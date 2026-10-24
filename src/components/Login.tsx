@@ -8,7 +8,7 @@ interface Props {
 }
 
 export function Login({ onLogin }: Props) {
-  const server = "https://your-server.example";
+  const server = import.meta.env.DEV ? "" : "https://your-server.example";
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
