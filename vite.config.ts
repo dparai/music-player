@@ -34,5 +34,12 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    proxy: {
+      "/rest": {
+        target: "https://deepakmusic.duckdns.org",
+        changeOrigin: true,
+        secure: true,
+      },
+    },
   },
 });
