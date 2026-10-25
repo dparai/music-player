@@ -329,7 +329,10 @@ export function NowPlaying({
   }
 
   const progress = duration > 0 ? currentTime / duration : 0;
-  const coverSrc = song?.coverArt ? coverArtUrl(creds, song.coverArt, "512") : null;
+  const coverSrc = useMemo(
+    () => song?.coverArt ? coverArtUrl(creds, song.coverArt, "512") : null,
+    [song?.id, song?.coverArt, creds],
+  );
 
   if (!song) {
     return (
