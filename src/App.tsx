@@ -30,8 +30,9 @@ export function App() {
   const [songs, setSongs] = useState<SubsonicSong[]>([]);
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<View>(() => (loadView() as View) ?? "nowplaying");
-  const [playing, setPlaying] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [miniPlaying, setMiniPlaying] = useState(false);
+  const [miniProgress, setMiniProgress] = useState(0);
+  const togglePlayRef = useRef<(() => void) | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
   const [djMode, setDjMode] = useState(false);
   const [shuffled, setShuffled] = useState(false);
@@ -209,35 +210,14 @@ export function App() {
     }
   }
 
-  function handleTogglePlay() {
-    const audios = document.querySelectorAll("audio");
-    for (const audio of audios) {
-      if (audio.src && !audio.paused) {
-        audio.pause();
-        return;
-      }
-    }
-    for (const audio of audios) {
-      if (audio.src) {
-        audio.play();
-        return;
-      }
-    }
-  }
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const audios = document.querySelectorAll("audio");
-      for (const audio of audios) {
-        if (audio.src && audio.duration > 0) {
-          setPlaying(!audio.paused);
-          setProgress(audio.currentTime / audio.duration);
-          break;
-        }
-      }
-    }, 300);
-    return () => clearInterval(interval);
+  const handlePlayingChange = useCallback((isPlaying: boolean, prog: number) => {
+    setMiniPlaying(isPlaying);
+    setMiniProgress(prog);
   }, []);
+
+  function handleTogglePlay() {
+    togglePlayRef.current?.();
+  }
 
   if (!creds) return <Login onLogin={handleLogin} />;
 
@@ -261,6 +241,8 @@ export function App() {
                 onPrev={handlePrev}
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
+                onPlayingChange={handlePlayingChange}
+                togglePlayRef={togglePlayRef}
               />
             </div>
             <div className={styles.view} style={{ display: view === "library" ? "flex" : "none" }}>
@@ -280,8 +262,8 @@ export function App() {
         <MiniPlayer
           song={currentSong}
           creds={creds}
-          playing={playing}
-          progress={progress}
+          playing={miniPlaying}
+          progress={miniProgress}
           onToggle={handleTogglePlay}
           onClick={() => setView("nowplaying")}
         />
