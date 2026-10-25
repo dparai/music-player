@@ -40,6 +40,11 @@ export default defineConfig({
         changeOrigin: true,
         secure: true,
       },
+      "/api": {
+        target: "https://deepakmusic.duckdns.org",
+        changeOrigin: true,
+        secure: true,
+      },
     },
   },
 });

@@ -120,4 +120,40 @@ export function coverArtUrl(creds: SubsonicCredentials, coverArtId: string, size
   return apiUrl(creds, "getCoverArt", { id: coverArtId, size });
 }
 
+// BPM/Key analysis data
+export interface SongAnalysis {
+  bpm: number;
+  key: string;
+}
+
+let analysisCache: Record<string, SongAnalysis> | null = null;
+
+export async function fetchAnalysis(): Promise<Record<string, SongAnalysis>> {
+  if (analysisCache) return analysisCache;
+  const base = import.meta.env.DEV ? "" : "https://deepakmusic.duckdns.org";
+  const res = await fetch(`${base}/api/analysis.json`);
+  if (!res.ok) return {};
+  analysisCache = await res.json();
+  return analysisCache!;
+}
+
+export function lookupAnalysis(
+  analysis: Record<string, SongAnalysis>,
+  song: SubsonicSong,
+): SongAnalysis | null {
+  // Try exact filename patterns common in the library
+  for (const [filename, data] of Object.entries(analysis)) {
+    const name = filename.replace(/\.[^.]+$/, "");
+    if (
+      name === song.title ||
+      name === `${song.artist} - ${song.title}` ||
+      name === `${song.title} - ${song.artist}` ||
+      name.includes(song.title)
+    ) {
+      return data;
+    }
+  }
+  return null;
+}
+
 export type { SubsonicCredentials, SubsonicSong };
