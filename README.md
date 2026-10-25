@@ -16,8 +16,8 @@ Your Music Collection
                                                           |
                                         +-----------------+-----------------+
                                         |                 |                 |
-                                    Navidrome         Caddy            librosa
-                                  (music server)   (HTTPS proxy)   (BPM/key analysis)
+                                    Navidrome         Caddy            AutoMix
+                                  (music server)   (HTTPS proxy)   (FastAPI + librosa)
                                         |                 |                 |
                                         +-----------------+-----------------+
                                                           |
@@ -35,8 +35,8 @@ Your Music Collection
 2. `rclone` syncs them to an Oracle Cloud server every 48 hours
 3. **Navidrome** indexes and serves the music via the Subsonic API
 4. **Caddy** handles HTTPS with auto-renewing certificates
-5. **librosa** (Python) analyzes each track's BPM and musical key
-6. **Brook** (this PWA) plays it all in your browser with a slick UI
+5. **AutoMix** (FastAPI + librosa) analyzes each track's BPM, beats, and cue points
+6. **Brook** (this PWA) plays it all in your browser with a slick UI, pulling server-side analysis for smarter transitions
 
 ---
 
@@ -50,6 +50,7 @@ Brook doesn't just play the next song — it **mixes** like a real DJ:
 - **Camelot Wheel** — picks the next song in a harmonically compatible key (so transitions sound musical, not jarring)
 - **15-Second Crossfade** — equal-power volume curve with bass EQ crossover, so the low end doesn't mud up during the blend
 - **Smart Song Endings** — uses Web Audio `AnalyserNode` to detect silence/fade-outs and start the crossfade early instead of waiting for dead air
+- **Server-Side Analysis (AutoMix v2)** — FastAPI server with librosa analyzes every track for precise BPM, beat grid, and mix in/out cue points. The PWA fetches this data and uses server cue points over client-side detection when available
 
 ### How DJ Song Selection Works
 
@@ -95,7 +96,8 @@ During the crossfade:
 | Reverse Proxy | Caddy | Auto HTTPS, zero config |
 | Cloud | Oracle Cloud Always Free ARM | Free forever (2 OCPUs, 12GB RAM) |
 | Sync | rclone + Google Drive | Drop files in Drive, they appear in Brook |
-| Analysis | librosa (Python) | BPM and musical key detection |
+| Analysis | AutoMix (FastAPI + librosa) | BPM, beat grid, cue point detection |
+| Audio Decode | ffmpeg | Pre-decode m4a/AAC for librosa analysis |
 | DNS | DuckDNS | Free subdomain with auto-updating IP |
 
 ---
@@ -112,9 +114,22 @@ src/
     MiniPlayer.tsx      Bottom bar with play/pause and progress
   lib/
     subsonic.ts         Subsonic API client (getAllSongs, stream, coverArt)
+    automix.ts          AutoMix server client (track data, BPM, cue points)
     dj.ts               Camelot wheel, BPM matching, DJ scoring algorithm
     storage.ts          localStorage persistence (creds, last played, view)
 ```
+
+### AutoMix Server (on the VM)
+
+```
+/opt/automix/
+  app/
+    main.py             FastAPI server — analysis engine + REST API
+  venv/                 Python venv (librosa, fastapi, uvicorn)
+  automix.db            SQLite (WAL mode) — track analysis cache
+```
+
+The server runs as a systemd service on port 8000. Caddy routes `/automix/*` to it. On startup it scans `/srv/music` recursively, analyzing any new or previously failed tracks. Formats not natively supported by soundfile (m4a, AAC, WMA) are pre-decoded to WAV via ffmpeg before analysis.
 
 ---
 
@@ -125,7 +140,7 @@ npm install
 npm run dev
 ```
 
-The dev server proxies `/rest/*` and `/api/*` to the production Navidrome instance, so you can develop against real data.
+The dev server proxies `/rest/*`, `/api/*`, and `/automix/*` to the production instance, so you can develop against real data.
 
 ---
 
