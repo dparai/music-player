@@ -44,6 +44,26 @@ export function NowPlaying({
   const crossfadeTimerRef = useRef<number | null>(null);
   const crossfadeStartedRef = useRef(false);
   const lastSongIdRef = useRef<string | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceNodesRef = useRef<{ A?: MediaElementAudioSourceNode; B?: MediaElementAudioSourceNode }>({});
+  const filtersRef = useRef<{ A?: BiquadFilterNode; B?: BiquadFilterNode }>({});
+
+  function ensureAudioGraph(deck: "A" | "B") {
+    const audio = deck === "A" ? audioARef.current : audioBRef.current;
+    if (!audio || sourceNodesRef.current[deck]) return;
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext();
+    }
+    const ctx = audioCtxRef.current;
+    const source = ctx.createMediaElementSource(audio);
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowshelf";
+    filter.frequency.value = 200;
+    filter.gain.value = 0;
+    source.connect(filter).connect(ctx.destination);
+    sourceNodesRef.current[deck] = source;
+    filtersRef.current[deck] = filter;
+  }
 
   const waveformBars = useMemo(() => {
     return Array.from({ length: 60 }, () => 10 + Math.random() * 35);
@@ -112,6 +132,11 @@ export function NowPlaying({
 
     setCrossfading(true);
 
+    const outDeck = activeDeckRef.current;
+    const inDeck = outDeck === "A" ? "B" : "A";
+    ensureAudioGraph(outDeck);
+    ensureAudioGraph(inDeck);
+
     incoming.src = streamUrl(creds, nextSong.id);
     incoming.volume = 0;
 
@@ -120,6 +145,15 @@ export function NowPlaying({
       incoming.playbackRate = rate;
     } else {
       incoming.playbackRate = 1;
+    }
+
+    const outFilter = filtersRef.current[outDeck];
+    const inFilter = filtersRef.current[inDeck];
+    if (outFilter) outFilter.gain.value = 0;
+    if (inFilter) inFilter.gain.value = -40;
+
+    if (audioCtxRef.current?.state === "suspended") {
+      audioCtxRef.current.resume();
     }
 
     incoming.play().catch(() => {});
@@ -136,6 +170,9 @@ export function NowPlaying({
       outgoing.volume = Math.cos(progress * Math.PI / 2);
       incoming.volume = Math.sin(progress * Math.PI / 2);
 
+      if (outFilter) outFilter.gain.value = -40 * progress;
+      if (inFilter) inFilter.gain.value = -40 * (1 - progress);
+
       if (step >= steps) {
         clearInterval(crossfadeTimerRef.current!);
         crossfadeTimerRef.current = null;
@@ -143,6 +180,8 @@ export function NowPlaying({
         outgoing.src = "";
         incoming.volume = 1;
         incoming.playbackRate = 1;
+        if (outFilter) outFilter.gain.value = 0;
+        if (inFilter) inFilter.gain.value = 0;
 
         const newDeck = activeDeckRef.current === "A" ? "B" : "A";
         activeDeckRef.current = newDeck;
