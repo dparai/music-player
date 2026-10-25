@@ -1,4 +1,5 @@
 import md5 from "md5";
+import { buildNameIndex, matchByName, type NameIndex } from "./match";
 
 interface SubsonicCredentials {
   server: string;
@@ -20,6 +21,14 @@ interface SubsonicSong {
   contentType: string;
   coverArt?: string;
   created: string;
+  path?: string;
+  // OpenSubsonic extension; Navidrome fills it from file tags when present.
+  replayGain?: {
+    trackGain?: number;
+    albumGain?: number;
+    trackPeak?: number;
+    albumPeak?: number;
+  };
 }
 
 interface SubsonicResponse<T> {
@@ -137,24 +146,18 @@ export async function fetchAnalysis(): Promise<Record<string, SongAnalysis>> {
   return analysisCache!;
 }
 
+const analysisIndexes = new WeakMap<Record<string, SongAnalysis>, NameIndex<SongAnalysis>>();
+
 export function lookupAnalysis(
   analysis: Record<string, SongAnalysis>,
   song: SubsonicSong,
 ): SongAnalysis | null {
-  const primaryArtist = song.artist?.split(/[;,&]/).map(s => s.trim())[0] ?? "";
-  for (const [filename, data] of Object.entries(analysis)) {
-    const name = filename.replace(/\.[^.]+$/, "");
-    if (
-      name === song.title ||
-      name === `${song.artist} - ${song.title}` ||
-      name === `${song.title} - ${song.artist}` ||
-      name === `${primaryArtist} - ${song.title}` ||
-      name === `${song.title} - ${primaryArtist}`
-    ) {
-      return data;
-    }
+  let index = analysisIndexes.get(analysis);
+  if (!index) {
+    index = buildNameIndex(Object.entries(analysis));
+    analysisIndexes.set(analysis, index);
   }
-  return null;
+  return matchByName(index, song);
 }
 
 export type { SubsonicCredentials, SubsonicSong };

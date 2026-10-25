@@ -44,7 +44,8 @@ export default defineConfig({
             },
           },
           {
-            urlPattern: /\/automix\/tracks/,
+            // The list only: per-song detail responses would evict it from this 5-entry cache.
+            urlPattern: /\/automix\/tracks(\?|$)/,
             handler: "StaleWhileRevalidate",
             options: {
               cacheName: "automix-tracks",

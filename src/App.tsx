@@ -3,7 +3,7 @@ import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subs
 import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
 import { pickNextDJ } from "@/lib/dj";
 import type { AutoMixTrack } from "@/lib/automix";
-import { getAutoMixTracks } from "@/lib/automix";
+import { getAutoMixTracks, findAutoMixTrack } from "@/lib/automix";
 import {
   saveCredentials, loadCredentials, clearCredentials,
   saveLastPlayed, loadLastPlayed,
@@ -58,18 +58,41 @@ export function App() {
   }, [currentSongId, playOrder]);
 
   const currentSong = currentIndex >= 0 ? playOrder[currentIndex] ?? null : null;
-  const currentAnalysis = currentSong ? lookupAnalysis(analysisData, currentSong) : null;
+  // Key/BPM for DJ picks: the AutoMix server's (whole-track key) when it has
+  // them, else analysis.json (key from the first 2 minutes only).
+  const lookupSong = useCallback(
+    (map: Record<string, SongAnalysis>, song: SubsonicSong): SongAnalysis | null => {
+      const t = findAutoMixTrack(autoMixTracks, song);
+      if (t?.key && t.bpm > 0) return { bpm: t.bpm, key: t.key };
+      return lookupAnalysis(map, song);
+    },
+    [autoMixTracks],
+  );
+
+  const currentAnalysis = currentSong ? lookupSong(analysisData, currentSong) : null;
 
   const djNextSong = useRef<SubsonicSong | null>(null);
+
+  // DJ pick for the song after `currentSongId`. Excludes the current song
+  // explicitly: recentIds only learns about it in an effect after render.
+  const pickDJ = useCallback((): SubsonicSong | null => {
+    if (songs.length === 0) return null;
+    const exclude = new Set(recentIdsRef.current);
+    if (currentSongId) exclude.add(currentSongId);
+    if (currentAnalysis) {
+      return pickNextDJ(currentAnalysis, songs, analysisData, exclude, lookupSong);
+    }
+    // No key/BPM for this song: keep the mix going with a random track
+    // instead of returning null, which used to stop DJ mode dead.
+    const available = songs.filter((s) => !exclude.has(s.id));
+    return available.length > 0 ? available[Math.floor(Math.random() * available.length)]! : null;
+  }, [songs, currentSongId, currentAnalysis, analysisData, lookupSong]);
 
   const getNextSong = useCallback((): SubsonicSong | null => {
     if (playNextQueue.length > 0) return playNextQueue[0]!;
     if (djMode) {
-      if (!currentAnalysis || songs.length === 0) return null;
-      if (!djNextSong.current) {
-        djNextSong.current = pickNextDJ(
-          currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis,
-        );
+      if (!djNextSong.current || djNextSong.current.id === currentSongId) {
+        djNextSong.current = pickDJ();
       }
       return djNextSong.current;
     }
@@ -78,10 +101,10 @@ export function App() {
     }
     if (playOrder.length > 0) return playOrder[0]!;
     return null;
-  }, [playNextQueue, djMode, currentAnalysis, songs, analysisData, currentIndex, playOrder]);
+  }, [playNextQueue, djMode, pickDJ, currentSongId, currentIndex, playOrder]);
 
   const nextSong = getNextSong();
-  const nextAnalysis = nextSong ? lookupAnalysis(analysisData, nextSong) : null;
+  const nextAnalysis = nextSong ? lookupSong(analysisData, nextSong) : null;
 
   useEffect(() => {
     djNextSong.current = null;
@@ -159,18 +182,11 @@ export function App() {
     }
 
     if (djMode) {
-      const picked = djNextSong.current;
-      if (picked) {
-        djNextSong.current = null;
-        setCurrentSongId(picked.id);
+      const next = djNextSong.current ?? pickDJ();
+      djNextSong.current = null;
+      if (next) {
+        setCurrentSongId(next.id);
         return;
-      }
-      if (currentAnalysis && songs.length > 0) {
-        const next = pickNextDJ(currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis);
-        if (next) {
-          setCurrentSongId(next.id);
-          return;
-        }
       }
     }
 
@@ -179,7 +195,14 @@ export function App() {
     } else if (playOrder.length > 0) {
       setCurrentSongId(playOrder[0]!.id);
     }
-  }, [playNextQueue, djMode, currentIndex, playOrder, currentAnalysis, songs, analysisData]);
+  }, [playNextQueue, djMode, currentIndex, playOrder, pickDJ]);
+
+  // A DJ crossfade finished on `song`; it is already playing, so just follow it.
+  const handleAdvance = useCallback((song: SubsonicSong) => {
+    setPlayNextQueue((q) => (q[0]?.id === song.id ? q.slice(1) : q));
+    djNextSong.current = null;
+    setCurrentSongId(song.id);
+  }, []);
 
   const handlePrev = useCallback(() => {
     if (currentIndex > 0) {
@@ -243,6 +266,7 @@ export function App() {
                 onShuffleToggle={handleShuffle}
                 onNext={handleNext}
                 onPrev={handlePrev}
+                onAdvance={handleAdvance}
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
                 onPlayingChange={handlePlayingChange}

@@ -46,11 +46,14 @@ Your Music Collection
 
 Brook doesn't just play the next song — it **mixes** like a real DJ:
 
-- **Beat Matching** — adjusts playback speed (within +-8%) so the BPMs align during transitions
+- **Beat Sync** — the mix starts exactly on a downbeat, the incoming song is tempo-matched (up to ±6%, pitch preserved) and phase-locked to the outgoing beat (within ~10 ms), then eases back to its own tempo
 - **Camelot Wheel** — picks the next song in a harmonically compatible key (so transitions sound musical, not jarring)
-- **15-Second Crossfade** — equal-power volume curve with bass EQ crossover, so the low end doesn't mud up during the blend
-- **Smart Song Endings** — uses Web Audio `AnalyserNode` to detect silence/fade-outs and start the crossfade early instead of waiting for dead air
-- **Server-Side Analysis (AutoMix v2)** — FastAPI server with librosa analyzes every track for precise BPM, beat grid, and mix in/out cue points. The PWA fetches this data and uses server cue points over client-side detection when available
+- **8-Bar Phrase Mix** — the crossfade lasts 8 bars at the song's tempo (15 s at 128 BPM, 21 s at 90 BPM)
+- **Bass Swap** — only one bassline at a time: the bass changes hands in one bar in the middle of the mix, with no mud and no mid-mix bass hole
+- **Outro Cues** — the server finds where each song's outro starts and mixes there, not just "15 s before the end"
+- **Loudness Levelling** — every song trimmed to about −14 LUFS, plus a master limiter, so volume doesn't jump between songs
+- **Smart Song Endings** — detects real silence/fade-outs and starts the mix early instead of waiting for dead air
+- **Server-Side Analysis (AutoMix v2)** — FastAPI + librosa on the VM: BPM, beat grid with real downbeats, cue points, key and loudness for every song, matched to Navidrome song IDs
 
 ### How DJ Song Selection Works
 
@@ -77,10 +80,21 @@ Deck A: ████████████████░░░░  (playing, 
 Deck B: ░░░░░░████████████████  (fading in, becomes active)
 ```
 
-During the crossfade:
+Each deck is a Web Audio channel strip, and every fade curve runs on the audio thread (sample-accurate, not a JS timer):
+
+```
+<audio> → loudness trim → analyser → low-shelf (bass swap) → fader ┐
+                                                                    ├→ limiter → speakers
+<audio> → loudness trim → analyser → low-shelf (bass swap) → fader ┘
+```
+
+During the mix:
 - **Volume**: equal-power curve (cos/sin) so total energy stays constant
-- **Bass EQ**: low-shelf filter sweeps the bass from outgoing to incoming
-- **BPM**: incoming track speed-adjusts to match outgoing tempo, then snaps back after
+- **Bass**: the low shelf compensates for the fader, so bass level stays flat (0 dB) through the whole mix
+- **Tempo**: incoming deck is tempo-matched and nudged every 100 ms to stay on the beat, then eases back over 4 bars
+- **Pause / Next**: pausing freezes the mix; Next jumps straight to the incoming song
+
+Details and the plan for server-rendered transitions: [docs/AUTOMIX-V2.md](docs/AUTOMIX-V2.md).
 
 ---
 
@@ -90,14 +104,14 @@ During the crossfade:
 |-------|------|-----|
 | Frontend | React + TypeScript + Vite | Fast builds, type safety |
 | Styling | CSS Modules | Scoped styles, no conflicts |
-| Audio | Web Audio API | Crossfade, EQ, silence detection |
+| Audio | Web Audio API | Beat-synced mixing, bass swap, limiter, silence detection |
 | PWA | vite-plugin-pwa + Workbox | Install to homescreen, offline UI |
 | Music Server | Navidrome (Subsonic API) | Self-hosted, battle-tested |
 | Reverse Proxy | Caddy | Auto HTTPS, zero config |
 | Cloud | Oracle Cloud Always Free ARM | Free forever (2 OCPUs, 12GB RAM) |
 | Sync | rclone + Google Drive | Drop files in Drive, they appear in Brook |
 | Analysis | AutoMix (FastAPI + librosa) | BPM, beat grid, cue point detection |
-| Audio Decode | ffmpeg | Pre-decode m4a/AAC for librosa analysis |
+| Audio Decode | ffmpeg | Decoding for analysis, EBU R128 loudness |
 | DNS | DuckDNS | Free subdomain with auto-updating IP |
 
 ---
@@ -114,8 +128,9 @@ src/
     MiniPlayer.tsx      Bottom bar with play/pause and progress
   lib/
     subsonic.ts         Subsonic API client (getAllSongs, stream, coverArt)
-    automix.ts          AutoMix server client (track data, BPM, cue points)
-    dj.ts               Camelot wheel, BPM matching, DJ scoring algorithm
+    automix.ts          AutoMix server client (track data, beat grids, cue points)
+    dj.ts               Camelot wheel, tempo matching, crossfade curves, DJ scoring
+    match.ts            Song ↔ analysis matching (normalized filenames)
     storage.ts          localStorage persistence (creds, last played, view)
 ```
 
@@ -124,12 +139,15 @@ src/
 ```
 /opt/automix/
   app/
-    main.py             FastAPI server — analysis engine + REST API
+    main.py             FastAPI server — scanning + REST API
+    analysis_v2.py      BPM, beats, downbeats, cue points, key, loudness
+    navidrome_ids.py    File path → Navidrome song ID
+    auth.py             Verifies Brook users against Navidrome
   venv/                 Python venv (librosa, fastapi, uvicorn)
   automix.db            SQLite (WAL mode) — track analysis cache
 ```
 
-The server runs as a systemd service on port 8000. Caddy routes `/automix/*` to it. On startup it scans `/srv/music` recursively, analyzing any new or previously failed tracks. Formats not natively supported by soundfile (m4a, AAC, WMA) are pre-decoded to WAV via ffmpeg before analysis.
+The source lives in [`server/automix/`](server/automix/README.md). The server runs as a systemd service on port 8000, and Caddy routes `/automix/*` to it. On startup, and after every Drive sync (`sync-music.sh` calls `/automix/rescan`), it scans `/srv/music`: it analyses new songs, re-analyses old v1 rows in the background, and drops songs that were deleted. Analysis runs at low priority so streaming stays smooth.
 
 ---
 

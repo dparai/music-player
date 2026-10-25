@@ -1,178 +1,74 @@
-# AutoMix DJ Mode v2 — Server-Side Transitions
+# AutoMix DJ Mode v2
 
-> Server renders pro-quality DJ transitions. Phone plays them. Falls back to v1 browser crossfade if clip isn't ready.
-
-## How It Works
-
-```
-Phone plays Song A
-    |
-    | Song A starts → POST /automix/transitions {from: A, to: B}
-    |
-    | Server renders clip in background:
-    |   librosa (BPM + beats) → Rubber Band (time-stretch) → pedalboard (EQ + fade)
-    |
-    | Song A reaches cue point AND clip ready?
-    |     YES → play server-rendered clip → Song B at offset
-    |     NO  → fall back to v1 browser crossfade
-    |
-Phone plays Song B
-```
-
-## Features
-
-| Feature | How |
-|---------|-----|
-| Beatmatching | Both songs play at the same tempo during transition |
-| Beat-grid alignment | Downbeats of both songs land together |
-| Bass swap | One bassline fades out as the other fades in, never both at once |
-| Smart cue points | Mix starts at a musical phrase boundary |
-| Pitch-locked stretching | Speed changes without pitch change (Rubber Band) |
-| Automatic fallback | v1 browser crossfade runs if server clip isn't ready |
-
-## Architecture
+> Goal: transitions that sound like a DJ mixed them: on the beat, on the phrase, no bass mud or bass hole, steady loudness.
+> Built in three layers. Each one works on its own, and every layer falls back to the one below it.
 
 ```
-Google Drive → rclone (48h) → Oracle VM
-                                  |
-                    +-------------+-------------+
-                    |             |             |
-                Navidrome    AutoMix API    Caddy
-              (Subsonic)    (FastAPI:8000)  (HTTPS)
-                    |             |             |
-                    +-------------+-------------+
-                                  |
-                          dpkmusic.duckdns.org
-                                  |
-                    /rest/*  →  Navidrome
-                    /automix/* → FastAPI
-                    /*       →  Brook PWA
+Layer 3  Server-rendered clip  (big tempo gaps, key shifts, iOS)      ← planned
+Layer 2  Beat-synced browser mix (Web Audio, phase-locked)           ← shipped
+Layer 1  Plain browser crossfade (no beat data)                       ← shipped
 ```
 
-## Tech Stack
+## What changed from the first v2 plan, and why
 
-| Job | Tool |
-|-----|------|
-| API + streaming | FastAPI (Python) |
-| BPM + beats | librosa (not madmom — won't compile on ARM) |
-| Time-stretching | Rubber Band via pyrubberband (available on arm64) |
-| EQ, fades, limiter | pedalboard (Spotify) |
-| Song data | SQLite with WAL mode |
-| Background jobs | threading + queue |
-| Audio decode/encode | ffmpeg |
+| First plan said | Problem | Now |
+|---|---|---|
+| Downbeats = every 4th beat | Bar lines off by 1–3 beats, so phrase cues land mid-bar | Real downbeats: `beat_this`, or a librosa phase estimate. Tested on all 4 phases |
+| Mix-out = `duration − overlap` | Mixes over the last chorus | 4/8-bar boundary at the biggest energy drop (outro) |
+| Mix-in = first beat after 2 s | Starts on beat 2, not the bar line | First downbeat (≤ 30 s) |
+| BPM tiers in absolute BPM ("0–6 BPM") | 6 BPM is 4.7% at 128 but 8.6% at 70 | Percent: ≤ 6% in browser, beyond that server |
+| `tracks.id` = Navidrome song ID | Real table uses MD5(path); PWA guessed by filename | Extra `navidrome_id` column read from Navidrome's DB |
+| "HTMLAudioElement handles the gapless seam" | Element start latency is 20–200 ms and varies (mobile) | Clip played via Web Audio; B aligned under the clip by the same phase-lock loop |
+| Bearer token for auth | Token is in the public JS bundle | Subsonic credentials verified with Navidrome (`auth.py`) |
 
-## BPM Tier System
+## Layer 1 + 2: browser mix (`NowPlaying.tsx`, `dj.ts`)
 
-| BPM gap | Beatmatch? | Stretch | Overlap |
-|---------|-----------|---------|---------|
-| 0-6 | Yes | Song B only | 16 bars |
-| 6-12 | Yes | Song B only (up to 10%) | 16 bars |
-| 12-20 | Yes | Song B only + ramp back | 8 bars |
-| 20+ | No | None — EQ crossfade only | ~10 seconds |
-
-Half/double-time matches (70 vs 140 BPM) count as 0 gap.
-
-Safety: if stretch exceeds 10%, drop to next tier.
-
-## Cue Points (v2 — simple)
-
-- **Mix-out:** `duration - overlap_length`
-- **Mix-in:** first beat after 2 seconds
-
-Upgrade to energy-based detection in v2.1.
-
-## Gapless Playback (phone side)
-
-Server renders clip with Song A's last 2s and Song B's first 2s baked in:
+Graph per deck:
 
 ```
-Song A: ████████████████|==|
-                     clip: |==TRANSITION==|
-                                       |==|Song B: ████████████████
+<audio> → source → preGain (−14 LUFS trim) → analyser → lowshelf 200 Hz → fader ┐
+                                                                                 ├→ limiter → out
+<audio> → source → preGain                 → analyser → lowshelf 200 Hz → fader ┘
 ```
 
-Phone does:
-1. Stop Song A at `cue_out - 2s`
-2. Play clip (contains Song A's tail → blend → Song B's head)
-3. Start Song B at `cue_in + 2s` with 50ms micro-crossfade
+1. **Preload** the next song on the idle deck 30 s before the cue, seeked to its first downbeat.
+2. **Cue** = the server's `mix_out_point` or `duration − fade`, whichever is earlier, snapped to the last downbeat before it.
+3. **Start exactly on the downbeat:** the 200 ms poll arms a `setTimeout` for the precise moment.
+4. **Fade length = 8 bars** at the outgoing tempo (15 s at 128 BPM, 21.3 s at 90), kept within 8–24 s.
+5. **Curves** run on the audio thread (`setValueCurveAtTime`): equal-power faders plus a **one-bar bass swap** in the middle. The shelf offsets the fader, so bass power stays at 0.0 dB the whole time (the old fade dipped to −20 dB).
+6. **Phase lock** every 100 ms: compare beat phases. If off by more than 80 ms, jump into phase; if off by more than 5 ms, nudge `playbackRate` by up to ±2%.
+7. **Tempo** match up to ±6% with `preservesPitch`, then ease back to 1.0 over 4 bars (no audible snap).
+8. **Pause mid-mix** suspends the AudioContext, so the curves freeze and resume where they stopped.
 
-No sample-accurate scheduling needed. HTMLAudioElement handles it.
+Falls back to an unsynced crossfade when either track lacks a confident grid, tempos are more than 6% apart, or the user seeks.
 
-## API Endpoints
+## Layer 3: server-rendered transitions (planned)
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | /automix/tracks | Library with analysis data |
-| POST | /automix/transitions | Request transition render (returns job_id) |
-| GET | /automix/transitions/{job_id} | Job status + play plan when ready |
-| GET | /automix/transitions/{job_id}/clip | Stream the rendered clip |
-| POST | /automix/rescan | Trigger re-analysis of new songs |
-
-Auth: `Authorization: Bearer <token>` header on all endpoints.
-
-## Cache Strategy
-
-- Max 50 clips in `/var/brook-clips/`
-- LRU eviction: on new render, delete oldest if count > 50
-- ~3MB per clip = 150MB worst case
-- SQLite tracks clip path + last_used timestamp
-
-## SQLite Schema
-
-```sql
-CREATE TABLE tracks (
-    id TEXT PRIMARY KEY,          -- Navidrome song ID
-    path TEXT NOT NULL,
-    bpm REAL,
-    beats TEXT,                   -- JSON array of beat times
-    downbeats TEXT,               -- JSON array (estimated: every 4th beat)
-    confidence REAL,
-    mix_in_point REAL,
-    mix_out_point REAL,
-    duration REAL,
-    analyzed_at TEXT
-);
-
-CREATE TABLE transitions (
-    id TEXT PRIMARY KEY,
-    from_track TEXT NOT NULL,
-    to_track TEXT NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, rendering, ready, failed
-    clip_path TEXT,
-    play_plan TEXT,                -- JSON: {stop_a_at, clip_duration, start_b_at}
-    created_at TEXT,
-    last_used TEXT,
-    FOREIGN KEY (from_track) REFERENCES tracks(id),
-    FOREIGN KEY (to_track) REFERENCES tracks(id)
-);
+```
+Song A starts ─→ POST /automix/transitions {from: navidrome_id A, to: navidrome_id B}
+                 server (one ffmpeg filter graph, ~3–8 s on one core):
+                   A: [cue_out, cue_out + 8 bars + 2 s]
+                   B: [cue_in − 2 s, …] → rubberband tempo (and ±1 semitone if it improves the key match)
+                   faders + bass swap identical to dj.ts → loudnorm trims → Opus 160k
+                 → /var/brook-clips/{from}_{to}.opus + play_plan
+Phone, at cue_out − 2 s: if clip ready → play clip, else Layer 2
 ```
 
-## Analysis Trigger
+When to use it: tempo gap 6–20%, a key clash fixable by a ±1 semitone shift, or iOS where two `<audio>` elements are unreliable.
 
-- FastAPI scans music directory on startup
-- Analyzes any file not in SQLite
-- Cron hits `POST /automix/rescan` after rclone sync
+The seam, done properly:
+- Decode the clip to an `AudioBuffer`. Start it with `AudioBufferSourceNode.start(when)` at A's exact cue time (sample-accurate).
+- Start deck B silent ~2 s before the clip ends and phase-lock it to the clip's timeline with the Layer 2 loop.
+- Swap clip → B with a 30 ms gain crossfade. The audio is identical on both sides, so the seam can't be heard.
 
-## Resolved Risks
+Ops:
+- Render only when both tracks are analysed. The queue has a single worker at `Nice=10`, so streaming always wins.
+- Cache key = `(from, to, analysis version)`. LRU at 50 clips: about 500 KB each (≈25 s of Opus at 160 kbps), so about 25 MB total.
+- `pickNextDJ` scoring should use server `key` and `bpm` (dropping `analysis.json`). Reward pairs a render can fix, not just pairs already close.
 
-| Risk | Resolution |
-|------|-----------|
-| madmom won't compile on ARM | Use librosa. Estimate downbeats by grouping beats into 4s |
-| Rubber Band on ARM | Available via `apt install rubberband-cli` (confirmed arm64) |
-| 2 CPUs too slow | Request transition when song starts (3-4 min headroom). Fallback to v1 if not ready |
-| Gapless playback hard | Bake Song A tail + Song B head into clip. 50ms micro-crossfade at seams |
-| SQLite concurrency | WAL mode. Single writer thread, FastAPI reads only |
-| No API auth | Bearer token header |
-| Meet-in-the-middle risky | Stretch Song B only. Simpler, less audible |
+## Rollout
 
-## Build Order
-
-1. **FastAPI + SQLite** on VM behind Caddy `/automix/*` route
-2. **Analysis pipeline:** librosa BPM + beats + cue points → SQLite
-3. **EQ crossfade renderer:** pedalboard, no beatmatching yet
-4. **PWA integration:** new `automix.ts` client, transition request on song start
-5. **Phone playback:** `if (clipReady) playClip() else v1Crossfade()`
-6. **Rubber Band beatmatching** (tiers 0-12)
-7. **Tune cue points**, add tier 12-20
-
-Each step is independently deployable. v1 crossfade works at every step.
+1. ✅ Browser engine (this repo).
+2. Deploy `server/automix/` (analysis v2, Navidrome IDs, auth, cron): see `server/automix/README.md`. Re-analyse the library once.
+3. Point `pickNextDJ` at server key/BPM; retire `/api/analysis.json`.
+4. Layer 3 render endpoint, then the clip playback path in the PWA.
