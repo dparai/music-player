@@ -1,10 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
 import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
 import { pickNextDJ } from "@/lib/dj";
 import {
   saveCredentials, loadCredentials, clearCredentials,
-  saveQueue, loadQueue,
   saveLastPlayed, loadLastPlayed,
   saveView, loadView,
 } from "@/lib/storage";
@@ -17,50 +16,73 @@ import styles from "./App.module.css";
 
 const RECENT_HISTORY = 20;
 
+function shuffleArray<T>(arr: T[]): T[] {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j]!, copy[i]!];
+  }
+  return copy;
+}
+
 export function App() {
   const [creds, setCreds] = useState<SubsonicCredentials | null>(loadCredentials);
   const [songs, setSongs] = useState<SubsonicSong[]>([]);
   const [loading, setLoading] = useState(false);
-  const [queue, setQueue] = useState<SubsonicSong[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(-1);
   const [view, setView] = useState<View>(() => (loadView() as View) ?? "nowplaying");
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
   const [djMode, setDjMode] = useState(false);
+  const [shuffled, setShuffled] = useState(false);
+  const [currentSongId, setCurrentSongId] = useState<string | null>(null);
+  const [playNextQueue, setPlayNextQueue] = useState<SubsonicSong[]>([]);
   const recentIdsRef = useRef<Set<string>>(new Set());
+  const lastShuffleRef = useRef<string[] | null>(null);
 
-  const currentSong = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] ?? null : null;
+  const sortedSongs = useMemo(() =>
+    [...songs].sort((a, b) => a.title.localeCompare(b.title)),
+  [songs]);
+
+  const [shuffledSongs, setShuffledSongs] = useState<SubsonicSong[]>([]);
+
+  const playOrder = shuffled ? shuffledSongs : sortedSongs;
+
+  const currentIndex = useMemo(() => {
+    if (!currentSongId) return -1;
+    return playOrder.findIndex((s) => s.id === currentSongId);
+  }, [currentSongId, playOrder]);
+
+  const currentSong = currentIndex >= 0 ? playOrder[currentIndex] ?? null : null;
   const currentAnalysis = currentSong ? lookupAnalysis(analysisData, currentSong) : null;
 
-  // Compute next song and its analysis for crossfade
-  const nextSongInQueue = currentIndex >= 0 && currentIndex < queue.length - 1 ? queue[currentIndex + 1]! : null;
-
-  // In DJ mode with no queued next song, pre-pick one
   const djNextSong = useRef<SubsonicSong | null>(null);
 
-  // Determine the actual next song (queued or DJ-picked)
   const getNextSong = useCallback((): SubsonicSong | null => {
-    if (nextSongInQueue) return nextSongInQueue;
-    if (!djMode || !currentAnalysis || songs.length === 0) return null;
-
-    if (!djNextSong.current) {
-      djNextSong.current = pickNextDJ(
-        currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis,
-      );
+    if (playNextQueue.length > 0) return playNextQueue[0]!;
+    if (djMode) {
+      if (!currentAnalysis || songs.length === 0) return null;
+      if (!djNextSong.current) {
+        djNextSong.current = pickNextDJ(
+          currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis,
+        );
+      }
+      return djNextSong.current;
     }
-    return djNextSong.current;
-  }, [nextSongInQueue, djMode, currentAnalysis, songs, analysisData]);
+    if (currentIndex >= 0 && currentIndex < playOrder.length - 1) {
+      return playOrder[currentIndex + 1]!;
+    }
+    if (playOrder.length > 0) return playOrder[0]!;
+    return null;
+  }, [playNextQueue, djMode, currentAnalysis, songs, analysisData, currentIndex, playOrder]);
 
   const nextSong = getNextSong();
   const nextAnalysis = nextSong ? lookupAnalysis(analysisData, nextSong) : null;
 
-  // Clear DJ pre-pick when song changes
   useEffect(() => {
     djNextSong.current = null;
-  }, [currentSong?.id]);
+  }, [currentSongId]);
 
-  // Track recently played
   useEffect(() => {
     if (currentSong) {
       recentIdsRef.current.add(currentSong.id);
@@ -78,40 +100,16 @@ export function App() {
     getAllSongs(creds)
       .then((s) => {
         setSongs(s);
-        const saved = loadQueue();
-        if (saved) {
-          const restored = saved.songIds
-            .map((id) => s.find((song) => song.id === id))
-            .filter((x): x is SubsonicSong => !!x);
-          if (restored.length > 0) {
-            setQueue(restored);
-            setCurrentIndex(Math.min(saved.currentIndex, restored.length - 1));
-            return;
-          }
-        }
         const lastId = loadLastPlayed();
-        if (lastId) {
-          const lastSong = s.find((song) => song.id === lastId);
-          if (lastSong) {
-            setQueue([lastSong]);
-            setCurrentIndex(0);
-            return;
-          }
-        }
-        if (s.length > 0) {
-          setQueue([s[0]!]);
-          setCurrentIndex(0);
+        if (lastId && s.find((song) => song.id === lastId)) {
+          setCurrentSongId(lastId);
+        } else if (s.length > 0) {
+          setCurrentSongId(s[0]!.id);
         }
       })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [creds]);
-
-  useEffect(() => {
-    if (queue.length > 0) {
-      saveQueue(queue.map((s) => s.id), currentIndex, 0);
-    }
-  }, [queue, currentIndex]);
 
   useEffect(() => {
     if (currentSong) saveLastPlayed(currentSong.id);
@@ -136,79 +134,79 @@ export function App() {
     clearCredentials();
     setCreds(null);
     setSongs([]);
-    setQueue([]);
-    setCurrentIndex(-1);
+    setCurrentSongId(null);
+    setPlayNextQueue([]);
     setDjMode(false);
+    setShuffled(false);
   }
 
-  function handlePlay(song: SubsonicSong, songList: SubsonicSong[]) {
-    setQueue(songList);
-    setCurrentIndex(songList.findIndex((s) => s.id === song.id));
+  function handlePlay(song: SubsonicSong) {
+    setCurrentSongId(song.id);
     setView("nowplaying");
   }
 
   const handleNext = useCallback(() => {
-    if (djMode && currentIndex >= queue.length - 1) {
-      // No more queued songs — DJ auto-picks
+    if (playNextQueue.length > 0) {
+      const next = playNextQueue[0]!;
+      setPlayNextQueue((q) => q.slice(1));
+      setCurrentSongId(next.id);
+      return;
+    }
+
+    if (djMode) {
       const picked = djNextSong.current;
       if (picked) {
-        setQueue((prev) => [...prev, picked]);
-        setCurrentIndex((i) => i + 1);
         djNextSong.current = null;
+        setCurrentSongId(picked.id);
         return;
       }
-      // Fallback: pick now
       if (currentAnalysis && songs.length > 0) {
         const next = pickNextDJ(currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis);
         if (next) {
-          setQueue((prev) => [...prev, next]);
-          setCurrentIndex((i) => i + 1);
+          setCurrentSongId(next.id);
           return;
         }
       }
     }
-    setCurrentIndex((i) => (i < queue.length - 1 ? i + 1 : i));
-  }, [queue.length, djMode, currentIndex, currentAnalysis, songs, analysisData]);
+
+    if (currentIndex >= 0 && currentIndex < playOrder.length - 1) {
+      setCurrentSongId(playOrder[currentIndex + 1]!.id);
+    } else if (playOrder.length > 0) {
+      setCurrentSongId(playOrder[0]!.id);
+    }
+  }, [playNextQueue, djMode, currentIndex, playOrder, currentAnalysis, songs, analysisData]);
 
   const handlePrev = useCallback(() => {
-    setCurrentIndex((i) => (i > 0 ? i - 1 : i));
-  }, []);
+    if (currentIndex > 0) {
+      setCurrentSongId(playOrder[currentIndex - 1]!.id);
+    } else if (playOrder.length > 0) {
+      setCurrentSongId(playOrder[playOrder.length - 1]!.id);
+    }
+  }, [currentIndex, playOrder]);
 
   function handlePlayNext(song: SubsonicSong) {
-    setQueue((prev) => {
-      const insertAt = currentIndex + 1;
-      const filtered = prev.filter((s) => s.id !== song.id);
-      return [...filtered.slice(0, insertAt), song, ...filtered.slice(insertAt)];
+    setPlayNextQueue((q) => {
+      const filtered = q.filter((s) => s.id !== song.id);
+      return [song, ...filtered];
     });
   }
 
-  function handleAddToQueue(song: SubsonicSong) {
-    setQueue((prev) => {
-      if (prev.some((s) => s.id === song.id)) return prev;
-      return [...prev, song];
-    });
-  }
-
-  function handleQueueRemove(index: number) {
-    setQueue((prev) => {
-      const next = [...prev];
-      next.splice(index, 1);
-      return next;
-    });
-    setCurrentIndex((i) => {
-      if (index < i) return i - 1;
-      if (index === i) return Math.min(i, queue.length - 2);
-      return i;
-    });
-  }
-
-  function handleQueueReorder(from: number, to: number) {
-    setQueue((prev) => {
-      const next = [...prev];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved!);
-      return next;
-    });
+  function handleShuffle() {
+    if (shuffled) {
+      setShuffled(false);
+      setShuffledSongs([]);
+      lastShuffleRef.current = null;
+    } else {
+      let newOrder = shuffleArray(sortedSongs);
+      if (lastShuffleRef.current && newOrder.length > 1) {
+        const lastOrder = lastShuffleRef.current;
+        const isSame = newOrder.every((s, i) => s.id === lastOrder[i]);
+        if (isSame) newOrder = shuffleArray(sortedSongs);
+      }
+      lastShuffleRef.current = newOrder.map((s) => s.id);
+      setShuffledSongs(newOrder);
+      setShuffled(true);
+    }
   }
 
   function handleTogglePlay() {
@@ -227,7 +225,6 @@ export function App() {
     }
   }
 
-  // Poll audio state for mini player (find the active audio)
   useEffect(() => {
     const interval = setInterval(() => {
       const audios = document.querySelectorAll("audio");
@@ -254,16 +251,14 @@ export function App() {
             <div className={styles.view} style={{ display: view === "nowplaying" ? "flex" : "none" }}>
               <NowPlaying
                 song={currentSong}
-                queue={queue}
-                currentIndex={currentIndex}
                 creds={creds}
                 analysis={currentAnalysis}
                 djMode={djMode}
                 onDjModeToggle={() => setDjMode((d) => !d)}
+                shuffled={shuffled}
+                onShuffleToggle={handleShuffle}
                 onNext={handleNext}
                 onPrev={handlePrev}
-                onQueueRemove={handleQueueRemove}
-                onQueueReorder={handleQueueReorder}
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
               />
@@ -275,7 +270,6 @@ export function App() {
                 currentSongId={currentSong?.id ?? null}
                 onPlay={handlePlay}
                 onPlayNext={handlePlayNext}
-                onAddToQueue={handleAddToQueue}
               />
             </div>
           </>
