@@ -30,7 +30,7 @@ function formatTime(seconds: number): string {
 export function NowPlaying({
   song, queue, currentIndex, creds, analysis,
   djMode, onDjModeToggle, onNext, onPrev,
-  onQueueRemove, onQueueReorder,
+  onQueueRemove,
   nextAnalysis, nextSong,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);

@@ -30,7 +30,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext, onAdd
   const [contextMenu, setContextMenu] = useState<{ song: SubsonicSong; x: number; y: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout>>();
+  const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   const filtered = useMemo(() => {
     let list = songs;
