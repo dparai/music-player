@@ -20,7 +20,6 @@ from navidrome_ids import navidrome_ids  # noqa: E402
 MUSIC_DIR = Path("/srv/music")
 CLIPS_DIR = Path("/var/brook-clips")
 DB_PATH = Path("/opt/automix/automix.db")
-API_TOKEN = os.environ.get("AUTOMIX_TOKEN", "brook-automix-2026")
 SUPPORTED_EXTENSIONS = {".flac", ".mp3", ".m4a", ".opus", ".ogg", ".wav"}
 
 app = FastAPI(title="AutoMix DJ Server")

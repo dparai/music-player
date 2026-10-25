@@ -3,16 +3,13 @@ import { buildNameIndex, matchByName, type NameIndex } from "./match";
 import { loadCredentials } from "./storage";
 import md5 from "md5";
 
-const AUTOMIX_TOKEN = "brook-automix-2026";
-
 function automixUrl(path: string): string {
   const base = import.meta.env.DEV ? "" : window.location.origin;
   return `${base}/automix${path}`;
 }
 
-// The bearer token ships in the bundle, so it is public. The Subsonic
-// headers let the server verify the real user against Navidrome instead
-// (see server/automix/auth.py); servers that don't check them ignore them.
+// The server verifies these against Navidrome (server/automix/auth.py), so
+// the app needs no secret of its own in the bundle.
 function subsonicAuthHeaders(): Record<string, string> {
   const creds = loadCredentials();
   if (!creds) return {};
@@ -31,7 +28,6 @@ async function automixFetch<T>(path: string, init?: RequestInit): Promise<T> {
     headers: {
       ...init?.headers,
       ...subsonicAuthHeaders(),
-      Authorization: `Bearer ${AUTOMIX_TOKEN}`,
     },
   });
   if (!res.ok) throw new Error(`AutoMix ${res.status}`);

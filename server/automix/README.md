@@ -13,7 +13,7 @@ with or without this deployed: the new fields are optional.
 |------|--------------|
 | `analysis_v2.py` | `analyze_track(path)` → bpm, beats, **real downbeats**, confidence, phrase-aligned `mix_in_point`/`mix_out_point`, `key`, `lufs` |
 | `navidrome_ids.py` | `{file path: Navidrome song id}` from Navidrome's DB, for exact matching in the PWA |
-| `auth.py` | FastAPI dependency: verifies the Brook user against Navidrome (the bearer token is public in the JS bundle) |
+| `auth.py` | FastAPI dependency: verifies the Brook user against Navidrome; a bearer token (in `/opt/automix/automix.env`) works only for local scripts |
 | `sync-music.sh` | rclone sync + automatic `/automix/rescan` |
 
 ## 1. Copy and install
