@@ -40,6 +40,11 @@ export default defineConfig({
         changeOrigin: true,
         secure: true,
       },
+      "/api": {
+        target: "https://your-server.example",
+        changeOrigin: true,
+        secure: true,
+      },
     },
   },
 });

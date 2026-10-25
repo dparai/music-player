@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { SubsonicCredentials, SubsonicSong } from "@/lib/subsonic";
-import { getAllSongs } from "@/lib/subsonic";
+import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
+import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
 import {
   saveCredentials, loadCredentials, clearCredentials,
   saveQueue, loadQueue,
@@ -23,8 +23,10 @@ export function App() {
   const [view, setView] = useState<View>(() => (loadView() as View) ?? "nowplaying");
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
 
   const currentSong = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] ?? null : null;
+  const currentAnalysis = currentSong ? lookupAnalysis(analysisData, currentSong) : null;
 
   // Expose audio state for MiniPlayer via NowPlaying's audio element
   const audioStateCallback = useRef<(() => { playing: boolean; progress: number }) | null>(null);
@@ -32,6 +34,7 @@ export function App() {
   useEffect(() => {
     if (!creds) return;
     setLoading(true);
+    fetchAnalysis().then(setAnalysisData).catch(() => {});
     getAllSongs(creds)
       .then((s) => {
         setSongs(s);
@@ -186,6 +189,7 @@ export function App() {
                 queue={queue}
                 currentIndex={currentIndex}
                 creds={creds}
+                analysis={currentAnalysis}
                 onNext={handleNext}
                 onPrev={handlePrev}
                 onQueueRemove={handleQueueRemove}

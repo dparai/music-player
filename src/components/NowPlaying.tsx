@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect, useCallback, useMemo } from "react";
-import type { SubsonicSong, SubsonicCredentials } from "@/lib/subsonic";
+import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subsonic";
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import styles from "./NowPlaying.module.css";
 
@@ -8,6 +8,7 @@ interface Props {
   queue: SubsonicSong[];
   currentIndex: number;
   creds: SubsonicCredentials;
+  analysis: SongAnalysis | null;
   onNext: () => void;
   onPrev: () => void;
   onQueueRemove: (index: number) => void;
@@ -21,7 +22,7 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export function NowPlaying({ song, queue, currentIndex, creds, onNext, onPrev, onQueueRemove, onQueueReorder }: Props) {
+export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext, onPrev, onQueueRemove, onQueueReorder }: Props) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -167,6 +168,11 @@ export function NowPlaying({ song, queue, currentIndex, creds, onNext, onPrev, o
 
           <div className={styles.quality}>
             {song.suffix?.toUpperCase() ?? "MP3"} &middot; {song.bitRate ? `${song.bitRate} KBPS` : ""}
+            {analysis && (
+              <>
+                {" "}&middot; {analysis.bpm} BPM &middot; {analysis.key}
+              </>
+            )}
           </div>
         </div>
       ) : (
