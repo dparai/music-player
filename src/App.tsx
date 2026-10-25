@@ -71,8 +71,6 @@ export function App() {
     }
   }, [currentSong]);
 
-  const audioStateCallback = useRef<(() => { playing: boolean; progress: number }) | null>(null);
-
   useEffect(() => {
     if (!creds) return;
     setLoading(true);
