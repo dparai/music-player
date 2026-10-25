@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subsonic";
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
-import { CROSSFADE_DURATION, bpmRatio } from "@/lib/dj";
+import { CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD, bpmRatio } from "@/lib/dj";
 import styles from "./NowPlaying.module.css";
 
 interface Props {
@@ -16,6 +16,8 @@ interface Props {
   onPrev: () => void;
   nextAnalysis: SongAnalysis | null;
   nextSong: SubsonicSong | null;
+  onPlayingChange?: (playing: boolean, progress: number) => void;
+  togglePlayRef?: React.MutableRefObject<(() => void) | null>;
 }
 
 function formatTime(seconds: number): string {
@@ -31,6 +33,7 @@ export function NowPlaying({
   shuffled, onShuffleToggle,
   onNext, onPrev,
   nextAnalysis, nextSong,
+  onPlayingChange, togglePlayRef,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -48,6 +51,7 @@ export function NowPlaying({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodesRef = useRef<{ A?: MediaElementAudioSourceNode; B?: MediaElementAudioSourceNode }>({});
   const filtersRef = useRef<{ A?: BiquadFilterNode; B?: BiquadFilterNode }>({});
+  const analysersRef = useRef<{ A?: AnalyserNode; B?: AnalyserNode }>({});
   const onNextRef = useRef(onNext);
   const onPrevRef = useRef(onPrev);
   onNextRef.current = onNext;
@@ -65,9 +69,12 @@ export function NowPlaying({
     filter.type = "lowshelf";
     filter.frequency.value = 200;
     filter.gain.value = 0;
-    source.connect(filter).connect(ctx.destination);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(filter).connect(analyser).connect(ctx.destination);
     sourceNodesRef.current[deck] = source;
     filtersRef.current[deck] = filter;
+    analysersRef.current[deck] = analyser;
   }
 
   const waveformBars = useMemo(() => {
@@ -89,6 +96,7 @@ export function NowPlaying({
       skipNextLoadRef.current = false;
       lastSongIdRef.current = song.id;
       crossfadeStartedRef.current = false;
+      const audio = getActiveAudio();
       if ("mediaSession" in navigator) {
         navigator.mediaSession.metadata = new MediaMetadata({
           title: song.title,
@@ -98,6 +106,12 @@ export function NowPlaying({
             ? [{ src: coverArtUrl(creds, song.coverArt, "512"), sizes: "512x512", type: "image/jpeg" }]
             : [],
         });
+        if (audio) {
+          navigator.mediaSession.setActionHandler("play", () => audio.play());
+          navigator.mediaSession.setActionHandler("pause", () => audio.pause());
+          navigator.mediaSession.setActionHandler("previoustrack", () => onPrevRef.current());
+          navigator.mediaSession.setActionHandler("nexttrack", () => onNextRef.current());
+        }
       }
       return;
     }
@@ -130,23 +144,49 @@ export function NowPlaying({
     }
   }, [song, creds, getActiveAudio]);
 
+  const silenceCountRef = useRef(0);
+
   useEffect(() => {
     if (!djMode) return;
 
     const check = () => {
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
+      if (crossfadeStartedRef.current || !nextSong) return;
 
       const remaining = audio.duration - audio.currentTime;
 
-      if (remaining <= CROSSFADE_DURATION && remaining > 0 && !crossfadeStartedRef.current && nextSong) {
+      if (remaining <= CROSSFADE_DURATION && remaining > 0) {
         crossfadeStartedRef.current = true;
         startCrossfade();
+        return;
+      }
+
+      if (remaining <= EARLY_FADE_WINDOW && remaining > CROSSFADE_DURATION) {
+        const deck = activeDeckRef.current;
+        const analyser = analysersRef.current[deck];
+        if (analyser) {
+          const buf = new Float32Array(analyser.fftSize);
+          analyser.getFloatTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) sum += buf[i]! * buf[i]!;
+          const rms = Math.sqrt(sum / buf.length);
+          if (rms < SILENCE_THRESHOLD) {
+            silenceCountRef.current++;
+            if (silenceCountRef.current >= 3) {
+              crossfadeStartedRef.current = true;
+              silenceCountRef.current = 0;
+              startCrossfade();
+            }
+          } else {
+            silenceCountRef.current = 0;
+          }
+        }
       }
     };
 
     const interval = setInterval(check, 200);
-    return () => clearInterval(interval);
+    return () => { clearInterval(interval); silenceCountRef.current = 0; };
   }, [djMode, nextSong, getActiveAudio, getInactiveAudio]);
 
   function startCrossfade() {
@@ -203,6 +243,7 @@ export function NowPlaying({
         outgoing.pause();
         outgoing.src = "";
         incoming.volume = 1;
+        incoming.playbackRate = 1;
         if (outFilter) outFilter.gain.value = 0;
         if (inFilter) inFilter.gain.value = 0;
 
@@ -224,9 +265,22 @@ export function NowPlaying({
     else audio.pause();
   }, [getActiveAudio]);
 
+  useEffect(() => {
+    if (togglePlayRef) togglePlayRef.current = togglePlay;
+    return () => { if (togglePlayRef) togglePlayRef.current = null; };
+  }, [togglePlay, togglePlayRef]);
+
+  const onPlayingChangeRef = useRef(onPlayingChange);
+  onPlayingChangeRef.current = onPlayingChange;
+
   function handleTimeUpdate() {
     const audio = getActiveAudio();
-    if (audio) setCurrentTime(audio.currentTime);
+    if (audio) {
+      setCurrentTime(audio.currentTime);
+      if (onPlayingChangeRef.current && audio.duration > 0) {
+        onPlayingChangeRef.current(!audio.paused, audio.currentTime / audio.duration);
+      }
+    }
   }
 
   function handleLoadedMetadata() {
@@ -249,6 +303,13 @@ export function NowPlaying({
       if (crossfadeTimerRef.current) {
         clearInterval(crossfadeTimerRef.current);
         crossfadeTimerRef.current = null;
+      }
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+        sourceNodesRef.current = {};
+        filtersRef.current = {};
+        analysersRef.current = {};
       }
     };
   }, []);
