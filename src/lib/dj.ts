@@ -140,4 +140,4 @@ export function pickNextDJ(
   return top[0]!.song;
 }
 
-export const CROSSFADE_DURATION = 5; // seconds
+export const CROSSFADE_DURATION = 8; // seconds
