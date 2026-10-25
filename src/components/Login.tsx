@@ -8,7 +8,7 @@ interface Props {
 }
 
 export function Login({ onLogin }: Props) {
-  const server = import.meta.env.DEV ? "" : "https://deepakmusic.duckdns.org";
+  const server = import.meta.env.DEV ? "" : window.location.origin;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");

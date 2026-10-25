@@ -130,7 +130,7 @@ let analysisCache: Record<string, SongAnalysis> | null = null;
 
 export async function fetchAnalysis(): Promise<Record<string, SongAnalysis>> {
   if (analysisCache) return analysisCache;
-  const base = import.meta.env.DEV ? "" : "https://deepakmusic.duckdns.org";
+  const base = import.meta.env.DEV ? "" : window.location.origin;
   const res = await fetch(`${base}/api/analysis.json`);
   if (!res.ok) return {};
   analysisCache = await res.json();
