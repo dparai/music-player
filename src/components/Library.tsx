@@ -7,9 +7,8 @@ interface Props {
   songs: SubsonicSong[];
   creds: SubsonicCredentials;
   currentSongId: string | null;
-  onPlay: (song: SubsonicSong, queue: SubsonicSong[]) => void;
+  onPlay: (song: SubsonicSong) => void;
   onPlayNext: (song: SubsonicSong) => void;
-  onAddToQueue: (song: SubsonicSong) => void;
 }
 
 type SortKey = "title" | "artist" | "album" | "created";
@@ -23,7 +22,7 @@ function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export function Library({ songs, creds, currentSongId, onPlay, onPlayNext, onAddToQueue }: Props) {
+export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Props) {
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<SortKey>("title");
   const [scrollTop, setScrollTop] = useState(0);
@@ -112,12 +111,6 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext, onAdd
     setContextMenu(null);
   }
 
-  function handleAddToQueue(song: SubsonicSong) {
-    onAddToQueue(song);
-    showToast(`Added to Queue: ${song.title}`);
-    setContextMenu(null);
-  }
-
   // Find which letter badge should appear before a visible item
   function getLetterBadge(globalIndex: number): string | null {
     if (!letterGroups) return null;
@@ -173,7 +166,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext, onAdd
                 {badge && <div className={styles.letterBadge}>{badge}</div>}
                 <button
                   className={`${styles.row} ${song.id === currentSongId ? styles.active : ""}`}
-                  onClick={() => onPlay(song, filtered)}
+                  onClick={() => onPlay(song)}
                 >
                   {song.coverArt ? (
                     <img
@@ -212,9 +205,6 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext, onAdd
         >
           <button className={styles.ctxOption} onClick={() => handlePlayNext(contextMenu.song)}>
             &#9654; Play Next
-          </button>
-          <button className={styles.ctxOption} onClick={() => handleAddToQueue(contextMenu.song)}>
-            + Add to Queue
           </button>
         </div>
       )}
