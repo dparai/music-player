@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subsonic";
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
+import { CROSSFADE_DURATION, bpmRatio } from "@/lib/dj";
 import styles from "./NowPlaying.module.css";
 
 interface Props {
@@ -9,10 +10,14 @@ interface Props {
   currentIndex: number;
   creds: SubsonicCredentials;
   analysis: SongAnalysis | null;
+  djMode: boolean;
+  onDjModeToggle: () => void;
   onNext: () => void;
   onPrev: () => void;
   onQueueRemove: (index: number) => void;
   onQueueReorder: (from: number, to: number) => void;
+  nextAnalysis: SongAnalysis | null;
+  nextSong: SubsonicSong | null;
 }
 
 function formatTime(seconds: number): string {
@@ -22,23 +27,49 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext, onPrev, onQueueRemove, onQueueReorder }: Props) {
-  const audioRef = useRef<HTMLAudioElement>(null);
+export function NowPlaying({
+  song, queue, currentIndex, creds, analysis,
+  djMode, onDjModeToggle, onNext, onPrev,
+  onQueueRemove, onQueueReorder,
+  nextAnalysis, nextSong,
+}: Props) {
+  const audioARef = useRef<HTMLAudioElement>(null);
+  const audioBRef = useRef<HTMLAudioElement>(null);
+  const [activeDeck, setActiveDeck] = useState<"A" | "B">("A");
+  const activeDeckRef = useRef<"A" | "B">("A");
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [showQueue, setShowQueue] = useState(false);
+  const [crossfading, setCrossfading] = useState(false);
   const waveformRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ index: number; startY: number } | null>(null);
+  const crossfadeTimerRef = useRef<number | null>(null);
+  const crossfadeStartedRef = useRef(false);
+  const lastSongIdRef = useRef<string | null>(null);
 
   const waveformBars = useMemo(() => {
     return Array.from({ length: 60 }, () => 10 + Math.random() * 35);
   }, [song?.id]);
 
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !song) return;
+  const getActiveAudio = useCallback(() => {
+    return activeDeckRef.current === "A" ? audioARef.current : audioBRef.current;
+  }, []);
 
+  const getInactiveAudio = useCallback(() => {
+    return activeDeckRef.current === "A" ? audioBRef.current : audioARef.current;
+  }, []);
+
+  // Load and play the current song
+  useEffect(() => {
+    if (!song || song.id === lastSongIdRef.current) return;
+    lastSongIdRef.current = song.id;
+
+    const audio = getActiveAudio();
+    if (!audio) return;
+
+    crossfadeStartedRef.current = false;
+    audio.volume = 1;
+    audio.playbackRate = 1;
     audio.src = streamUrl(creds, song.id);
     audio.play().then(() => setPlaying(true)).catch(() => {});
 
@@ -56,33 +87,114 @@ export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext,
       navigator.mediaSession.setActionHandler("previoustrack", onPrev);
       navigator.mediaSession.setActionHandler("nexttrack", onNext);
     }
-  }, [song, creds, onNext, onPrev]);
+  }, [song, creds, onNext, onPrev, getActiveAudio]);
+
+  // Crossfade logic: monitor time and trigger crossfade near end
+  useEffect(() => {
+    if (!djMode) return;
+
+    const check = () => {
+      const audio = getActiveAudio();
+      if (!audio || audio.paused || !isFinite(audio.duration)) return;
+
+      const remaining = audio.duration - audio.currentTime;
+
+      if (remaining <= CROSSFADE_DURATION && remaining > 0 && !crossfadeStartedRef.current && nextSong) {
+        crossfadeStartedRef.current = true;
+        startCrossfade();
+      }
+    };
+
+    const interval = setInterval(check, 200);
+    return () => clearInterval(interval);
+  }, [djMode, nextSong, getActiveAudio, getInactiveAudio]);
+
+  function startCrossfade() {
+    const outgoing = getActiveAudio();
+    const incoming = getInactiveAudio();
+    if (!outgoing || !incoming || !nextSong) return;
+
+    setCrossfading(true);
+
+    // Load next track into inactive audio
+    incoming.src = streamUrl(creds, nextSong.id);
+    incoming.volume = 0;
+
+    // Apply beat-matched playback rate
+    if (analysis && nextAnalysis) {
+      const rate = bpmRatio(analysis.bpm, nextAnalysis.bpm);
+      incoming.playbackRate = rate;
+    } else {
+      incoming.playbackRate = 1;
+    }
+
+    incoming.play().catch(() => {});
+
+    const steps = CROSSFADE_DURATION * 20; // 50ms intervals
+    let step = 0;
+
+    if (crossfadeTimerRef.current) clearInterval(crossfadeTimerRef.current);
+
+    crossfadeTimerRef.current = window.setInterval(() => {
+      step++;
+      const progress = step / steps;
+
+      // Equal-power crossfade curve
+      outgoing.volume = Math.cos(progress * Math.PI / 2);
+      incoming.volume = Math.sin(progress * Math.PI / 2);
+
+      if (step >= steps) {
+        clearInterval(crossfadeTimerRef.current!);
+        crossfadeTimerRef.current = null;
+        outgoing.pause();
+        outgoing.src = "";
+        incoming.volume = 1;
+        incoming.playbackRate = 1; // Reset after fade complete
+
+        // Swap active
+        const newDeck = activeDeckRef.current === "A" ? "B" : "A";
+        activeDeckRef.current = newDeck;
+        setActiveDeck(newDeck);
+        setCrossfading(false);
+
+        // Tell App to advance
+        onNext();
+      }
+    }, 50);
+  }
 
   const togglePlay = useCallback(() => {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (!audio) return;
     if (audio.paused) audio.play();
     else audio.pause();
-  }, []);
+  }, [getActiveAudio]);
 
   function handleTimeUpdate() {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (audio) setCurrentTime(audio.currentTime);
   }
 
   function handleLoadedMetadata() {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (audio) setDuration(audio.duration);
   }
 
   function handleWaveformClick(e: React.MouseEvent) {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     const el = waveformRef.current;
     if (!audio || !el) return;
     const rect = el.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     audio.currentTime = ratio * duration;
     setCurrentTime(audio.currentTime);
+  }
+
+  function handleEnded() {
+    if (!djMode) {
+      onNext();
+    }
+    // In DJ mode, crossfade handles the transition
   }
 
   const progress = duration > 0 ? currentTime / duration : 0;
@@ -102,12 +214,20 @@ export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext,
   return (
     <div className={styles.container}>
       <audio
-        ref={audioRef}
-        onTimeUpdate={handleTimeUpdate}
-        onLoadedMetadata={handleLoadedMetadata}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onEnded={onNext}
+        ref={audioARef}
+        onTimeUpdate={activeDeck === "A" ? handleTimeUpdate : undefined}
+        onLoadedMetadata={activeDeck === "A" ? handleLoadedMetadata : undefined}
+        onPlay={activeDeck === "A" ? () => setPlaying(true) : undefined}
+        onPause={activeDeck === "A" ? () => setPlaying(false) : undefined}
+        onEnded={activeDeck === "A" ? handleEnded : undefined}
+      />
+      <audio
+        ref={audioBRef}
+        onTimeUpdate={activeDeck === "B" ? handleTimeUpdate : undefined}
+        onLoadedMetadata={activeDeck === "B" ? handleLoadedMetadata : undefined}
+        onPlay={activeDeck === "B" ? () => setPlaying(true) : undefined}
+        onPause={activeDeck === "B" ? () => setPlaying(false) : undefined}
+        onEnded={activeDeck === "B" ? handleEnded : undefined}
       />
 
       {coverSrc && <div className={styles.bgBlur} style={{ backgroundImage: `url(${coverSrc})` }} />}
@@ -142,7 +262,10 @@ export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext,
 
           <div className={styles.timeRow}>
             <span>{formatTime(currentTime)}</span>
-            <span>{formatTime(duration)}</span>
+            <span>
+              {crossfading && <span className={styles.crossfadeLabel}>CROSSFADING</span>}
+              {formatTime(duration)}
+            </span>
           </div>
 
           <div className={styles.controls}>
@@ -158,6 +281,12 @@ export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext,
           </div>
 
           <div className={styles.extras}>
+            <button
+              className={`${styles.djToggle} ${djMode ? styles.djActive : ""}`}
+              onClick={onDjModeToggle}
+            >
+              DJ
+            </button>
             <button
               className={styles.queueToggle}
               onClick={() => setShowQueue(true)}
@@ -180,7 +309,10 @@ export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext,
           <div className={styles.queueHeader}>
             <button className={styles.queueBack} onClick={() => setShowQueue(false)}>&#8592;</button>
             <h2 className={styles.queueTitle}>Queue</h2>
-            <span className={styles.queueCount}>{upNext.length} songs</span>
+            <span className={styles.queueCount}>
+              {djMode && <span className={styles.djBadge}>DJ</span>}
+              {upNext.length} songs
+            </span>
           </div>
 
           <div className={styles.queueNow}>
@@ -204,7 +336,9 @@ export function NowPlaying({ song, queue, currentIndex, creds, analysis, onNext,
           <div className={styles.queueList}>
             <div className={styles.queueListLabel}>Up Next</div>
             {upNext.length === 0 && (
-              <p className={styles.queueEmpty}>Queue is empty. Add songs from Library.</p>
+              <p className={styles.queueEmpty}>
+                {djMode ? "DJ Mode will auto-pick the next track." : "Queue is empty. Add songs from Library."}
+              </p>
             )}
             {upNext.map((s, i) => {
               const realIndex = currentIndex + 1 + i;
