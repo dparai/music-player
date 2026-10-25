@@ -188,6 +188,7 @@ export function NowPlaying({
         setActiveDeck(newDeck);
         setCrossfading(false);
 
+        if (nextSong) lastSongIdRef.current = nextSong.id;
         onNext();
       }
     }, 50);
