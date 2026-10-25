@@ -24,6 +24,35 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
+        runtimeCaching: [
+          {
+            urlPattern: /\/rest\/getCoverArt/,
+            handler: "CacheFirst",
+            options: {
+              cacheName: "cover-art",
+              expiration: { maxEntries: 500, maxAgeSeconds: 30 * 24 * 60 * 60 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            urlPattern: /\/rest\/search3/,
+            handler: "NetworkFirst",
+            options: {
+              cacheName: "song-list",
+              expiration: { maxEntries: 20, maxAgeSeconds: 7 * 24 * 60 * 60 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            urlPattern: /\/api\/analysis\.json/,
+            handler: "StaleWhileRevalidate",
+            options: {
+              cacheName: "analysis-data",
+              expiration: { maxEntries: 1, maxAgeSeconds: 7 * 24 * 60 * 60 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+        ],
       },
     }),
   ],
