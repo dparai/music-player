@@ -44,9 +44,14 @@ export function NowPlaying({
   const crossfadeTimerRef = useRef<number | null>(null);
   const crossfadeStartedRef = useRef(false);
   const lastSongIdRef = useRef<string | null>(null);
+  const skipNextLoadRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodesRef = useRef<{ A?: MediaElementAudioSourceNode; B?: MediaElementAudioSourceNode }>({});
   const filtersRef = useRef<{ A?: BiquadFilterNode; B?: BiquadFilterNode }>({});
+  const onNextRef = useRef(onNext);
+  const onPrevRef = useRef(onPrev);
+  onNextRef.current = onNext;
+  onPrevRef.current = onPrev;
 
   function ensureAudioGraph(deck: "A" | "B") {
     const audio = deck === "A" ? audioARef.current : audioBRef.current;
@@ -78,7 +83,26 @@ export function NowPlaying({
   }, []);
 
   useEffect(() => {
-    if (!song || song.id === lastSongIdRef.current) return;
+    if (!song) return;
+
+    if (skipNextLoadRef.current) {
+      skipNextLoadRef.current = false;
+      lastSongIdRef.current = song.id;
+      crossfadeStartedRef.current = false;
+      if ("mediaSession" in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: song.title,
+          artist: song.artist ?? "Unknown",
+          album: song.album ?? "Unknown",
+          artwork: song.coverArt
+            ? [{ src: coverArtUrl(creds, song.coverArt, "512"), sizes: "512x512", type: "image/jpeg" }]
+            : [],
+        });
+      }
+      return;
+    }
+
+    if (song.id === lastSongIdRef.current) return;
     lastSongIdRef.current = song.id;
 
     const audio = getActiveAudio();
@@ -101,10 +125,10 @@ export function NowPlaying({
       });
       navigator.mediaSession.setActionHandler("play", () => audio.play());
       navigator.mediaSession.setActionHandler("pause", () => audio.pause());
-      navigator.mediaSession.setActionHandler("previoustrack", onPrev);
-      navigator.mediaSession.setActionHandler("nexttrack", onNext);
+      navigator.mediaSession.setActionHandler("previoustrack", () => onPrevRef.current());
+      navigator.mediaSession.setActionHandler("nexttrack", () => onNextRef.current());
     }
-  }, [song, creds, onNext, onPrev, getActiveAudio]);
+  }, [song, creds, getActiveAudio]);
 
   useEffect(() => {
     if (!djMode) return;
@@ -188,8 +212,8 @@ export function NowPlaying({
         setActiveDeck(newDeck);
         setCrossfading(false);
 
-        if (nextSong) lastSongIdRef.current = nextSong.id;
-        onNext();
+        skipNextLoadRef.current = true;
+        onNextRef.current();
       }
     }, 50);
   }
