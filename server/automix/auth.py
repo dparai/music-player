@@ -1,19 +1,21 @@
-"""AutoMix auth that checks the real Brook user against Navidrome.
+"""AutoMix auth: Brook users are verified against Navidrome.
 
-The bearer token "brook-automix-2026" is compiled into the PWA bundle, so
-anyone can read it. That was harmless for read-only endpoints, but /rescan and
-the planned /transitions render endpoint burn CPU on request. The PWA now also
-sends X-Subsonic-User / -Token / -Salt (same salted-MD5 scheme as /rest/*);
-this dependency verifies them with Navidrome's /rest/ping.
+The PWA sends X-Subsonic-User / -Token / -Salt (same salted-MD5 scheme as
+/rest/*); this dependency checks them with Navidrome's /rest/ping.
 
     from auth import require_user
     @app.post("/automix/rescan", dependencies=[Depends(require_user)])
 
-Set AUTOMIX_ALLOW_BEARER=0 once every client sends Subsonic headers.
+The bearer token is for local scripts only (cron's /rescan call). It is read
+from AUTOMIX_TOKEN (EnvironmentFile=/opt/automix/automix.env, mode 600) and
+is only accepted on direct connections to 127.0.0.1:8000, never through
+Caddy. The old token "brook-automix-2026" was public (it shipped in the JS
+bundle and this repo), so it is no longer accepted from the internet.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import urllib.parse
@@ -22,8 +24,7 @@ import urllib.request
 from fastapi import HTTPException, Request
 
 NAVIDROME = os.environ.get("AUTOMIX_NAVIDROME", "http://127.0.0.1:4533")
-BEARER = os.environ.get("AUTOMIX_TOKEN", "brook-automix-2026")
-ALLOW_BEARER = os.environ.get("AUTOMIX_ALLOW_BEARER", "1") == "1"
+BEARER = os.environ.get("AUTOMIX_TOKEN") or None
 
 
 def _navidrome_ok(user: str, token: str, salt: str) -> bool | None:
@@ -36,17 +37,26 @@ def _navidrome_ok(user: str, token: str, salt: str) -> bool | None:
         return None
 
 
+def _local_bearer_ok(request: Request) -> bool:
+    """Valid bearer on a direct local connection (Caddy always adds X-Forwarded-For)."""
+    if not BEARER or "x-forwarded-for" in request.headers:
+        return False
+    client = request.client.host if request.client else ""
+    if client not in ("127.0.0.1", "::1"):
+        return False
+    return hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {BEARER}")
+
+
 def require_user(request: Request) -> str:
     h = request.headers
     user, token, salt = h.get("x-subsonic-user"), h.get("x-subsonic-token"), h.get("x-subsonic-salt")
-    bearer_ok = ALLOW_BEARER and h.get("authorization") == f"Bearer {BEARER}"
     if user and token and salt:
         ok = _navidrome_ok(urllib.parse.unquote(user), token, salt)  # the PWA URL-encodes it
         if ok:
             return user
-        if ok is None and bearer_ok:
-            return "bearer"  # Navidrome unreachable: don't lock the app out meanwhile
-        raise HTTPException(status_code=401 if ok is False else 503, detail="could not verify Subsonic credentials")
-    if bearer_ok:
-        return "bearer"
+        if ok is None:
+            raise HTTPException(status_code=503, detail="Navidrome unavailable, try again shortly")
+        raise HTTPException(status_code=401, detail="invalid Subsonic credentials")
+    if _local_bearer_ok(request):
+        return "local"
     raise HTTPException(status_code=401, detail="missing credentials")

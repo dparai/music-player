@@ -14,6 +14,8 @@ echo "$(date): Running BPM/key analysis" >> "$LOG"
 /opt/brook-analysis/venv/bin/python /opt/brook-analysis/analyze.py >> "$LOG" 2>&1
 echo "$(date): Analysis complete" >> "$LOG"
 echo "$(date): Triggering AutoMix rescan" >> "$LOG"
+# Local-only token, kept out of the repo (mode 600, also used by automix.service).
+AUTOMIX_TOKEN=$(sed -n 's/^AUTOMIX_TOKEN=//p' /opt/automix/automix.env)
 curl -fsS -X POST http://127.0.0.1:8000/automix/rescan \
-  -H "Authorization: Bearer ${AUTOMIX_TOKEN:-brook-automix-2026}" >> "$LOG" 2>&1
+  -H "Authorization: Bearer ${AUTOMIX_TOKEN}" >> "$LOG" 2>&1
 echo >> "$LOG"
