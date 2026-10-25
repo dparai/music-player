@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
 import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
 import { pickNextDJ } from "@/lib/dj";
+import type { AutoMixTrack } from "@/lib/automix";
+import { getAutoMixTracks } from "@/lib/automix";
 import {
   saveCredentials, loadCredentials, clearCredentials,
   saveLastPlayed, loadLastPlayed,
@@ -34,6 +36,7 @@ export function App() {
   const [miniProgress, setMiniProgress] = useState(0);
   const togglePlayRef = useRef<(() => void) | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
+  const [autoMixTracks, setAutoMixTracks] = useState<AutoMixTrack[]>([]);
   const [djMode, setDjMode] = useState(false);
   const [shuffled, setShuffled] = useState(false);
   const [currentSongId, setCurrentSongId] = useState<string | null>(null);
@@ -98,6 +101,7 @@ export function App() {
     if (!creds) return;
     setLoading(true);
     fetchAnalysis().then(setAnalysisData).catch(() => {});
+    getAutoMixTracks().then(setAutoMixTracks).catch(() => {});
     getAllSongs(creds)
       .then((s) => {
         setSongs(s);
@@ -243,6 +247,7 @@ export function App() {
                 nextSong={nextSong}
                 onPlayingChange={handlePlayingChange}
                 togglePlayRef={togglePlayRef}
+                autoMixTracks={autoMixTracks}
               />
             </div>
             <div className={styles.view} style={{ display: view === "library" ? "flex" : "none" }}>
