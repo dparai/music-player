@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
 import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
+import { pickNextDJ } from "@/lib/dj";
 import {
   saveCredentials, loadCredentials, clearCredentials,
   saveQueue, loadQueue,
@@ -14,6 +15,8 @@ import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
 
+const RECENT_HISTORY = 20;
+
 export function App() {
   const [creds, setCreds] = useState<SubsonicCredentials | null>(loadCredentials);
   const [songs, setSongs] = useState<SubsonicSong[]>([]);
@@ -24,11 +27,50 @@ export function App() {
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
+  const [djMode, setDjMode] = useState(false);
+  const recentIdsRef = useRef<Set<string>>(new Set());
 
   const currentSong = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] ?? null : null;
   const currentAnalysis = currentSong ? lookupAnalysis(analysisData, currentSong) : null;
 
-  // Expose audio state for MiniPlayer via NowPlaying's audio element
+  // Compute next song and its analysis for crossfade
+  const nextSongInQueue = currentIndex >= 0 && currentIndex < queue.length - 1 ? queue[currentIndex + 1]! : null;
+
+  // In DJ mode with no queued next song, pre-pick one
+  const djNextSong = useRef<SubsonicSong | null>(null);
+
+  // Determine the actual next song (queued or DJ-picked)
+  const getNextSong = useCallback((): SubsonicSong | null => {
+    if (nextSongInQueue) return nextSongInQueue;
+    if (!djMode || !currentAnalysis || songs.length === 0) return null;
+
+    if (!djNextSong.current) {
+      djNextSong.current = pickNextDJ(
+        currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis,
+      );
+    }
+    return djNextSong.current;
+  }, [nextSongInQueue, djMode, currentAnalysis, songs, analysisData]);
+
+  const nextSong = getNextSong();
+  const nextAnalysis = nextSong ? lookupAnalysis(analysisData, nextSong) : null;
+
+  // Clear DJ pre-pick when song changes
+  useEffect(() => {
+    djNextSong.current = null;
+  }, [currentSong?.id]);
+
+  // Track recently played
+  useEffect(() => {
+    if (currentSong) {
+      recentIdsRef.current.add(currentSong.id);
+      if (recentIdsRef.current.size > RECENT_HISTORY) {
+        const first = recentIdsRef.current.values().next().value;
+        if (first) recentIdsRef.current.delete(first);
+      }
+    }
+  }, [currentSong]);
+
   const audioStateCallback = useRef<(() => { playing: boolean; progress: number }) | null>(null);
 
   useEffect(() => {
@@ -49,7 +91,6 @@ export function App() {
             return;
           }
         }
-        // No saved queue — check last played or default to first song
         const lastId = loadLastPlayed();
         if (lastId) {
           const lastSong = s.find((song) => song.id === lastId);
@@ -82,7 +123,6 @@ export function App() {
     saveView(view);
   }, [view]);
 
-  // Listen for logout event from Library
   useEffect(() => {
     function onLogout() { handleLogout(); }
     window.addEventListener("brook-logout", onLogout);
@@ -100,6 +140,7 @@ export function App() {
     setSongs([]);
     setQueue([]);
     setCurrentIndex(-1);
+    setDjMode(false);
   }
 
   function handlePlay(song: SubsonicSong, songList: SubsonicSong[]) {
@@ -109,8 +150,27 @@ export function App() {
   }
 
   const handleNext = useCallback(() => {
+    if (djMode && currentIndex >= queue.length - 1) {
+      // No more queued songs — DJ auto-picks
+      const picked = djNextSong.current;
+      if (picked) {
+        setQueue((prev) => [...prev, picked]);
+        setCurrentIndex((i) => i + 1);
+        djNextSong.current = null;
+        return;
+      }
+      // Fallback: pick now
+      if (currentAnalysis && songs.length > 0) {
+        const next = pickNextDJ(currentAnalysis, songs, analysisData, recentIdsRef.current, lookupAnalysis);
+        if (next) {
+          setQueue((prev) => [...prev, next]);
+          setCurrentIndex((i) => i + 1);
+          return;
+        }
+      }
+    }
     setCurrentIndex((i) => (i < queue.length - 1 ? i + 1 : i));
-  }, [queue.length]);
+  }, [queue.length, djMode, currentIndex, currentAnalysis, songs, analysisData]);
 
   const handlePrev = useCallback(() => {
     setCurrentIndex((i) => (i > 0 ? i - 1 : i));
@@ -154,21 +214,31 @@ export function App() {
   }
 
   function handleTogglePlay() {
-    // Toggle via the audio element in NowPlaying
-    const audio = document.querySelector("audio");
-    if (audio) {
-      if (audio.paused) audio.play();
-      else audio.pause();
+    const audios = document.querySelectorAll("audio");
+    for (const audio of audios) {
+      if (audio.src && !audio.paused) {
+        audio.pause();
+        return;
+      }
+    }
+    for (const audio of audios) {
+      if (audio.src) {
+        audio.play();
+        return;
+      }
     }
   }
 
-  // Poll audio state for mini player
+  // Poll audio state for mini player (find the active audio)
   useEffect(() => {
     const interval = setInterval(() => {
-      const audio = document.querySelector("audio");
-      if (audio) {
-        setPlaying(!audio.paused);
-        setProgress(audio.duration > 0 ? audio.currentTime / audio.duration : 0);
+      const audios = document.querySelectorAll("audio");
+      for (const audio of audios) {
+        if (audio.src && audio.duration > 0) {
+          setPlaying(!audio.paused);
+          setProgress(audio.currentTime / audio.duration);
+          break;
+        }
       }
     }, 300);
     return () => clearInterval(interval);
@@ -190,10 +260,14 @@ export function App() {
                 currentIndex={currentIndex}
                 creds={creds}
                 analysis={currentAnalysis}
+                djMode={djMode}
+                onDjModeToggle={() => setDjMode((d) => !d)}
                 onNext={handleNext}
                 onPrev={handlePrev}
                 onQueueRemove={handleQueueRemove}
                 onQueueReorder={handleQueueReorder}
+                nextAnalysis={nextAnalysis}
+                nextSong={nextSong}
               />
             </div>
             <div className={styles.view} style={{ display: view === "library" ? "flex" : "none" }}>
