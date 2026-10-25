@@ -140,6 +140,6 @@ export function pickNextDJ(
   return top[0]!.song;
 }
 
-export const CROSSFADE_DURATION = 10;
+export const CROSSFADE_DURATION = 15;
 export const EARLY_FADE_WINDOW = 20;
 export const SILENCE_THRESHOLD = 0.01;
