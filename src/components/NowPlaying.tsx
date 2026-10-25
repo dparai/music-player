@@ -54,8 +54,11 @@ export function NowPlaying({
   const analysersRef = useRef<{ A?: AnalyserNode; B?: AnalyserNode }>({});
   const onNextRef = useRef(onNext);
   const onPrevRef = useRef(onPrev);
+  const startCrossfadeRef = useRef<() => void>(() => {});
+  const nextSongRef = useRef(nextSong);
   onNextRef.current = onNext;
   onPrevRef.current = onPrev;
+  nextSongRef.current = nextSong;
 
   function ensureAudioGraph(deck: "A" | "B") {
     const audio = deck === "A" ? audioARef.current : audioBRef.current;
@@ -126,7 +129,10 @@ export function NowPlaying({
     audio.volume = 1;
     audio.playbackRate = 1;
     audio.src = streamUrl(creds, song.id);
-    audio.play().then(() => setPlaying(true)).catch(() => {});
+    audio.play().then(() => {
+      setPlaying(true);
+      ensureAudioGraph(activeDeckRef.current);
+    }).catch(() => {});
 
     if ("mediaSession" in navigator) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -152,13 +158,13 @@ export function NowPlaying({
     const check = () => {
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
-      if (crossfadeStartedRef.current || !nextSong) return;
+      if (crossfadeStartedRef.current || !nextSongRef.current) return;
 
       const remaining = audio.duration - audio.currentTime;
 
       if (remaining <= CROSSFADE_DURATION && remaining > 0) {
         crossfadeStartedRef.current = true;
-        startCrossfade();
+        startCrossfadeRef.current();
         return;
       }
 
@@ -176,7 +182,7 @@ export function NowPlaying({
             if (silenceCountRef.current >= 3) {
               crossfadeStartedRef.current = true;
               silenceCountRef.current = 0;
-              startCrossfade();
+              startCrossfadeRef.current();
             }
           } else {
             silenceCountRef.current = 0;
@@ -187,12 +193,13 @@ export function NowPlaying({
 
     const interval = setInterval(check, 200);
     return () => { clearInterval(interval); silenceCountRef.current = 0; };
-  }, [djMode, nextSong, getActiveAudio, getInactiveAudio]);
+  }, [djMode, getActiveAudio]);
 
   function startCrossfade() {
     const outgoing = getActiveAudio();
     const incoming = getInactiveAudio();
     if (!outgoing || !incoming || !nextSong) return;
+
 
     setCrossfading(true);
 
@@ -257,6 +264,7 @@ export function NowPlaying({
       }
     }, 50);
   }
+  startCrossfadeRef.current = startCrossfade;
 
   const togglePlay = useCallback(() => {
     const audio = getActiveAudio();
@@ -339,16 +347,16 @@ export function NowPlaying({
         ref={audioARef}
         onTimeUpdate={activeDeck === "A" ? handleTimeUpdate : undefined}
         onLoadedMetadata={activeDeck === "A" ? handleLoadedMetadata : undefined}
-        onPlay={activeDeck === "A" ? () => setPlaying(true) : undefined}
-        onPause={activeDeck === "A" ? () => setPlaying(false) : undefined}
+        onPlay={activeDeck === "A" ? () => { setPlaying(true); onPlayingChangeRef.current?.(true, currentTime / (duration || 1)); } : undefined}
+        onPause={activeDeck === "A" ? () => { setPlaying(false); onPlayingChangeRef.current?.(false, currentTime / (duration || 1)); } : undefined}
         onEnded={activeDeck === "A" ? handleEnded : undefined}
       />
       <audio
         ref={audioBRef}
         onTimeUpdate={activeDeck === "B" ? handleTimeUpdate : undefined}
         onLoadedMetadata={activeDeck === "B" ? handleLoadedMetadata : undefined}
-        onPlay={activeDeck === "B" ? () => setPlaying(true) : undefined}
-        onPause={activeDeck === "B" ? () => setPlaying(false) : undefined}
+        onPlay={activeDeck === "B" ? () => { setPlaying(true); onPlayingChangeRef.current?.(true, currentTime / (duration || 1)); } : undefined}
+        onPause={activeDeck === "B" ? () => { setPlaying(false); onPlayingChangeRef.current?.(false, currentTime / (duration || 1)); } : undefined}
         onEnded={activeDeck === "B" ? handleEnded : undefined}
       />
 
