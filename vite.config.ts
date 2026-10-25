@@ -75,17 +75,17 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/rest": {
-        target: "https://deepakmusic.duckdns.org",
+        target: "https://dpkmusic.duckdns.org",
         changeOrigin: true,
         secure: true,
       },
       "/api": {
-        target: "https://deepakmusic.duckdns.org",
+        target: "https://dpkmusic.duckdns.org",
         changeOrigin: true,
         secure: true,
       },
       "/automix": {
-        target: "https://deepakmusic.duckdns.org",
+        target: "https://dpkmusic.duckdns.org",
         changeOrigin: true,
         secure: true,
       },

@@ -47,16 +47,24 @@ def _local_bearer_ok(request: Request) -> bool:
     return hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {BEARER}")
 
 
+def _deny(status: int, reason: str, request: Request, user: str | None) -> HTTPException:
+    # Reason and username only, never tokens: shows in `journalctl -u automix`.
+    print(f"auth denied ({status}): {reason}; user={user!r} path={request.url.path}", flush=True)
+    return HTTPException(status_code=status, detail=reason)
+
+
 def require_user(request: Request) -> str:
     h = request.headers
     user, token, salt = h.get("x-subsonic-user"), h.get("x-subsonic-token"), h.get("x-subsonic-salt")
     if user and token and salt:
-        ok = _navidrome_ok(urllib.parse.unquote(user), token, salt)  # the PWA URL-encodes it
+        name = urllib.parse.unquote(user)  # the PWA URL-encodes it
+        ok = _navidrome_ok(name, token, salt)
         if ok:
-            return user
+            return name
         if ok is None:
-            raise HTTPException(status_code=503, detail="Navidrome unavailable, try again shortly")
-        raise HTTPException(status_code=401, detail="invalid Subsonic credentials")
+            raise _deny(503, "Navidrome unavailable, try again shortly", request, name)
+        raise _deny(401, "invalid Subsonic credentials", request, name)
     if _local_bearer_ok(request):
         return "local"
-    raise HTTPException(status_code=401, detail="missing credentials")
+    old = h.get("authorization", "").startswith("Bearer ")
+    raise _deny(401, "missing credentials" + (" (bearer only: outdated app, reload it)" if old else ""), request, None)
