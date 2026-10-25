@@ -1,4 +1,7 @@
 import type { SubsonicSong } from "./subsonic";
+import { buildNameIndex, matchByName, type NameIndex } from "./match";
+import { loadCredentials } from "./storage";
+import md5 from "md5";
 
 const AUTOMIX_TOKEN = "brook-automix-2026";
 
@@ -7,11 +10,27 @@ function automixUrl(path: string): string {
   return `${base}/automix${path}`;
 }
 
+// The bearer token ships in the bundle, so it is public. The Subsonic
+// headers let the server verify the real user against Navidrome instead
+// (see server/automix/auth.py); servers that don't check them ignore them.
+function subsonicAuthHeaders(): Record<string, string> {
+  const creds = loadCredentials();
+  if (!creds) return {};
+  const salt = Math.random().toString(36).slice(2, 10);
+  return {
+    // Header values must be Latin-1: a non-Latin username would make fetch throw.
+    "X-Subsonic-User": encodeURIComponent(creds.username),
+    "X-Subsonic-Token": md5(creds.password + salt),
+    "X-Subsonic-Salt": salt,
+  };
+}
+
 async function automixFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(automixUrl(path), {
     ...init,
     headers: {
       ...init?.headers,
+      ...subsonicAuthHeaders(),
       Authorization: `Bearer ${AUTOMIX_TOKEN}`,
     },
   });
@@ -27,6 +46,10 @@ export interface AutoMixTrack {
   mix_in_point: number;
   mix_out_point: number;
   duration: number;
+  // Added by analysis v2 (server/automix); absent on older servers.
+  navidrome_id?: string | null;
+  key?: string | null;
+  lufs?: number | null;
 }
 
 export interface AutoMixTrackDetail extends AutoMixTrack {
@@ -43,30 +66,41 @@ export async function getAutoMixTracks(): Promise<AutoMixTrack[]> {
   return trackCache;
 }
 
-export async function getAutoMixTrack(trackId: string): Promise<AutoMixTrackDetail> {
-  return automixFetch<AutoMixTrackDetail>(`/tracks/${trackId}`);
+const detailCache = new Map<string, Promise<AutoMixTrackDetail | null>>();
+
+// Full beat grid for one track. Cached; resolves null on failure so callers
+// can fall back to an unsynced crossfade.
+export function getAutoMixTrack(trackId: string): Promise<AutoMixTrackDetail | null> {
+  let p = detailCache.get(trackId);
+  if (!p) {
+    p = automixFetch<AutoMixTrackDetail>(`/tracks/${trackId}`).catch(() => {
+      detailCache.delete(trackId);
+      return null;
+    });
+    detailCache.set(trackId, p);
+  }
+  return p;
 }
+
+interface TrackIndex {
+  byNavidromeId: Map<string, AutoMixTrack>;
+  byName: NameIndex<AutoMixTrack>;
+}
+
+const trackIndexes = new WeakMap<AutoMixTrack[], TrackIndex>();
 
 export function findAutoMixTrack(
   tracks: AutoMixTrack[],
   song: SubsonicSong,
 ): AutoMixTrack | null {
-  const title = song.title;
-  const artist = song.artist;
-  const primaryArtist = artist?.split(/[;,&]/).map(s => s.trim())[0] ?? "";
-  for (const t of tracks) {
-    const name = t.filename.replace(/\.[^.]+$/, "");
-    if (
-      name === title ||
-      name === `${artist} - ${title}` ||
-      name === `${title} - ${artist}` ||
-      name === `${primaryArtist} - ${title}` ||
-      name === `${title} - ${primaryArtist}`
-    ) {
-      return t;
-    }
+  let index = trackIndexes.get(tracks);
+  if (!index) {
+    const byNavidromeId = new Map<string, AutoMixTrack>();
+    for (const t of tracks) if (t.navidrome_id) byNavidromeId.set(t.navidrome_id, t);
+    index = { byNavidromeId, byName: buildNameIndex(tracks.map((t) => [t.filename, t])) };
+    trackIndexes.set(tracks, index);
   }
-  return null;
+  return index.byNavidromeId.get(song.id) ?? matchByName(index.byName, song);
 }
 
 export interface AutoMixStats {
@@ -81,4 +115,5 @@ export async function getAutoMixStats(): Promise<AutoMixStats> {
 
 export function invalidateTrackCache(): void {
   trackCache = null;
+  detailCache.clear();
 }

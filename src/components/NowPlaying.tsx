@@ -1,9 +1,13 @@
 import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subsonic";
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
-import { CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD, bpmRatio } from "@/lib/dj";
-import type { AutoMixTrack } from "@/lib/automix";
-import { findAutoMixTrack } from "@/lib/automix";
+import {
+  CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
+  tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb,
+  downbeatAtOrBefore, phaseError,
+} from "@/lib/dj";
+import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
+import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
 
 interface Props {
@@ -16,12 +20,59 @@ interface Props {
   onShuffleToggle: () => void;
   onNext: () => void;
   onPrev: () => void;
+  // Called when a crossfade finishes: `song` is already playing on the new deck.
+  onAdvance: (song: SubsonicSong) => void;
   nextAnalysis: SongAnalysis | null;
   nextSong: SubsonicSong | null;
   onPlayingChange?: (playing: boolean, progress: number) => void;
   togglePlayRef?: React.MutableRefObject<(() => void) | null>;
   autoMixTracks?: AutoMixTrack[];
 }
+
+type Deck = "A" | "B";
+
+// Per-deck channel strip:
+// <audio> → source → preGain (loudness trim) → analyser → lowshelf (bass) → fader → master limiter
+interface DeckNodes {
+  source: MediaElementAudioSourceNode;
+  preGain: GainNode;
+  analyser: AnalyserNode;
+  shelf: BiquadFilterNode;
+  fader: GainNode;
+}
+
+interface BeatSync {
+  outAnchor: number; // outgoing downbeat the mix starts on (track seconds)
+  inAnchor: number;  // incoming downbeat it is aligned to
+  outBeat: number;   // seconds per beat, outgoing
+  inBeat: number;    // seconds per (tempo-matched) beat, incoming track time
+  outRate: number;   // outgoing playbackRate during the mix
+}
+
+interface Fade {
+  song: SubsonicSong;
+  outDeck: Deck;
+  inDeck: Deck;
+  end: number;  // AudioContext time the curves finish
+  rate: number; // incoming playbackRate while mixing
+  bar: number;  // seconds per bar, for the tempo ramp afterwards
+  sync: BeatSync | null;
+  // Audio not unlocked yet: fade element volumes from a timer instead.
+  legacy: { start: number; length: number } | null;
+}
+
+interface Preload {
+  songId: string;
+  deck: Deck;
+  anchor: number | null; // first downbeat the deck is cued to, if known
+}
+
+const PRELOAD_LEAD = 30;    // seconds before the cue to start buffering the next song
+const SCHEDULE_LEAD = 1.5;  // seconds before the cue to arm the precise start timer
+const MIN_CONFIDENCE = 0.4; // beat-grid confidence needed to beat-sync
+const MAX_INTRO_CUE = 30;   // don't skip more intro than this to reach the first downbeat
+const CURVE_POINTS = 128;
+const SILENCE_READINGS = 8; // × 200 ms polls
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds)) return "0:00";
@@ -30,38 +81,56 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function dbToGain(db: number): number {
+  return Math.pow(10, db / 20);
+}
+
+function stopDeck(audio: HTMLAudioElement) {
+  audio.pause();
+  // Not `src = ""`: that resolves to the page URL and fetches index.html as audio.
+  audio.removeAttribute("src");
+  audio.load();
+}
+
 export function NowPlaying({
   song, creds, analysis,
   djMode, onDjModeToggle,
   shuffled, onShuffleToggle,
-  onNext, onPrev,
+  onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, togglePlayRef,
   autoMixTracks,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
-  const [activeDeck, setActiveDeck] = useState<"A" | "B">("A");
-  const activeDeckRef = useRef<"A" | "B">("A");
+  const [activeDeck, setActiveDeck] = useState<Deck>("A");
+  const activeDeckRef = useRef<Deck>("A");
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [crossfading, setCrossfading] = useState(false);
   const waveformRef = useRef<HTMLDivElement>(null);
-  const crossfadeTimerRef = useRef<number | null>(null);
-  const crossfadeStartedRef = useRef(false);
   const lastSongIdRef = useRef<string | null>(null);
-  const skipNextLoadRef = useRef(false);
+  const skipNextLoadRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceNodesRef = useRef<{ A?: MediaElementAudioSourceNode; B?: MediaElementAudioSourceNode }>({});
-  const filtersRef = useRef<{ A?: BiquadFilterNode; B?: BiquadFilterNode }>({});
-  const analysersRef = useRef<{ A?: AnalyserNode; B?: AnalyserNode }>({});
+  const masterRef = useRef<DynamicsCompressorNode | null>(null);
+  const decksRef = useRef<Partial<Record<Deck, DeckNodes>>>({});
+  const trimDbRef = useRef<Partial<Record<Deck, number>>>({});
+  const fadeRef = useRef<Fade | null>(null);
+  const fadeTimerRef = useRef<number | null>(null);
+  const startTimerRef = useRef<number | null>(null);
+  const rampTimerRef = useRef<number | null>(null);
+  const preloadRef = useRef<Preload | null>(null);
+  const crossfadeStartedRef = useRef(false);
+  const currentDetailRef = useRef<AutoMixTrackDetail | null>(null);
+  const nextDetailRef = useRef<AutoMixTrackDetail | null>(null);
   const onNextRef = useRef(onNext);
   const onPrevRef = useRef(onPrev);
-  const startCrossfadeRef = useRef<() => void>(() => {});
+  const onAdvanceRef = useRef(onAdvance);
   const nextSongRef = useRef(nextSong);
   onNextRef.current = onNext;
   onPrevRef.current = onPrev;
+  onAdvanceRef.current = onAdvance;
   nextSongRef.current = nextSong;
 
   const serverTrack = useMemo(
@@ -73,35 +142,33 @@ export function NowPlaying({
     [nextSong?.id, autoMixTracks],
   );
 
-  const effectiveBpm = serverTrack?.bpm ?? analysis?.bpm ?? null;
-  const effectiveNextBpm = serverNextTrack?.bpm ?? nextAnalysis?.bpm ?? null;
-  const mixOutPoint = serverTrack?.mix_out_point ?? null;
-  const mixOutPointRef = useRef(mixOutPoint);
-  mixOutPointRef.current = mixOutPoint;
+  // `||`, not `??`: the server stores bpm 0 when it found no beat.
+  const effectiveBpm = serverTrack?.bpm || analysis?.bpm || null;
+  const effectiveNextBpm = serverNextTrack?.bpm || nextAnalysis?.bpm || null;
 
-  function ensureAudioGraph(deck: "A" | "B") {
-    const audio = deck === "A" ? audioARef.current : audioBRef.current;
-    if (!audio || sourceNodesRef.current[deck]) return;
-    if (!audioCtxRef.current) {
-      audioCtxRef.current = new AudioContext();
-    }
-    const ctx = audioCtxRef.current;
-    const source = ctx.createMediaElementSource(audio);
-    const filter = ctx.createBiquadFilter();
-    filter.type = "lowshelf";
-    filter.frequency.value = 200;
-    filter.gain.value = 0;
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(filter).connect(analyser).connect(ctx.destination);
-    sourceNodesRef.current[deck] = source;
-    filtersRef.current[deck] = filter;
-    analysersRef.current[deck] = analyser;
+  // The DJ loop and timers run outside React renders; read live values via refs.
+  const liveRef = useRef({ serverTrack, serverNextTrack, effectiveBpm, effectiveNextBpm });
+  liveRef.current = { serverTrack, serverNextTrack, effectiveBpm, effectiveNextBpm };
+
+  useEffect(() => {
+    currentDetailRef.current = null;
+    if (!serverTrack) return;
+    let alive = true;
+    getAutoMixTrack(serverTrack.id).then((d) => { if (alive) currentDetailRef.current = d; });
+    return () => { alive = false; };
+  }, [serverTrack?.id]);
+
+  useEffect(() => {
+    nextDetailRef.current = null;
+    if (!serverNextTrack) return;
+    let alive = true;
+    getAutoMixTrack(serverNextTrack.id).then((d) => { if (alive) nextDetailRef.current = d; });
+    return () => { alive = false; };
+  }, [serverNextTrack?.id]);
+
+  function audioFor(deck: Deck) {
+    return deck === "A" ? audioARef.current : audioBRef.current;
   }
-
-  const waveformBars = useMemo(() => {
-    return Array.from({ length: 60 }, () => 10 + Math.random() * 35);
-  }, [song?.id]);
 
   const getActiveAudio = useCallback(() => {
     return activeDeckRef.current === "A" ? audioARef.current : audioBRef.current;
@@ -111,65 +178,225 @@ export function NowPlaying({
     return activeDeckRef.current === "A" ? audioBRef.current : audioARef.current;
   }, []);
 
+  // Routes both decks through Web Audio, but only once the AudioContext is
+  // running. An element wired into a context that is still suspended (no
+  // user gesture yet, e.g. an autoplayed restore) stalls at 0:00 while
+  // reporting that it plays. Until then decks play directly and mixes fall
+  // back to element-volume fades. Returns whether the graph is live.
+  function ensureAudioGraph(): boolean {
+    if (!audioCtxRef.current) {
+      const ctx = new AudioContext({ latencyHint: "playback" });
+      const master = ctx.createDynamicsCompressor();
+      // Safety limiter for summed peaks during a mix.
+      master.threshold.value = -1;
+      master.knee.value = 0;
+      master.ratio.value = 20;
+      master.attack.value = 0.003;
+      master.release.value = 0.25;
+      master.connect(ctx.destination);
+      audioCtxRef.current = ctx;
+      masterRef.current = master;
+    }
+    const ctx = audioCtxRef.current;
+    if (decksRef.current.A && decksRef.current.B) return true;
+    if (ctx.state !== "running") {
+      ctx.resume().then(() => { ensureAudioGraph(); }).catch(() => {});
+      return false;
+    }
+    for (const deck of ["A", "B"] as const) {
+      const audio = audioFor(deck);
+      if (!audio || decksRef.current[deck]) continue;
+      const source = ctx.createMediaElementSource(audio);
+      const preGain = ctx.createGain();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048; // ~45 ms window for the silence detector
+      const shelf = ctx.createBiquadFilter();
+      shelf.type = "lowshelf";
+      shelf.frequency.value = 200;
+      shelf.gain.value = 0;
+      preGain.gain.value = dbToGain(trimDbRef.current[deck] ?? 0);
+      const fader = ctx.createGain();
+      // During a legacy fade both decks are audible and element volume does the fading.
+      fader.gain.value = deck === activeDeckRef.current || fadeRef.current?.legacy ? 1 : 0;
+      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(masterRef.current!);
+      decksRef.current[deck] = { source, preGain, analyser, shelf, fader };
+    }
+    return true;
+  }
+
+  // Any tap or key press unlocks audio; wire the graph as soon as one happens.
+  useEffect(() => {
+    const unlock = () => { if (audioCtxRef.current) ensureAudioGraph(); };
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, []);
+
+  function resumeCtx() {
+    const ctx = audioCtxRef.current;
+    // iOS uses "interrupted" (calls, Siri) as well as "suspended".
+    if (ctx && ctx.state !== "running" && ctx.state !== "closed") ctx.resume().catch(() => {});
+  }
+
+  // Drop any automation (including a curve already in progress) and hold `value`.
+  function setParam(param: AudioParam, value: number) {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    param.cancelScheduledValues(0);
+    param.setValueAtTime(value, ctx.currentTime);
+  }
+
+  function setTrim(deck: Deck, s: SubsonicSong, track: AutoMixTrack | null) {
+    const db = loudnessTrimDb(track?.lufs, s.replayGain);
+    trimDbRef.current[deck] = db; // applied when the graph is wired, if it isn't yet
+    const nodes = decksRef.current[deck];
+    if (nodes) setParam(nodes.preGain.gain, dbToGain(db));
+  }
+
+  function resetStrip(deck: Deck, fader: number) {
+    const audio = audioFor(deck);
+    if (audio) audio.volume = 1;
+    const nodes = decksRef.current[deck];
+    if (!nodes) return;
+    setParam(nodes.fader.gain, fader);
+    setParam(nodes.shelf.gain, 0);
+  }
+
+  function clearTimers() {
+    if (fadeTimerRef.current) { clearInterval(fadeTimerRef.current); fadeTimerRef.current = null; }
+    if (startTimerRef.current) { clearTimeout(startTimerRef.current); startTimerRef.current = null; }
+    if (rampTimerRef.current) { clearInterval(rampTimerRef.current); rampTimerRef.current = null; }
+  }
+
+  // Abort a scheduled or running mix and any preload; the active deck keeps playing.
+  function cancelCrossfade() {
+    clearTimers();
+    const inactive = getInactiveAudio();
+    if (inactive && (fadeRef.current || preloadRef.current)) stopDeck(inactive);
+    const active = activeDeckRef.current;
+    resetStrip(active, 1);
+    resetStrip(active === "A" ? "B" : "A", 0);
+    fadeRef.current = null;
+    preloadRef.current = null;
+    crossfadeStartedRef.current = false;
+    setCrossfading(false);
+  }
+
+  function updateMediaSession(s: SubsonicSong) {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: s.title,
+      artist: s.artist ?? "Unknown",
+      album: s.album ?? "Unknown",
+      artwork: s.coverArt
+        ? [{ src: coverArtUrl(creds, s.coverArt, "512"), sizes: "512x512", type: "image/jpeg" }]
+        : [],
+    });
+    navigator.mediaSession.setActionHandler("play", () => playRef.current());
+    navigator.mediaSession.setActionHandler("pause", () => pauseRef.current());
+    navigator.mediaSession.setActionHandler("previoustrack", () => onPrevRef.current());
+    navigator.mediaSession.setActionHandler("nexttrack", () => onNextRef.current());
+  }
+
+  function setStreamSrc(audio: HTMLAudioElement, songId: string) {
+    const url = streamUrl(creds, songId);
+    // A cross-origin stream routed through Web Audio is silent without CORS.
+    try {
+      if (new URL(url, window.location.href).origin !== window.location.origin) {
+        audio.crossOrigin = "anonymous";
+      }
+    } catch {}
+    audio.src = url;
+  }
+
+  const waveformBars = useMemo(() => {
+    return Array.from({ length: 60 }, () => 10 + Math.random() * 35);
+  }, [song?.id]);
+
   useEffect(() => {
     if (!song) return;
 
-    if (skipNextLoadRef.current) {
-      skipNextLoadRef.current = false;
+    if (skipNextLoadRef.current === song.id) {
+      // A crossfade already brought this song in on the new deck.
+      skipNextLoadRef.current = null;
       lastSongIdRef.current = song.id;
-      crossfadeStartedRef.current = false;
-      const audio = getActiveAudio();
-      if ("mediaSession" in navigator) {
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: song.title,
-          artist: song.artist ?? "Unknown",
-          album: song.album ?? "Unknown",
-          artwork: song.coverArt
-            ? [{ src: coverArtUrl(creds, song.coverArt, "512"), sizes: "512x512", type: "image/jpeg" }]
-            : [],
-        });
-        if (audio) {
-          navigator.mediaSession.setActionHandler("play", () => audio.play());
-          navigator.mediaSession.setActionHandler("pause", () => audio.pause());
-          navigator.mediaSession.setActionHandler("previoustrack", () => onPrevRef.current());
-          navigator.mediaSession.setActionHandler("nexttrack", () => onNextRef.current());
-        }
-      }
+      updateMediaSession(song);
       return;
     }
+    skipNextLoadRef.current = null;
 
     if (song.id === lastSongIdRef.current) return;
     lastSongIdRef.current = song.id;
 
+    // "Next" pressed mid-mix lands on the incoming song: finish the mix now.
+    if (fadeRef.current?.song.id === song.id) {
+      finishCrossfade(false);
+      updateMediaSession(song);
+      return;
+    }
+
+    cancelCrossfade();
     const audio = getActiveAudio();
     if (!audio) return;
 
-    crossfadeStartedRef.current = false;
-    audio.volume = 1;
+    ensureAudioGraph();
+    resumeCtx();
+    setTrim(activeDeckRef.current, song, serverTrack);
+    audio.preservesPitch = true;
     audio.playbackRate = 1;
-    audio.src = streamUrl(creds, song.id);
-    audio.play().then(() => {
-      setPlaying(true);
-      ensureAudioGraph(activeDeckRef.current);
-    }).catch(() => {});
-
-    if ("mediaSession" in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: song.title,
-        artist: song.artist ?? "Unknown",
-        album: song.album ?? "Unknown",
-        artwork: song.coverArt
-          ? [{ src: coverArtUrl(creds, song.coverArt, "512"), sizes: "512x512", type: "image/jpeg" }]
-          : [],
-      });
-      navigator.mediaSession.setActionHandler("play", () => audio.play());
-      navigator.mediaSession.setActionHandler("pause", () => audio.pause());
-      navigator.mediaSession.setActionHandler("previoustrack", () => onPrevRef.current());
-      navigator.mediaSession.setActionHandler("nexttrack", () => onNextRef.current());
-    }
+    setStreamSrc(audio, song.id);
+    audio.play().then(() => setPlaying(true)).catch(() => {});
+    updateMediaSession(song);
   }, [song, creds, getActiveAudio]);
 
-  const silenceCountRef = useRef(0);
+  // Buffer the next song on the idle deck, cued to its first downbeat.
+  function preload(next: SubsonicSong) {
+    const deck: Deck = activeDeckRef.current === "A" ? "B" : "A";
+    const audio = audioFor(deck);
+    if (!audio) return;
+    ensureAudioGraph();
+    const { serverNextTrack: track } = liveRef.current;
+    const detail = track && nextDetailRef.current?.id === track.id ? nextDetailRef.current : null;
+    const first = detail?.downbeats?.[0] ?? null;
+    const anchor = first !== null && first <= MAX_INTRO_CUE ? first : null;
+
+    audio.pause();
+    audio.preload = "auto";
+    resetStrip(deck, 0);
+    setTrim(deck, next, track);
+    setStreamSrc(audio, next.id);
+    if (anchor !== null) {
+      // Skip if a newer preload replaced this one before metadata arrived.
+      const cue = () => { if (preloadRef.current?.songId === next.id) audio.currentTime = anchor; };
+      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) cue();
+      else audio.addEventListener("loadedmetadata", cue, { once: true });
+    }
+    preloadRef.current = { songId: next.id, deck, anchor };
+  }
+
+  // Where the outgoing track should start mixing out, in its own time.
+  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean } {
+    const { serverTrack: track, effectiveBpm: bpm } = liveRef.current;
+    const fadeLen = fadeDurationFor(bpm);
+    let at = audio.duration - fadeLen;
+    if (track?.mix_out_point && track.mix_out_point < at) at = track.mix_out_point;
+    at = Math.max(at, audio.duration / 2);
+
+    const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
+    if (detail?.downbeats?.length && bpm && track!.confidence >= MIN_CONFIDENCE) {
+      const snapped = downbeatAtOrBefore(detail.downbeats, at);
+      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm) return { at: snapped, onDownbeat: true };
+    }
+    return { at, onDownbeat: false };
+  }
+
+  // Mean-square level of the last SILENCE_READINGS polls (~1.6 s). Three
+  // 12 ms snapshots used to be enough to "detect silence" in the gaps of a
+  // sparse breakdown and start an unsynced mix early.
+  const silenceLevelsRef = useRef<number[]>([]);
 
   useEffect(() => {
     if (!djMode) return;
@@ -177,124 +404,252 @@ export function NowPlaying({
     const check = () => {
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
-      if (crossfadeStartedRef.current || !nextSongRef.current) return;
+      const next = nextSongRef.current;
+      if (crossfadeStartedRef.current || !next) return;
 
+      const cue = cueOutFor(audio);
       const remaining = audio.duration - audio.currentTime;
-      const cueOut = mixOutPointRef.current ?? (audio.duration - CROSSFADE_DURATION);
-      const shouldCrossfade = audio.currentTime >= cueOut && remaining > 0;
 
-      if (shouldCrossfade) {
+      if (audio.currentTime >= cue.at - PRELOAD_LEAD && preloadRef.current?.songId !== next.id) {
+        preload(next);
+      }
+
+      if (audio.currentTime >= cue.at - SCHEDULE_LEAD && remaining > 0) {
         crossfadeStartedRef.current = true;
-        startCrossfadeRef.current();
+        // The 200 ms poll is too coarse to land on a beat; time the start exactly.
+        const delay = Math.max(0, (cue.at - audio.currentTime) / audio.playbackRate);
+        startTimerRef.current = window.setTimeout(() => {
+          startTimerRef.current = null;
+          startCrossfade(cue.at, cue.onDownbeat);
+        }, delay * 1000);
         return;
       }
 
       if (remaining <= EARLY_FADE_WINDOW && remaining > CROSSFADE_DURATION) {
-        const deck = activeDeckRef.current;
-        const analyser = analysersRef.current[deck];
+        const analyser = decksRef.current[activeDeckRef.current]?.analyser;
         if (analyser) {
           const buf = new Float32Array(analyser.fftSize);
           analyser.getFloatTimeDomainData(buf);
           let sum = 0;
           for (let i = 0; i < buf.length; i++) sum += buf[i]! * buf[i]!;
-          const rms = Math.sqrt(sum / buf.length);
-          if (rms < SILENCE_THRESHOLD) {
-            silenceCountRef.current++;
-            if (silenceCountRef.current >= 3) {
-              crossfadeStartedRef.current = true;
-              silenceCountRef.current = 0;
-              startCrossfadeRef.current();
-            }
-          } else {
-            silenceCountRef.current = 0;
+          const levels = silenceLevelsRef.current;
+          levels.push(sum / buf.length);
+          if (levels.length > SILENCE_READINGS) levels.shift();
+          const meanSquare = levels.reduce((a, b) => a + b, 0) / levels.length;
+          if (levels.length === SILENCE_READINGS && Math.sqrt(meanSquare) < SILENCE_THRESHOLD) {
+            crossfadeStartedRef.current = true;
+            silenceLevelsRef.current = [];
+            startCrossfade(null, false);
           }
         }
+      } else {
+        silenceLevelsRef.current = [];
       }
     };
 
     const interval = setInterval(check, 200);
-    return () => { clearInterval(interval); silenceCountRef.current = 0; };
+    return () => {
+      clearInterval(interval);
+      silenceLevelsRef.current = [];
+      // DJ mode turned off: a mix armed for the next second must not start.
+      if (startTimerRef.current) {
+        clearTimeout(startTimerRef.current);
+        startTimerRef.current = null;
+        crossfadeStartedRef.current = false;
+      }
+    };
   }, [djMode, getActiveAudio]);
 
-  function startCrossfade() {
+  // `target`: the outgoing time this start was timed to (null: start now, e.g.
+  // silence detected). `onDownbeat`: target is a downbeat, so beat-sync.
+  function startCrossfade(target: number | null, onDownbeat: boolean) {
     const outgoing = getActiveAudio();
     const incoming = getInactiveAudio();
-    if (!outgoing || !incoming || !nextSong) return;
+    const next = nextSongRef.current;
+    if (!outgoing || !incoming || !next) { crossfadeStartedRef.current = false; return; }
 
+    if (outgoing.paused) { crossfadeStartedRef.current = false; return; } // re-arm on resume
+    let anchor = onDownbeat ? target : null;
+    if (target !== null && Math.abs(outgoing.currentTime - target) > 0.15) {
+      // A seek or stall moved the playhead: re-arm if we are early, else start unsynced.
+      if (outgoing.currentTime < target) { crossfadeStartedRef.current = false; return; }
+      anchor = null;
+    }
+    // A short song can still be easing out of the previous mix's tempo. Hold
+    // its current rate and match the incoming deck to it, not to 1.0.
+    if (rampTimerRef.current) { clearInterval(rampTimerRef.current); rampTimerRef.current = null; }
+    const outRate = outgoing.playbackRate;
 
-    setCrossfading(true);
+    if (preloadRef.current?.songId !== next.id) {
+      preload(next);
+      anchor = null; // not buffered or cued in time to sync
+    }
+    const live = ensureAudioGraph();
+    const ctx = audioCtxRef.current;
 
     const outDeck = activeDeckRef.current;
-    const inDeck = outDeck === "A" ? "B" : "A";
-    ensureAudioGraph(outDeck);
-    ensureAudioGraph(inDeck);
+    const inDeck: Deck = outDeck === "A" ? "B" : "A";
+    const { serverTrack: outTrack, serverNextTrack: inTrack, effectiveBpm: outBpm, effectiveNextBpm: inBpm } = liveRef.current;
 
-    incoming.src = streamUrl(creds, nextSong.id);
-    incoming.volume = 0;
+    const match = outBpm && inBpm ? tempoMatch(outBpm, inBpm) : null;
+    incoming.preservesPitch = true;
+    incoming.playbackRate = (match?.rate ?? 1) * outRate;
 
-    if (effectiveBpm && effectiveNextBpm) {
-      const rate = bpmRatio(effectiveBpm, effectiveNextBpm);
-      incoming.playbackRate = rate;
-    } else if (analysis && nextAnalysis) {
-      const rate = bpmRatio(analysis.bpm, nextAnalysis.bpm);
-      incoming.playbackRate = rate;
+    const inAnchor = preloadRef.current?.anchor ?? null;
+    const sync: BeatSync | null =
+      anchor !== null && inAnchor !== null && match && outBpm && inBpm &&
+      (outTrack?.confidence ?? 0) >= MIN_CONFIDENCE && (inTrack?.confidence ?? 0) >= MIN_CONFIDENCE
+        ? { outAnchor: anchor, inAnchor, outBeat: 60 / outBpm, inBeat: 60 / (inBpm * match.factor), outRate }
+        : null;
+
+    const fadeLen = fadeDurationFor(outBpm);
+    const bar = outBpm ? 240 / outBpm : fadeLen / 8;
+    const half = 0.5 * (bar / fadeLen); // one-bar bass swap centred on the midpoint
+    const curves = buildCrossfadeCurves(CURVE_POINTS, 0.5 - half, 0.5 + half);
+
+    let end = 0;
+    let legacy: Fade["legacy"] = null;
+    if (live && ctx) {
+      const out = decksRef.current[outDeck]!;
+      const inn = decksRef.current[inDeck]!;
+      const t0 = ctx.currentTime + 0.02;
+      const schedule = (param: AudioParam, curve: Float32Array) => {
+        param.cancelScheduledValues(0);
+        param.setValueAtTime(curve[0]!, ctx.currentTime);
+        param.setValueCurveAtTime(curve, t0, fadeLen);
+      };
+      schedule(out.fader.gain, curves.gainOut);
+      schedule(inn.fader.gain, curves.gainIn);
+      schedule(out.shelf.gain, curves.shelfOut);
+      schedule(inn.shelf.gain, curves.shelfIn);
+      end = t0 + fadeLen;
     } else {
-      incoming.playbackRate = 1;
-    }
-
-    const outFilter = filtersRef.current[outDeck];
-    const inFilter = filtersRef.current[inDeck];
-    if (outFilter) outFilter.gain.value = 0;
-    if (inFilter) inFilter.gain.value = -40;
-
-    if (audioCtxRef.current?.state === "suspended") {
-      audioCtxRef.current.resume();
+      incoming.volume = 0;
+      legacy = { start: performance.now(), length: fadeLen };
     }
 
     incoming.play().catch(() => {});
+    fadeRef.current = { song: next, outDeck, inDeck, end, rate: incoming.playbackRate, bar, sync, legacy };
+    setCrossfading(true);
 
-    const steps = CROSSFADE_DURATION * 20;
-    let step = 0;
-
-    if (crossfadeTimerRef.current) clearInterval(crossfadeTimerRef.current);
-
-    crossfadeTimerRef.current = window.setInterval(() => {
-      step++;
-      const progress = step / steps;
-
-      outgoing.volume = Math.cos(progress * Math.PI / 2);
-      incoming.volume = Math.sin(progress * Math.PI / 2);
-
-      if (outFilter) outFilter.gain.value = -40 * progress;
-      if (inFilter) inFilter.gain.value = -40 * (1 - progress);
-
-      if (step >= steps) {
-        clearInterval(crossfadeTimerRef.current!);
-        crossfadeTimerRef.current = null;
-        outgoing.pause();
-        outgoing.src = "";
-        incoming.volume = 1;
-        incoming.playbackRate = 1;
-        if (outFilter) outFilter.gain.value = 0;
-        if (inFilter) inFilter.gain.value = 0;
-
-        const newDeck = activeDeckRef.current === "A" ? "B" : "A";
-        activeDeckRef.current = newDeck;
-        setActiveDeck(newDeck);
-        setCrossfading(false);
-
-        skipNextLoadRef.current = true;
-        onNextRef.current();
-      }
-    }, 50);
+    if (fadeTimerRef.current) clearInterval(fadeTimerRef.current);
+    fadeTimerRef.current = window.setInterval(tickFade, 100);
   }
-  startCrossfadeRef.current = startCrossfade;
+
+  // Runs every 100 ms during a mix: keeps the beats locked and ends the mix.
+  // Gain and EQ curves run on the audio thread and don't depend on this timer.
+  function tickFade() {
+    const fade = fadeRef.current;
+    if (!fade) return;
+    const out = audioFor(fade.outDeck);
+    const inc = audioFor(fade.inDeck);
+    if (fade.legacy) {
+      if (out?.paused) { fade.legacy.start += 100; return; } // hold the fade while paused
+      const p = Math.min(1, (performance.now() - fade.legacy.start) / 1000 / fade.legacy.length);
+      if (out) out.volume = Math.cos((p * Math.PI) / 2);
+      if (inc) inc.volume = Math.sin((p * Math.PI) / 2);
+      if (p >= 1) { finishCrossfade(true); return; }
+    } else {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      if (ctx.currentTime >= fade.end) { finishCrossfade(true); return; }
+    }
+
+    const sync = fade.sync;
+    if (!sync || !out || !inc || out.paused || inc.paused) return;
+    if (inc.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
+
+    const err = phaseError(out.currentTime, sync.outAnchor, sync.outBeat, inc.currentTime, sync.inAnchor, sync.inBeat);
+    const errSec = (err * sync.outBeat) / sync.outRate; // wall-clock seconds; > 0: incoming is ahead
+    if (Math.abs(errSec) > 0.08) {
+      // Way off (start latency, buffering stall): jump into phase.
+      inc.currentTime = inc.currentTime - err * sync.inBeat;
+    } else if (Math.abs(errSec) > 0.005) {
+      // Small drift (play() latency, BPM estimate error): nudge tempo, like a DJ on the jog wheel.
+      const nudge = Math.max(-0.02, Math.min(0.02, errSec / 2));
+      inc.playbackRate = fade.rate * (1 - nudge);
+    } else {
+      inc.playbackRate = fade.rate;
+    }
+  }
+
+  // Hand over to the incoming deck. `advance`: tell App the song changed.
+  function finishCrossfade(advance: boolean) {
+    const fade = fadeRef.current;
+    if (!fade) return;
+    clearTimers();
+    const out = audioFor(fade.outDeck);
+    const inc = audioFor(fade.inDeck);
+    if (out) stopDeck(out);
+    resetStrip(fade.inDeck, 1);
+    resetStrip(fade.outDeck, 0);
+
+    activeDeckRef.current = fade.inDeck;
+    setActiveDeck(fade.inDeck);
+    setCrossfading(false);
+    fadeRef.current = null;
+    preloadRef.current = null;
+    crossfadeStartedRef.current = false;
+    lastSongIdRef.current = fade.song.id;
+
+    if (inc) {
+      // The incoming deck loaded while inactive, so its metadata event was never handled.
+      if (isFinite(inc.duration)) setDuration(inc.duration);
+      setPlaying(!inc.paused);
+      rampRate(inc, fade.bar * 4);
+    }
+
+    if (advance) {
+      skipNextLoadRef.current = fade.song.id;
+      onAdvanceRef.current(fade.song);
+    }
+  }
+
+  // Ease the tempo back to the track's own speed instead of snapping to 1.0.
+  function rampRate(audio: HTMLAudioElement, seconds: number) {
+    const from = audio.playbackRate;
+    if (Math.abs(from - 1) < 0.001) { audio.playbackRate = 1; return; }
+    const steps = Math.max(1, Math.round((seconds * 1000) / 100));
+    let step = 0;
+    rampTimerRef.current = window.setInterval(() => {
+      step++;
+      audio.playbackRate = from + (1 - from) * (step / steps);
+      if (step >= steps) {
+        audio.playbackRate = 1;
+        clearInterval(rampTimerRef.current!);
+        rampTimerRef.current = null;
+      }
+    }, 100);
+  }
+
+  function playAll() {
+    const audio = getActiveAudio();
+    if (!audio) return;
+    ensureAudioGraph();
+    resumeCtx();
+    audio.play().catch(() => {});
+    if (fadeRef.current) audioFor(fadeRef.current.inDeck)?.play().catch(() => {});
+  }
+
+  function pauseAll() {
+    getActiveAudio()?.pause();
+    if (fadeRef.current) {
+      audioFor(fadeRef.current.inDeck)?.pause();
+      // Freeze the automation clock so the mix resumes where it stopped.
+      audioCtxRef.current?.suspend().catch(() => {});
+    }
+  }
+
+  const playRef = useRef(playAll);
+  const pauseRef = useRef(pauseAll);
+  playRef.current = playAll;
+  pauseRef.current = pauseAll;
 
   const togglePlay = useCallback(() => {
     const audio = getActiveAudio();
     if (!audio) return;
-    if (audio.paused) audio.play();
-    else audio.pause();
+    if (audio.paused) playRef.current();
+    else pauseRef.current();
   }, [getActiveAudio]);
 
   useEffect(() => {
@@ -326,30 +681,39 @@ export function NowPlaying({
     if (!audio || !el) return;
     const rect = el.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    if (fadeRef.current) fadeRef.current.sync = null; // a seek breaks the beat alignment
     audio.currentTime = ratio * duration;
     setCurrentTime(audio.currentTime);
   }
 
+  const mountedRef = useRef(false);
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      if (crossfadeTimerRef.current) {
-        clearInterval(crossfadeTimerRef.current);
-        crossfadeTimerRef.current = null;
-      }
-      if (audioCtxRef.current) {
+      mountedRef.current = false;
+      clearTimers();
+      // Close on a real unmount only. StrictMode's test unmount/remount keeps
+      // the same <audio> elements, and an element wired into a closed context
+      // can never be rewired: playback would stall for good.
+      setTimeout(() => {
+        if (mountedRef.current || !audioCtxRef.current) return;
         audioCtxRef.current.close().catch(() => {});
         audioCtxRef.current = null;
-        sourceNodesRef.current = {};
-        filtersRef.current = {};
-        analysersRef.current = {};
-      }
+        masterRef.current = null;
+        decksRef.current = {};
+      }, 0);
     };
   }, []);
 
   function handleEnded() {
-    if (!djMode) {
-      onNextRef.current();
+    if (fadeRef.current) {
+      // The outgoing track ran out before the curves did.
+      finishCrossfade(true);
+      return;
     }
+    // Also in DJ mode: if no mix could start (no next song yet), don't stall.
+    cancelCrossfade();
+    onNextRef.current();
   }
 
   const progress = duration > 0 ? currentTime / duration : 0;
@@ -358,18 +722,10 @@ export function NowPlaying({
     [song?.id, song?.coverArt, creds],
   );
 
-  if (!song) {
-    return (
-      <div className={styles.empty}>
-        <div className={styles.emptyIcon}>&#9835;</div>
-        <p className={styles.emptyText}>No song playing</p>
-        <p className={styles.emptyHint}>Go to Library and pick a song</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className={styles.container}>
+  // The decks stay mounted even with no song: they are wired into the
+  // AudioContext once, and a remounted element would play outside the graph.
+  const decks = (
+    <>
       <audio
         ref={audioARef}
         onTimeUpdate={activeDeck === "A" ? handleTimeUpdate : undefined}
@@ -386,7 +742,23 @@ export function NowPlaying({
         onPause={activeDeck === "B" ? () => { setPlaying(false); const a = audioBRef.current; if (a && a.duration > 0) onPlayingChangeRef.current?.(false, a.currentTime / a.duration); } : undefined}
         onEnded={activeDeck === "B" ? handleEnded : undefined}
       />
+    </>
+  );
 
+  if (!song) {
+    return (
+      <div className={styles.empty}>
+        {decks}
+        <div className={styles.emptyIcon}>&#9835;</div>
+        <p className={styles.emptyText}>No song playing</p>
+        <p className={styles.emptyHint}>Go to Library and pick a song</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className={styles.container}>
+      {decks}
       {coverSrc && <div className={styles.bgBlur} style={{ backgroundImage: `url(${coverSrc})` }} />}
       <div className={styles.bgOverlay} />
 
@@ -454,10 +826,10 @@ export function NowPlaying({
         <div className={styles.quality}>
           {song.suffix?.toUpperCase() ?? "MP3"} &middot; {song.bitRate ? `${song.bitRate} KBPS` : ""}
           {effectiveBpm && (
-            <> &middot; {effectiveBpm} BPM</>
+            <> &middot; {Math.round(effectiveBpm)} BPM</>
           )}
-          {analysis?.key && (
-            <> &middot; {analysis.key}</>
+          {(serverTrack?.key ?? analysis?.key) && (
+            <> &middot; {serverTrack?.key ?? analysis?.key}</>
           )}
           {serverTrack && (
             <> &middot; v2</>

@@ -55,17 +55,29 @@ export function isCompatibleKey(keyA: string, keyB: string): boolean {
   return camelotDistance(a, b) <= 1;
 }
 
+// Largest tempo change applied to the incoming deck. Browsers keep pitch
+// (preservesPitch) when stretching, but their real-time stretcher smears
+// drums beyond a few percent, so stay well under the old 8%.
+export const MAX_STRETCH = 0.06;
+
+export interface TempoMatch {
+  rate: number;   // playbackRate for the incoming deck
+  factor: number; // 1 = same tempo, 2 = incoming is half-time, 0.5 = double-time
+}
+
+// How to play the incoming track at the outgoing tempo, trying straight,
+// half-time and double-time matches. Null when no match is within MAX_STRETCH.
+export function tempoMatch(fromBpm: number, toBpm: number): TempoMatch | null {
+  if (!(fromBpm > 0) || !(toBpm > 0)) return null;
+  for (const factor of [1, 2, 0.5]) {
+    const rate = fromBpm / (toBpm * factor);
+    if (Math.abs(rate - 1) <= MAX_STRETCH) return { rate, factor };
+  }
+  return null;
+}
+
 export function bpmRatio(fromBpm: number, toBpm: number): number {
-  // How much to speed/slow the incoming track
-  // Keep within ±8% to avoid noticeable pitch change
-  const ratio = fromBpm / toBpm;
-  if (ratio >= 0.92 && ratio <= 1.08) return ratio;
-  // Try halving/doubling
-  const halfRatio = fromBpm / (toBpm * 2);
-  if (halfRatio >= 0.92 && halfRatio <= 1.08) return halfRatio;
-  const doubleRatio = (fromBpm * 2) / toBpm;
-  if (doubleRatio >= 0.92 && doubleRatio <= 1.08) return doubleRatio;
-  return 1; // Too different, don't adjust
+  return tempoMatch(fromBpm, toBpm)?.rate ?? 1; // Too different, don't adjust
 }
 
 export interface ScoredSong {
@@ -143,3 +155,103 @@ export function pickNextDJ(
 export const CROSSFADE_DURATION = 15;
 export const EARLY_FADE_WINDOW = 20;
 export const SILENCE_THRESHOLD = 0.01;
+
+const FADE_BARS = 8;
+const MIN_FADE = 8;
+const MAX_FADE = 24;
+
+// Crossfade length: 8 bars at the outgoing tempo, so the mix spans one
+// musical phrase (15 s at 128 BPM, 21.3 s at 90 BPM). Without a tempo,
+// the fixed CROSSFADE_DURATION is used.
+export function fadeDurationFor(bpm: number | null | undefined): number {
+  if (!bpm || !(bpm > 0)) return CROSSFADE_DURATION;
+  let seconds = (FADE_BARS * 4 * 60) / bpm;
+  // Very slow or very fast tracks: use 4 or 16 bars instead of leaving the range.
+  while (seconds > MAX_FADE) seconds /= 2;
+  while (seconds < MIN_FADE) seconds *= 2;
+  return seconds;
+}
+
+export interface CrossfadeCurves {
+  gainOut: Float32Array;
+  gainIn: Float32Array;
+  shelfOut: Float32Array; // low-shelf gain in dB
+  shelfIn: Float32Array;
+}
+
+const SHELF_MIN_DB = -40;
+const SHELF_MAX_DB = 6;
+
+function toShelfDb(target: number, fader: number): number {
+  if (target < 1e-4 || fader < 1e-4) return SHELF_MIN_DB;
+  const db = 20 * Math.log10(target / fader);
+  return Math.max(SHELF_MIN_DB, Math.min(SHELF_MAX_DB, db));
+}
+
+// Equal-power faders plus a bass swap. The old fade swept both low shelves
+// to -20 dB at the midpoint while the faders were at -3 dB, losing ~20 dB
+// of bass for several seconds. Here the outgoing bass stays at full level
+// (the shelf compensates for its fader) until a short swap window in the
+// middle, where the two basslines trade places on an equal-power curve;
+// only one bassline is ever fully present.
+export function buildCrossfadeCurves(points: number, swapStart: number, swapEnd: number): CrossfadeCurves {
+  const gainOut = new Float32Array(points);
+  const gainIn = new Float32Array(points);
+  const shelfOut = new Float32Array(points);
+  const shelfIn = new Float32Array(points);
+  const swapLen = Math.max(1e-3, swapEnd - swapStart);
+  for (let i = 0; i < points; i++) {
+    const p = i / (points - 1);
+    const gOut = Math.cos((p * Math.PI) / 2);
+    const gIn = Math.sin((p * Math.PI) / 2);
+    const s = Math.max(0, Math.min(1, (p - swapStart) / swapLen));
+    const bassOut = Math.cos((s * Math.PI) / 2);
+    const bassIn = Math.sin((s * Math.PI) / 2);
+    gainOut[i] = gOut;
+    gainIn[i] = gIn;
+    shelfOut[i] = toShelfDb(bassOut, gOut);
+    shelfIn[i] = toShelfDb(bassIn, gIn);
+  }
+  // Exact endpoints: the incoming deck must finish at unity.
+  gainOut[points - 1] = 0;
+  gainIn[points - 1] = 1;
+  shelfIn[points - 1] = 0;
+  return { gainOut, gainIn, shelfOut, shelfIn };
+}
+
+// Static trim that brings a track to roughly -14 LUFS. Prefers the AutoMix
+// server's measured loudness, then ReplayGain tags (referenced to -18 LUFS),
+// and never boosts past the track's peak.
+export function loudnessTrimDb(
+  lufs: number | null | undefined,
+  replayGain?: { trackGain?: number; trackPeak?: number },
+): number {
+  let db: number;
+  if (typeof lufs === "number" && isFinite(lufs)) db = -14 - lufs;
+  else if (typeof replayGain?.trackGain === "number") db = replayGain.trackGain + 4;
+  else return 0;
+  const peak = replayGain?.trackPeak;
+  if (typeof peak === "number" && peak > 0) db = Math.min(db, -20 * Math.log10(peak));
+  return Math.max(-12, Math.min(6, db));
+}
+
+// Last downbeat at or before `t` (the start of the phrase to mix out on).
+export function downbeatAtOrBefore(downbeats: number[], t: number): number | null {
+  let best: number | null = null;
+  for (const d of downbeats) {
+    if (d <= t) best = d;
+    else break;
+  }
+  return best;
+}
+
+// Signed beat-phase error of `inTime` against `outTime`, in beats, in [-0.5, 0.5).
+export function phaseError(
+  outTime: number, outAnchor: number, outBeat: number,
+  inTime: number, inAnchor: number, inBeat: number,
+): number {
+  const outPhase = (outTime - outAnchor) / outBeat;
+  const inPhase = (inTime - inAnchor) / inBeat;
+  const d = inPhase - outPhase;
+  return d - Math.round(d);
+}
