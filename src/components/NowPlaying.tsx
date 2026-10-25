@@ -2,6 +2,8 @@ import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subsonic";
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import { CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD, bpmRatio } from "@/lib/dj";
+import type { AutoMixTrack } from "@/lib/automix";
+import { findAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
 
 interface Props {
@@ -18,6 +20,7 @@ interface Props {
   nextSong: SubsonicSong | null;
   onPlayingChange?: (playing: boolean, progress: number) => void;
   togglePlayRef?: React.MutableRefObject<(() => void) | null>;
+  autoMixTracks?: AutoMixTrack[];
 }
 
 function formatTime(seconds: number): string {
@@ -34,6 +37,7 @@ export function NowPlaying({
   onNext, onPrev,
   nextAnalysis, nextSong,
   onPlayingChange, togglePlayRef,
+  autoMixTracks,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -59,6 +63,21 @@ export function NowPlaying({
   onNextRef.current = onNext;
   onPrevRef.current = onPrev;
   nextSongRef.current = nextSong;
+
+  const serverTrack = useMemo(
+    () => song && autoMixTracks ? findAutoMixTrack(autoMixTracks, song) : null,
+    [song?.id, autoMixTracks],
+  );
+  const serverNextTrack = useMemo(
+    () => nextSong && autoMixTracks ? findAutoMixTrack(autoMixTracks, nextSong) : null,
+    [nextSong?.id, autoMixTracks],
+  );
+
+  const effectiveBpm = serverTrack?.bpm ?? analysis?.bpm ?? null;
+  const effectiveNextBpm = serverNextTrack?.bpm ?? nextAnalysis?.bpm ?? null;
+  const mixOutPoint = serverTrack?.mix_out_point ?? null;
+  const mixOutPointRef = useRef(mixOutPoint);
+  mixOutPointRef.current = mixOutPoint;
 
   function ensureAudioGraph(deck: "A" | "B") {
     const audio = deck === "A" ? audioARef.current : audioBRef.current;
@@ -161,8 +180,10 @@ export function NowPlaying({
       if (crossfadeStartedRef.current || !nextSongRef.current) return;
 
       const remaining = audio.duration - audio.currentTime;
+      const cueOut = mixOutPointRef.current ?? (audio.duration - CROSSFADE_DURATION);
+      const shouldCrossfade = audio.currentTime >= cueOut && remaining > 0;
 
-      if (remaining <= CROSSFADE_DURATION && remaining > 0) {
+      if (shouldCrossfade) {
         crossfadeStartedRef.current = true;
         startCrossfadeRef.current();
         return;
@@ -211,7 +232,10 @@ export function NowPlaying({
     incoming.src = streamUrl(creds, nextSong.id);
     incoming.volume = 0;
 
-    if (analysis && nextAnalysis) {
+    if (effectiveBpm && effectiveNextBpm) {
+      const rate = bpmRatio(effectiveBpm, effectiveNextBpm);
+      incoming.playbackRate = rate;
+    } else if (analysis && nextAnalysis) {
       const rate = bpmRatio(analysis.bpm, nextAnalysis.bpm);
       incoming.playbackRate = rate;
     } else {
@@ -350,16 +374,16 @@ export function NowPlaying({
         ref={audioARef}
         onTimeUpdate={activeDeck === "A" ? handleTimeUpdate : undefined}
         onLoadedMetadata={activeDeck === "A" ? handleLoadedMetadata : undefined}
-        onPlay={activeDeck === "A" ? () => { setPlaying(true); onPlayingChangeRef.current?.(true, currentTime / (duration || 1)); } : undefined}
-        onPause={activeDeck === "A" ? () => { setPlaying(false); onPlayingChangeRef.current?.(false, currentTime / (duration || 1)); } : undefined}
+        onPlay={activeDeck === "A" ? () => { setPlaying(true); const a = audioARef.current; if (a && a.duration > 0) onPlayingChangeRef.current?.(true, a.currentTime / a.duration); } : undefined}
+        onPause={activeDeck === "A" ? () => { setPlaying(false); const a = audioARef.current; if (a && a.duration > 0) onPlayingChangeRef.current?.(false, a.currentTime / a.duration); } : undefined}
         onEnded={activeDeck === "A" ? handleEnded : undefined}
       />
       <audio
         ref={audioBRef}
         onTimeUpdate={activeDeck === "B" ? handleTimeUpdate : undefined}
         onLoadedMetadata={activeDeck === "B" ? handleLoadedMetadata : undefined}
-        onPlay={activeDeck === "B" ? () => { setPlaying(true); onPlayingChangeRef.current?.(true, currentTime / (duration || 1)); } : undefined}
-        onPause={activeDeck === "B" ? () => { setPlaying(false); onPlayingChangeRef.current?.(false, currentTime / (duration || 1)); } : undefined}
+        onPlay={activeDeck === "B" ? () => { setPlaying(true); const a = audioBRef.current; if (a && a.duration > 0) onPlayingChangeRef.current?.(true, a.currentTime / a.duration); } : undefined}
+        onPause={activeDeck === "B" ? () => { setPlaying(false); const a = audioBRef.current; if (a && a.duration > 0) onPlayingChangeRef.current?.(false, a.currentTime / a.duration); } : undefined}
         onEnded={activeDeck === "B" ? handleEnded : undefined}
       />
 
@@ -429,10 +453,14 @@ export function NowPlaying({
 
         <div className={styles.quality}>
           {song.suffix?.toUpperCase() ?? "MP3"} &middot; {song.bitRate ? `${song.bitRate} KBPS` : ""}
-          {analysis && (
-            <>
-              {" "}&middot; {analysis.bpm} BPM &middot; {analysis.key}
-            </>
+          {effectiveBpm && (
+            <> &middot; {effectiveBpm} BPM</>
+          )}
+          {analysis?.key && (
+            <> &middot; {analysis.key}</>
+          )}
+          {serverTrack && (
+            <> &middot; v2</>
           )}
         </div>
       </div>

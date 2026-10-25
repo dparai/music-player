@@ -141,12 +141,15 @@ export function lookupAnalysis(
   analysis: Record<string, SongAnalysis>,
   song: SubsonicSong,
 ): SongAnalysis | null {
+  const primaryArtist = song.artist?.split(/[;,&]/).map(s => s.trim())[0] ?? "";
   for (const [filename, data] of Object.entries(analysis)) {
     const name = filename.replace(/\.[^.]+$/, "");
     if (
       name === song.title ||
       name === `${song.artist} - ${song.title}` ||
-      name === `${song.title} - ${song.artist}`
+      name === `${song.title} - ${song.artist}` ||
+      name === `${primaryArtist} - ${song.title}` ||
+      name === `${song.title} - ${primaryArtist}`
     ) {
       return data;
     }

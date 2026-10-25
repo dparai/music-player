@@ -44,6 +44,15 @@ export default defineConfig({
             },
           },
           {
+            urlPattern: /\/automix\/tracks/,
+            handler: "StaleWhileRevalidate",
+            options: {
+              cacheName: "automix-tracks",
+              expiration: { maxEntries: 5, maxAgeSeconds: 24 * 60 * 60 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
             urlPattern: /\/api\/analysis\.json/,
             handler: "StaleWhileRevalidate",
             options: {
@@ -70,6 +79,11 @@ export default defineConfig({
         secure: true,
       },
       "/api": {
+        target: "https://deepakmusic.duckdns.org",
+        changeOrigin: true,
+        secure: true,
+      },
+      "/automix": {
         target: "https://deepakmusic.duckdns.org",
         changeOrigin: true,
         secure: true,
