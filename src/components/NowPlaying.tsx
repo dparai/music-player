@@ -203,7 +203,6 @@ export function NowPlaying({
         outgoing.pause();
         outgoing.src = "";
         incoming.volume = 1;
-        incoming.playbackRate = 1;
         if (outFilter) outFilter.gain.value = 0;
         if (inFilter) inFilter.gain.value = 0;
 
@@ -245,9 +244,18 @@ export function NowPlaying({
     setCurrentTime(audio.currentTime);
   }
 
+  useEffect(() => {
+    return () => {
+      if (crossfadeTimerRef.current) {
+        clearInterval(crossfadeTimerRef.current);
+        crossfadeTimerRef.current = null;
+      }
+    };
+  }, []);
+
   function handleEnded() {
     if (!djMode) {
-      onNext();
+      onNextRef.current();
     }
   }
 
