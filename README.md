@@ -32,7 +32,7 @@ Your Music Collection
 **In plain English:**
 
 1. You drop music files into Google Drive
-2. `rclone` syncs them to an Oracle Cloud server every 48 hours
+2. `rclone` syncs them to an Oracle Cloud server every day at midnight
 3. **Navidrome** indexes and serves the music via the Subsonic API
 4. **Caddy** handles HTTPS with auto-renewing certificates
 5. **AutoMix** (FastAPI + librosa) analyzes each track's BPM, beats, and cue points

@@ -89,5 +89,5 @@ In `automix.service` under `[Service]`: `Nice=10`, `IOSchedulingClass=idle`, `CP
 ## 7. Cron
 
 Replace the rclone crontab line with:
-`0 4 */2 * * /opt/automix/sync-music.sh >> /var/log/brook-sync.log 2>&1`
+`0 0 * * * /home/ubuntu/sync-music.sh` (the script logs to `/home/ubuntu/music-sync.log` itself)
 (set `RCLONE_REMOTE` in the script to your remote name).
