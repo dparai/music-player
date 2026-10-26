@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -92,82 +93,119 @@ def link_navidrome_ids(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE tracks SET navidrome_id = ? WHERE path = ?", (song_id, path))
     conn.commit()
 
+# Set by /rescan (or a second startup scan) while a scan is running: the
+# running scan picks up new files before its next track instead of the request
+# being dropped. A full re-analysis takes hours (Demucs), and a song synced
+# from Drive meanwhile used to wait for the next sync, two days later.
+_rescan_requested = threading.Event()
+LINK_EVERY = 900  # s: re-link Navidrome IDs during long scans (Navidrome indexes every 15 min)
+
 def scan_and_analyze():
     # Startup and /rescan can both start a scan; never run two at once.
     if not _scan_lock.acquire(blocking=False):
-        print("Scan already running.")
+        _rescan_requested.set()
+        print("Scan already running: new files will be picked up next.", flush=True)
         return
     try:
         _scan()
     finally:
         _scan_lock.release()
 
-def _scan():
-    try:
-        os.nice(10)  # this thread only (Linux): keep Navidrome streaming smooth
-    except (OSError, AttributeError):
-        pass
-    on_disk = {str(f) for f in MUSIC_DIR.rglob("*") if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS}
+def _list_audio() -> set[str]:
+    return {str(f) for f in MUSIC_DIR.rglob("*") if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS}
 
+def _prune_and_link(on_disk: set[str]) -> tuple[set[str], set[str]]:
+    """Drop rows for deleted files, refresh Navidrome IDs. Returns (done, known) paths."""
     with _db_lock:
         conn = get_db()
-        done = {row["path"] for row in conn.execute(
-            "SELECT path FROM tracks WHERE analysis_version >= ?", (ANALYSIS_VERSION,))}
         gone = [row["path"] for row in conn.execute("SELECT path FROM tracks") if row["path"] not in on_disk]
         for path in gone:
             conn.execute("DELETE FROM transitions WHERE from_track = ? OR to_track = ?", (make_track_id(path),) * 2)
             conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
         conn.commit()
         link_navidrome_ids(conn)
-        conn.close()
-    if gone:
-        print(f"Removed {len(gone)} deleted tracks.")
-
-    # New files first, then v1 rows awaiting re-analysis.
-    with _db_lock:
-        conn = get_db()
+        done = {row["path"] for row in conn.execute(
+            "SELECT path FROM tracks WHERE analysis_version >= ?", (ANALYSIS_VERSION,))}
         known = {row["path"] for row in conn.execute("SELECT path FROM tracks")}
         conn.close()
-    files = sorted(on_disk - done, key=lambda p: (p in known, p))
-    total = len(files)
-    if total == 0:
-        print("No new tracks to analyze.")
+    if gone:
+        print(f"Removed {len(gone)} deleted tracks.", flush=True)
+    return done, known
+
+def _save(path: str, r: dict) -> None:
+    with _db_lock:
+        c = get_db()
+        c.execute("""
+            INSERT OR REPLACE INTO tracks
+            (id, path, filename, bpm, beats, downbeats, confidence,
+             mix_in_point, mix_out_point, duration, analyzed_at,
+             key, lufs, grid_source, intro_end, outro_end, bar_energy, bar_bass,
+             bar_vocal, analysis_version, vocal_source, navidrome_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    (SELECT navidrome_id FROM tracks WHERE path = ?))
+        """, (
+            make_track_id(path), path, Path(path).name,
+            r["bpm"], r["beats"], r["downbeats"], r["confidence"],
+            r["mix_in_point"], r["mix_out_point"], r["duration"],
+            r["key"], r["lufs"], r["grid_source"], r["intro_end"], r["outro_end"],
+            r["bar_energy"], r["bar_bass"], r["bar_vocal"], r["analysis_version"],
+            r["vocal_source"], path,
+        ))
+        c.commit()
+        c.close()
+
+def _scan():
+    try:
+        os.nice(10)  # this thread only (Linux): keep Navidrome streaming smooth
+    except (OSError, AttributeError):
+        pass
+    _rescan_requested.clear()
+    on_disk = _list_audio()
+    done, known = _prune_and_link(on_disk)
+    # New files first, then rows from an older analysis version.
+    queue = sorted(on_disk - done, key=lambda p: (p in known, p))
+    if not queue:
+        print("No new tracks to analyze.", flush=True)
         return
 
-    print(f"Analyzing {total} tracks...")
-    for i, path in enumerate(files):
-        f = Path(path)
-        print(f"  [{i+1}/{total}] {f.name}...", flush=True)
-        try:
-            r = analyze_v2(path)
+    print(f"Analyzing {len(queue)} tracks...", flush=True)
+    failed: set[str] = set()
+    last_link = time.monotonic()
+    n = 0
+    while queue:
+        if _rescan_requested.is_set():
+            _rescan_requested.clear()
+            on_disk = _list_audio()
+            done, known = _prune_and_link(on_disk)
+            last_link = time.monotonic()
+            queued = set(queue)
+            fresh = sorted(p for p in on_disk - done - known - queued - failed)
+            queue = fresh + [p for p in queue if p in on_disk]
+            if fresh:
+                print(f"Rescan: {len(fresh)} new tracks moved to the front.", flush=True)
+        elif time.monotonic() - last_link > LINK_EVERY:
             with _db_lock:
-                c = get_db()
-                c.execute("""
-                    INSERT OR REPLACE INTO tracks
-                    (id, path, filename, bpm, beats, downbeats, confidence,
-                     mix_in_point, mix_out_point, duration, analyzed_at,
-                     key, lufs, grid_source, intro_end, outro_end, bar_energy, bar_bass,
-                     bar_vocal, analysis_version, vocal_source, navidrome_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            (SELECT navidrome_id FROM tracks WHERE path = ?))
-                """, (
-                    make_track_id(path), path, f.name,
-                    r["bpm"], r["beats"], r["downbeats"], r["confidence"],
-                    r["mix_in_point"], r["mix_out_point"], r["duration"],
-                    r["key"], r["lufs"], r["grid_source"], r["intro_end"], r["outro_end"],
-                    r["bar_energy"], r["bar_bass"], r["bar_vocal"], r["analysis_version"],
-                    r["vocal_source"], path,
-                ))
-                c.commit()
-                c.close()
+                conn = get_db()
+                link_navidrome_ids(conn)  # songs Navidrome indexed since
+                conn.close()
+            last_link = time.monotonic()
+
+        path = queue.pop(0)
+        n += 1
+        print(f"  [{n}/{n + len(queue)}] {Path(path).name}...", flush=True)
+        try:
+            _save(path, analyze_v2(path))
         except Exception as e:
+            failed.add(path)
             print(f"  FAILED: {e}", flush=True)
 
     with _db_lock:
         conn = get_db()
         link_navidrome_ids(conn)  # files new since the start of the scan
         conn.close()
-    print("Analysis complete.")
+    print("Analysis complete.", flush=True)
+    if _rescan_requested.is_set():
+        _scan()  # a request arrived during the very last track
 
 # --- API Endpoints ---
 @app.get("/automix/health")
