@@ -322,9 +322,13 @@ def structure_profile(y: np.ndarray, S: np.ndarray, downbeats: np.ndarray, durat
     }
 
 
+def demucs_available() -> bool:
+    return os.path.exists(DEMUCS_PYTHON) and DEMUCS_SCRIPT.exists()
+
+
 def _vocals_demucs(path: str, head_end: float, tail_start: float) -> tuple[np.ndarray, np.ndarray] | None:
     """(frame times, vocal share) from Demucs, NaN outside the separated windows; None if unavailable."""
-    if not (os.path.exists(DEMUCS_PYTHON) and DEMUCS_SCRIPT.exists()):
+    if not demucs_available():
         return None
     try:
         r = subprocess.run(
