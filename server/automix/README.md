@@ -12,7 +12,8 @@ with or without this deployed: the new fields are optional.
 | File | What it does |
 |------|--------------|
 | `analysis_v2.py` | `analyze_track(path)` → bpm, beats, **real downbeats**, confidence, phrase-aligned `mix_in_point`/`mix_out_point`, `key`, `lufs`, per-bar energy/bass/vocals, `intro_end`, `outro_end` |
-| `vocals_demucs.py` | Vocal-stem loudness over time via Demucs; runs in `/opt/demucs/venv` (see below) |
+| `vocals_separate.py` | Vocal-stem loudness over time via Demucs or Open-Unmix (pieces / file-repair options for retries); runs in `/opt/demucs/venv` |
+| `vocals_classify.py` | Singing probability over time via the PANNs CNN14 classifier; runs in `/opt/demucs/venv` |
 | `navidrome_ids.py` | `{file path: Navidrome song id}` from Navidrome's DB, for exact matching in the PWA |
 | `auth.py` | FastAPI dependency: verifies the Brook user against Navidrome; a bearer token (in `/opt/automix/automix.env`) works only for local scripts |
 | `sync-music.sh` | rclone sync + automatic `/automix/rescan` |
@@ -42,9 +43,12 @@ sudo mkdir -p /opt/demucs && sudo chown ubuntu:ubuntu /opt/demucs
 python3 -m venv /opt/demucs/venv
 /opt/demucs/venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 /opt/demucs/venv/bin/pip install "demucs==4.0.1" numpy soundfile   # newer demucs needs sphn: no ARM build
+/opt/demucs/venv/bin/pip install panns_inference                      # backup-of-backup classifier
 ```
 
-Without it, analysis falls back to the REPET vocal heuristic (`vocal_source = "repet"`).
+Open-Unmix comes with demucs. Model weights download on first use (~0.5 GB in total).
+Fallback chain: Demucs, then Open-Unmix, then PANNs, then the REPET heuristic
+(`vocal_source` records which). Without the venv, analysis uses REPET only.
 
 ## 2. Database migration
 

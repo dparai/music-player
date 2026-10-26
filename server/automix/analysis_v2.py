@@ -40,15 +40,26 @@ MAX_OUTRO = 40.0      # never start the mix-out earlier than this before the end
 # 3: per-bar structure profile (energy, bass, vocals) + intro_end / outro_end.
 # 4: vocals from Demucs source separation (heuristic only as a fallback).
 ANALYSIS_VERSION = 4
-# Demucs runs in its own venv (CPU torch); see vocals_demucs.py.
-DEMUCS_PYTHON = os.environ.get("AUTOMIX_DEMUCS_PYTHON", "/opt/demucs/venv/bin/python")
-DEMUCS_SCRIPT = Path(__file__).resolve().parent / "vocals_demucs.py"
-DEMUCS_TIMEOUT = 1800
-# bar_vocal is a 0..1 "singing" score, 0.5 = singing, whichever detector ran:
-# Demucs vocal-stem energy share 0.05 (instrumental bars read ~0.000-0.01,
-# sung bars 0.15-0.40) and the REPET heuristic ratio 0.18 both map to 0.5.
-DEMUCS_SINGING = 0.05
-REPET_SINGING = 0.18
+# Vocal detection runs in its own venv (CPU torch); see vocals_separate.py and
+# vocals_classify.py. Fallback chain, best first:
+#   1. Demucs htdemucs      (separation; retried up to 3 times over later scans:
+#                            plain, then in 10 s pieces, then pieces + file repair)
+#   2. Open-Unmix umxl      (separation, different design; ~45 s per song)
+#   3. PANNs CNN14          (singing classifier, no separation; ~30 s per song)
+#   4. REPET heuristic      (in-process; can't fail)
+VOCAL_PYTHON = os.environ.get("AUTOMIX_DEMUCS_PYTHON", "/opt/demucs/venv/bin/python")
+SEPARATE_SCRIPT = Path(__file__).resolve().parent / "vocals_separate.py"
+CLASSIFY_SCRIPT = Path(__file__).resolve().parent / "vocals_classify.py"
+VOCAL_TIMEOUT = 1800       # s per attempt; doubled for the piecewise retry
+MAX_DEMUCS_ATTEMPTS = 3    # main.py stops retrying Demucs for a file after this
+CHUNK_SECONDS = 10
+# bar_vocal is a 0..1 "singing" score, 0.5 = singing, whichever detector ran.
+# Raw level that maps to 0.5, from calibration on real songs (2026-10-25):
+#   Demucs vocal-stem share    instrumental 0.000-0.01, sung 0.15-0.41
+#   Open-Unmix vocal-stem share instrumental 0.000-0.03, sung 0.14-0.44
+#   PANNs singing probability  instrumental 0.000-0.005, sung 0.02-0.09
+#   REPET foreground ratio     instrumental 0.00-0.10, sung 0.15-0.40 (overlaps)
+SINGING_LEVEL = {"demucs": 0.05, "umxl": 0.07, "panns": 0.012, "repet": 0.18}
 HEAD_SECONDS = 47.0   # incoming side: the planner reads up to 45 s after mix_in
 VOCAL_HOP = 2048      # ~93 ms frames for the vocal estimate (keeps nn_filter small)
 
@@ -323,60 +334,133 @@ def structure_profile(y: np.ndarray, S: np.ndarray, downbeats: np.ndarray, durat
 
 
 def demucs_available() -> bool:
-    return os.path.exists(DEMUCS_PYTHON) and DEMUCS_SCRIPT.exists()
+    return os.path.exists(VOCAL_PYTHON) and SEPARATE_SCRIPT.exists()
 
 
-def _vocals_demucs(path: str, head_end: float, tail_start: float) -> tuple[np.ndarray, np.ndarray] | None:
-    """(frame times, vocal share) from Demucs, NaN outside the separated windows; None if unavailable."""
-    if not demucs_available():
-        return None
+def _failure_reason(returncode: int | None, stderr: str, timed_out: bool) -> str:
+    """Short reason for a failed vocal-detection run; decides the next retry strategy."""
+    if timed_out:
+        return "timeout"
+    if returncode in (-15, -2):
+        return "interrupted"  # service stopped/restarted mid-song: not the song's fault
+    err = stderr.lower()
+    if returncode == -9 or "memoryerror" in err or "out of memory" in err or "cannot allocate" in err:
+        return "memory"
+    if "ffmpeg" in err or "decode" in err or "invalid data" in err or "calledprocesserror" in err:
+        return "decode"
+    last = stderr.strip().splitlines()[-1][:120] if stderr.strip() else f"exit {returncode}"
+    return f"error: {last}"
+
+
+def _run_json(cmd: list[str], timeout: float) -> tuple[dict | None, str | None]:
+    """Run a vocal-detection script; (parsed JSON, None) or (None, failure reason)."""
     try:
-        r = subprocess.run(
-            [DEMUCS_PYTHON, "-I", str(DEMUCS_SCRIPT), path, f"{head_end:.2f}", f"{tail_start:.2f}"],
-            capture_output=True, text=True, timeout=DEMUCS_TIMEOUT,
-        )
-        d = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
-        print(f"demucs failed: {e}", file=sys.stderr)
-        return None
-    if not d or not d.get("vocal"):
-        print(f"demucs failed: exit {r.returncode}: {r.stderr.strip()[-300:]}", file=sys.stderr)
-        return None
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError as e:
+        return None, f"error: {e}"
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            return json.loads(r.stdout.strip().splitlines()[-1]), None
+        except json.JSONDecodeError:
+            return None, "error: bad output"
+    return None, _failure_reason(r.returncode, r.stderr, False)
+
+
+def _separate(model: str, path: str, head_end: float, tail_start: float,
+              chunk: bool, repair: bool) -> tuple[tuple[np.ndarray, np.ndarray] | None, str | None]:
+    """(frame times, vocal share) via vocals_separate.py, NaN outside the windows."""
+    cmd = [VOCAL_PYTHON, "-I", str(SEPARATE_SCRIPT), path, "--model", model,
+           "--head-end", f"{head_end:.2f}", "--tail-start", f"{tail_start:.2f}"]
+    if chunk:
+        cmd += ["--chunk", str(CHUNK_SECONDS)]
+    if repair:
+        cmd.append("--repair")
+    d, reason = _run_json(cmd, VOCAL_TIMEOUT * (2 if chunk else 1))
+    if d is None or not d.get("vocal"):
+        return None, reason or "error: empty output"
     vocal = np.array([np.nan if v is None else v for v in d["vocal"]], dtype=float)
     total = np.array(d["total"][: len(vocal)], dtype=float)
     share = vocal ** 2 / (total ** 2 + 1e-10)
-    times = np.arange(len(share)) * float(d["hop"])
-    return times, share
+    return (np.arange(len(share)) * float(d["hop"]), share), None
 
 
-def bar_vocals(path: str, y: np.ndarray, downbeats: np.ndarray, duration: float,
-               mix_in: float, mix_out: float) -> tuple[str | None, str]:
-    """Per-bar singing score JSON (0..1, 0.5 = singing; null where not measured) and its source.
+def _classify(path: str, repair: bool) -> tuple[tuple[np.ndarray, np.ndarray] | None, str | None]:
+    """(frame times, singing probability) via vocals_classify.py (PANNs)."""
+    if not CLASSIFY_SCRIPT.exists():
+        return None, "error: classifier not installed"
+    cmd = [VOCAL_PYTHON, "-I", str(CLASSIFY_SCRIPT), path] + (["--repair"] if repair else [])
+    d, reason = _run_json(cmd, VOCAL_TIMEOUT)
+    if d is None or not d.get("singing"):
+        return None, reason or "error: empty output"
+    p = np.array(d["singing"], dtype=float)
+    return (np.arange(len(p)) * float(d["hop"]), p), None
 
-    Demucs separates only the parts a transition reads: mix_in to +47 s (this
-    song as the incoming one) and mix_out to the end (as the outgoing one).
-    Without Demucs, the REPET heuristic covers the whole song.
+
+def detect_vocals(path: str, y: np.ndarray, duration: float, mix_in: float, mix_out: float,
+                  demucs_attempts: int = 0, last_error: str | None = None) -> dict:
+    """Run the fallback chain. Returns times, score (0..1, 0.5 = singing), source,
+    and demucs_error (None if Demucs succeeded or wasn't tried).
+
+    `demucs_attempts` / `last_error` (from earlier scans) pick the Demucs
+    strategy: 1st try plain; after a timeout or out-of-memory, in 10 s pieces;
+    after a read error, with file repair; 3rd try both. After
+    MAX_DEMUCS_ATTEMPTS failures Demucs is skipped and the backups are used.
     """
+    head_end, tail_start = min(duration, mix_in + HEAD_SECONDS), max(0.0, mix_out - 2.0)
+    decode_trouble = bool(last_error and last_error.startswith("decode"))
+    demucs_error: str | None = None
+    if demucs_available() and demucs_attempts < MAX_DEMUCS_ATTEMPTS:
+        chunk = demucs_attempts >= 1 and not (demucs_attempts == 1 and decode_trouble)
+        repair = decode_trouble or demucs_attempts >= 2
+        res, demucs_error = _separate("htdemucs", path, head_end, tail_start, chunk, repair)
+        if res is not None:
+            times, share = res
+            return {"times": times, "score": share / (2 * SINGING_LEVEL["demucs"]), "source": "demucs",
+                    "demucs_error": None}
+        print(f"demucs failed ({demucs_error}): {path}", file=sys.stderr, flush=True)
+        if demucs_error == "interrupted":
+            raise RuntimeError("vocal detection interrupted")  # don't save a fallback row
+        decode_trouble = decode_trouble or demucs_error.startswith("decode")
+    elif demucs_attempts >= MAX_DEMUCS_ATTEMPTS:
+        demucs_error = last_error
+
+    if demucs_available():
+        res, err = _separate("umxl", path, head_end, tail_start, chunk=False, repair=decode_trouble)
+        if res is not None:
+            times, share = res
+            return {"times": times, "score": share / (2 * SINGING_LEVEL["umxl"]), "source": "umxl",
+                    "demucs_error": demucs_error}
+        print(f"open-unmix failed ({err}): {path}", file=sys.stderr, flush=True)
+        decode_trouble = decode_trouble or (err or "").startswith("decode")
+        res, err = _classify(path, repair=decode_trouble)
+        if res is not None:
+            times, p = res
+            return {"times": times, "score": p / (2 * SINGING_LEVEL["panns"]), "source": "panns",
+                    "demucs_error": demucs_error}
+        print(f"panns failed ({err}): {path}", file=sys.stderr, flush=True)
+
+    times, ratio = _vocal_ratio(y)
+    return {"times": times, "score": ratio / (2 * SINGING_LEVEL["repet"]), "source": "repet",
+            "demucs_error": demucs_error}
+
+
+def bar_vocals(times: np.ndarray, score: np.ndarray, downbeats: np.ndarray, duration: float) -> str | None:
+    """Per-bar singing score JSON (0..1, 0.5 = singing; null where not measured)."""
     if len(downbeats) < 2:
-        return None, "none"
+        return None
     edges = np.r_[downbeats, duration]
-    demucs = _vocals_demucs(path, min(duration, mix_in + HEAD_SECONDS), max(0.0, mix_out - 2.0))
-    if demucs is not None:
-        times, share = demucs
-        score, source = share / (2 * DEMUCS_SINGING), "demucs"
-    else:
-        times, ratio = _vocal_ratio(y)
-        score, source = ratio / (2 * REPET_SINGING), "repet"
     idx = np.searchsorted(times, edges)
     out: list[float | None] = []
     for i in range(len(edges) - 1):
         seg = score[idx[i]:max(idx[i + 1], idx[i] + 1)]
         seg = seg[~np.isnan(seg)]
         out.append(round(float(min(1.0, np.median(seg))), 2) if len(seg) else None)
-    return json.dumps(out), source
+    return json.dumps(out)
 
 
-def analyze_track(path: str) -> dict:
+def analyze_track(path: str, demucs_attempts: int = 0, last_error: str | None = None) -> dict:
     """Everything the tracks table needs for one file."""
     y = decode(path)
     duration = len(y) / SR
@@ -407,7 +491,8 @@ def analyze_track(path: str) -> dict:
             if len(earlier) and earlier[-1] >= duration / 2:
                 mix_out = float(earlier[-1])
 
-    vocal_json, vocal_source = bar_vocals(path, y, downbeats, duration, mix_in, mix_out)
+    vocals = detect_vocals(path, y, duration, mix_in, mix_out, demucs_attempts, last_error)
+    vocal_json = bar_vocals(vocals["times"], vocals["score"], downbeats, duration)
 
     return {
         "intro_end": profile.get("intro_end"),
@@ -415,7 +500,8 @@ def analyze_track(path: str) -> dict:
         "bar_energy": profile.get("bar_energy"),
         "bar_bass": profile.get("bar_bass"),
         "bar_vocal": vocal_json,
-        "vocal_source": vocal_source,
+        "vocal_source": vocals["source"] if vocal_json else "none",
+        "demucs_error": vocals["demucs_error"],
         "analysis_version": ANALYSIS_VERSION,
         "bpm": round(bpm, 2),
         "beats": json.dumps([round(float(b), 4) for b in beats]),
