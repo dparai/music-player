@@ -3,12 +3,13 @@ import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subs
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
-  tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb,
+  tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
   downbeatAtOrBefore, phaseError,
 } from "@/lib/dj";
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
+import type { TrackShape } from "@/lib/dj";
 
 interface Props {
   song: SubsonicSong | null;
@@ -81,6 +82,25 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function shapeOf(
+  track: AutoMixTrack | null,
+  detail: AutoMixTrackDetail | null,
+  bpm: number | null,
+  duration: number,
+): TrackShape | null {
+  if (!bpm && !track) return null;
+  const d = detail && track && detail.id === track.id ? detail : null;
+  return {
+    bpm,
+    duration: isFinite(duration) ? duration : track?.duration ?? 0,
+    downbeats: d?.downbeats,
+    introEnd: d?.intro_end ?? null,
+    outroEnd: d?.outro_end ?? null,
+    barEnergy: d?.bar_energy,
+    barVocal: d?.bar_vocal,
+  };
+}
+
 function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
 }
@@ -109,6 +129,7 @@ export function NowPlaying({
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [crossfading, setCrossfading] = useState(false);
+  const [mixLabel, setMixLabel] = useState("CROSSFADING");
   const waveformRef = useRef<HTMLDivElement>(null);
   const lastSongIdRef = useRef<string | null>(null);
   const skipNextLoadRef = useRef<string | null>(null);
@@ -380,9 +401,11 @@ export function NowPlaying({
   // Where the outgoing track should start mixing out, in its own time.
   function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean } {
     const { serverTrack: track, effectiveBpm: bpm } = liveRef.current;
+    // The server's mix_out_point is phrase-aligned and leaves room for a
+    // mix; the transition planner decides how long the mix is from there.
     const fadeLen = fadeDurationFor(bpm);
-    let at = audio.duration - fadeLen;
-    if (track?.mix_out_point && track.mix_out_point < at) at = track.mix_out_point;
+    let at = track?.mix_out_point ? track.mix_out_point : audio.duration - fadeLen;
+    at = Math.min(at, audio.duration - (bpm ? 240 / bpm : 2));
     at = Math.max(at, audio.duration / 2);
 
     const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
@@ -502,10 +525,16 @@ export function NowPlaying({
         ? { outAnchor: anchor, inAnchor, outBeat: 60 / outBpm, inBeat: 60 / (inBpm * match.factor), outRate }
         : null;
 
-    const fadeLen = fadeDurationFor(outBpm);
+    const plan = planTransition(
+      shapeOf(outTrack, currentDetailRef.current, outBpm, outgoing.duration),
+      shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration),
+      match, outgoing.currentTime, inAnchor ?? 0,
+    );
+    const fadeLen = plan.seconds;
     const bar = outBpm ? 240 / outBpm : fadeLen / 8;
-    const half = 0.5 * (bar / fadeLen); // one-bar bass swap centred on the midpoint
-    const curves = buildCrossfadeCurves(CURVE_POINTS, 0.5 - half, 0.5 + half);
+    const curves = buildCrossfadeCurves(CURVE_POINTS, plan.swapStart, plan.swapEnd);
+    setMixLabel(plan.bars ? `MIX ${plan.bars} BAR${plan.bars > 1 ? "S" : ""}` : "CROSSFADING");
+    console.info("[brook] mix plan", plan);
 
     let end = 0;
     let legacy: Fade["legacy"] = null;
@@ -791,7 +820,7 @@ export function NowPlaying({
         <div className={styles.timeRow}>
           <span>{formatTime(currentTime)}</span>
           <span>
-            {crossfading && <span className={styles.crossfadeLabel}>CROSSFADING</span>}
+            {crossfading && <span className={styles.crossfadeLabel}>{mixLabel}</span>}
             {formatTime(duration)}
           </span>
         </div>

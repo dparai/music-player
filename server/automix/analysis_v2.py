@@ -33,7 +33,11 @@ SR = 22050
 HOP = 512
 KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 MAX_INTRO_CUE = 30.0  # matches NowPlaying.tsx: don't skip more intro than this
-MAX_OUTRO = 60.0      # never start the mix-out earlier than this before the end
+MAX_OUTRO = 40.0      # never start the mix-out earlier than this before the end
+# Bumped when analysis output changes; main.py re-analyses rows below it.
+# 3: per-bar structure profile (energy, bass, vocals) + intro_end / outro_end.
+ANALYSIS_VERSION = 3
+VOCAL_HOP = 2048      # ~93 ms frames for the vocal estimate (keeps nn_filter small)
 
 
 def decode(path: str, sr: int = SR) -> np.ndarray:
@@ -102,8 +106,19 @@ def _beats_librosa(y: np.ndarray, S: np.ndarray) -> tuple[np.ndarray, np.ndarray
     if len(beats) < 8:
         return beats, beats[::4]
 
-    frames = np.clip(frames, 0, S.shape[1] - 1)
     freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
+    # Loud off-beat hi-hats can pull the tracker half a beat off the kick.
+    # The kick (lowest band) belongs on the beat: if there's clearly more of it
+    # halfway between the tracked beats, shift the whole grid by half a beat.
+    low_all = S[freqs < 150].sum(axis=0)
+    half = int(round(np.median(np.diff(frames)) / 2))
+    on = low_all[np.clip(frames, 0, S.shape[1] - 1)]
+    off = low_all[np.clip(frames + half, 0, S.shape[1] - 1)]
+    if half > 0 and off.mean() > 1.3 * on.mean():
+        frames = frames + half
+        beats = librosa.frames_to_time(frames, sr=SR, hop_length=HOP)
+
+    frames = np.clip(frames, 0, S.shape[1] - 1)
     # Summarise each beat over its whole span [beat, next beat): a tracked beat
     # frame can sit just before the kick, so sampling that single frame misses it.
     # sync(pad=True) yields [0, f0), [f0, f1), ...; drop the pre-first-beat segment.
@@ -158,13 +173,16 @@ def detect_key(y_harm: np.ndarray) -> str:
     return best[1]
 
 
-def phrase_cues(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: float) -> tuple[float, float]:
+def phrase_cues(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: float,
+                origin: float | None = None) -> tuple[float, float]:
     """(mix_in, mix_out) on downbeats.
 
-    mix_out: a 4-bar boundary in the last minute where energy drops (the
-    outro), preferring later ones, leaving room for a full fade.
-    Boundaries on 8-bar phrases get a bonus. Falls back to the last boundary
-    that still fits the fade.
+    mix_out: a bar in the last minute where energy drops (the outro),
+    preferring later ones, leaving room for a full fade. Bars on a 4- or
+    8-bar phrase line get a bonus; phrases are counted from `origin` (where
+    the main section starts, i.e. intro_end), not from the first tracked
+    downbeat, which is often a bar late. Falls back to the last bar that still
+    fits the fade.
     """
     fade = fade_duration_for(bpm)
     mix_in = float(downbeats[0]) if len(downbeats) and downbeats[0] <= MAX_INTRO_CUE else 0.0
@@ -181,11 +199,14 @@ def phrase_cues(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: floa
     ])
     mean_energy = bar_energy.mean() or 1.0
 
+    bar = 240.0 / bpm if bpm > 0 else 2.0
+    origin = float(downbeats[0]) if origin is None else origin
     best_i, best_score = None, 0.0
     last_fit = None
-    for i in range(4, len(downbeats) - 1, 4):
+    for i in range(4, len(downbeats) - 1):
         t = float(downbeats[i])
-        # Mix out within the last minute: an earlier drop is a bridge, not an outro.
+        phrase = int(round((t - origin) / bar))
+        # Mix out within the last 40 s: an earlier drop is a bridge, not an outro.
         if t < max(duration / 2, duration - MAX_OUTRO) or t + fade > duration - 0.5:
             continue
         last_fit = t
@@ -195,12 +216,100 @@ def phrase_cues(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: floa
         # The outro is the *last* clear drop: the biggest one is often the
         # bridge (Espresso: 112 s of 175 s), which would cut a third of the song.
         # Later candidates win unless an earlier one is a much bigger drop.
-        score = drop + (0.05 if i % 8 == 0 else 0.0) + 0.5 * (t / duration)
+        score = drop + (0.1 if phrase % 8 == 0 else 0.05 if phrase % 4 == 0 else 0.0) + 1.5 * (t / duration)
         if drop > 0.15 and score > best_score:
             best_i, best_score = t, score
     if best_i is not None:
         return mix_in, best_i
     return mix_in, last_fit if last_fit is not None else simple_out
+
+
+def _per_bar(values: np.ndarray, times: np.ndarray, edges: np.ndarray, agg=np.mean) -> np.ndarray:
+    """Aggregate a frame-rate feature over each bar [edges[i], edges[i+1])."""
+    idx = np.searchsorted(times, edges)
+    out = np.zeros(len(edges) - 1)
+    for i in range(len(out)):
+        a, b = idx[i], max(idx[i + 1], idx[i] + 1)
+        seg = values[a:b]
+        out[i] = agg(seg) if len(seg) else 0.0
+    return out
+
+
+def _vocal_ratio(y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame share of vocal-band energy that is "foreground" (frame times, ratio).
+
+    REPET-SIM (librosa's vocal-separation recipe): the repeating background
+    (beat, pads, riffs) is what similar frames have in common; what doesn't
+    repeat, in the 250-3500 Hz band, is mostly the voice. Low resolution
+    (93 ms) keeps the similarity matrix small on 2 OCPUs.
+    """
+    hop = VOCAL_HOP if len(y) / SR < 600 else 2 * VOCAL_HOP
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+    width = max(3, int(librosa.time_to_frames(2.0, sr=SR, hop_length=hop)))
+    bg = librosa.decompose.nn_filter(S, aggregate=np.median, metric="cosine", width=width)
+    bg = np.minimum(S, bg)
+    fg = librosa.util.softmask(S - bg, 2.0 * bg, power=2) * S
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
+    band = (freqs >= 250) & (freqs <= 3500)
+    total = (S[band] ** 2).sum(axis=0) + 1e-10
+    ratio = (fg[band] ** 2).sum(axis=0) / total
+    times = librosa.frames_to_time(np.arange(S.shape[1]), sr=SR, hop_length=hop)
+    return times, ratio
+
+
+def structure_profile(y: np.ndarray, S: np.ndarray, downbeats: np.ndarray, duration: float, mix_in: float) -> dict:
+    """Per-bar energy / bass / vocals and where the intro ends and audio ends.
+
+    All per-bar arrays line up with `downbeats` (bar i = [downbeats[i], next)).
+    Energy and bass are relative to the track's median bar, so 1.0 = "typical".
+    - intro_end: first bar from mix_in where the track is really going (energy
+      and bass both >= 60% of typical for two bars): where the incoming bass
+      lands, so the bass swap belongs there.
+    - outro_end: end of the last bar that is still audible (within 40 dB of
+      the typical bar, and above -60 dBFS), so a mix never fades into trailing
+      silence. A quiet hats-only outro still counts as audible.
+    """
+    if len(downbeats) < 2:
+        return {}
+    edges = np.r_[downbeats, duration]
+    rms = librosa.feature.rms(S=S, frame_length=2048, hop_length=HOP)[0]
+    t = librosa.frames_to_time(np.arange(len(rms)), sr=SR, hop_length=HOP)
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
+    low = S[freqs < 150].sum(axis=0)
+
+    def rel(v: np.ndarray) -> np.ndarray:
+        audible = v[v > 0]
+        med = float(np.median(audible)) if len(audible) else 0.0
+        return v / med if med > 0 else v
+
+    energy = rel(_per_bar(rms, t, edges))
+    bass = rel(_per_bar(low, t, edges))
+    vt, vr = _vocal_ratio(y)
+    vocal = _per_bar(vr, vt, edges, agg=np.median)
+
+    start = int(np.searchsorted(downbeats, mix_in - 0.05))
+    intro_end = float(downbeats[start])
+    for i in range(start, min(len(energy) - 1, start + 64)):
+        if min(energy[i], energy[i + 1]) >= 0.6 and min(bass[i], bass[i + 1]) >= 0.6:
+            intro_end = float(downbeats[i])
+            break
+
+    bar_rms = _per_bar(rms, t, edges)
+    with np.errstate(divide="ignore"):
+        bar_db = 20 * np.log10(np.maximum(bar_rms, 1e-12))
+    loud = bar_db[bar_db > -100]
+    floor = max(-60.0, float(np.median(loud)) - 40.0) if len(loud) else -60.0
+    audible = np.nonzero(bar_db >= floor)[0]
+    outro_end = float(edges[audible[-1] + 1]) if len(audible) else duration
+
+    r2 = lambda a: [round(float(x), 2) for x in a]  # noqa: E731
+    return {
+        "intro_end": round(intro_end, 3),
+        "outro_end": round(min(outro_end, duration), 3),
+        "bar_energy": json.dumps(r2(energy)),
+        "bar_bass": json.dumps(r2(bass)),
+        "bar_vocal": json.dumps(r2(vocal)),
+    }
 
 
 def analyze_track(path: str) -> dict:
@@ -222,9 +331,25 @@ def analyze_track(path: str) -> dict:
         beats, downbeats = _extend_grid(beats, downbeats, duration, 60.0 / bpm)
 
     y_harm = librosa.effects.harmonic(y)
-    mix_in, mix_out = phrase_cues(y, downbeats, duration, bpm)
+    first = float(downbeats[0]) if len(downbeats) else 0.0
+    profile = structure_profile(y, S, downbeats, duration, first if first <= MAX_INTRO_CUE else 0.0)
+    mix_in, mix_out = phrase_cues(y, downbeats, duration, bpm, origin=profile.get("intro_end"))
+    # Never cue the mix-out at (or past) the end of audible audio: keep at
+    # least 4 bars between them when the song allows it.
+    if profile.get("outro_end") and bpm > 0:
+        latest = profile["outro_end"] - 4 * 240.0 / bpm
+        if mix_out > latest:
+            earlier = downbeats[downbeats <= latest]
+            if len(earlier) and earlier[-1] >= duration / 2:
+                mix_out = float(earlier[-1])
 
     return {
+        "intro_end": profile.get("intro_end"),
+        "outro_end": profile.get("outro_end"),
+        "bar_energy": profile.get("bar_energy"),
+        "bar_bass": profile.get("bar_bass"),
+        "bar_vocal": profile.get("bar_vocal"),
+        "analysis_version": ANALYSIS_VERSION,
         "bpm": round(bpm, 2),
         "beats": json.dumps([round(float(b), 4) for b in beats]),
         "downbeats": json.dumps([round(float(d), 4) for d in downbeats]),
@@ -243,4 +368,7 @@ if __name__ == "__main__":
         r = analyze_track(p)
         r["beats"] = f"<{len(json.loads(r['beats']))} beats>"
         r["downbeats"] = f"<{len(json.loads(r['downbeats']))} downbeats>"
+        for k in ("bar_energy", "bar_bass", "bar_vocal"):
+            if r.get(k):
+                r[k] = " ".join(f"{x:.1f}" for x in json.loads(r[k]))
         print(p, json.dumps(r, indent=2))

@@ -48,12 +48,12 @@ Brook doesn't just play the next song — it **mixes** like a real DJ:
 
 - **Beat Sync** — the mix starts exactly on a downbeat, the incoming song is tempo-matched (up to ±6%, pitch preserved) and phase-locked to the outgoing beat (within ~10 ms), then eases back to its own tempo
 - **Camelot Wheel** — picks the next song in a harmonically compatible key (so transitions sound musical, not jarring)
-- **8-Bar Phrase Mix** — the crossfade lasts 8 bars at the song's tempo (15 s at 128 BPM, 21 s at 90 BPM)
+- **Adaptive Transitions** — every mix is planned for the two songs: as long as the incoming intro (1 to 32 bars), shorter when both songs are loud, cut before two vocals would overlap, never into silence. The bass swaps exactly when the incoming bass comes in
 - **Bass Swap** — only one bassline at a time: the bass changes hands in one bar in the middle of the mix, with no mud and no mid-mix bass hole
 - **Outro Cues** — the server finds where each song's outro starts and mixes there, not just "15 s before the end"
 - **Loudness Levelling** — every song trimmed to about −14 LUFS, plus a master limiter, so volume doesn't jump between songs
 - **Smart Song Endings** — detects real silence/fade-outs and starts the mix early instead of waiting for dead air
-- **Server-Side Analysis (AutoMix v2)** — FastAPI + librosa on the VM: BPM, beat grid with real downbeats, cue points, key and loudness for every song, matched to Navidrome song IDs
+- **Server-Side Analysis (AutoMix)** — FastAPI + librosa on the VM: BPM, beat grid with real downbeats, cue points, key, loudness, and a per-bar structure profile (energy, bass, vocals, intro/outro) for every song, matched to Navidrome song IDs
 
 ### How DJ Song Selection Works
 

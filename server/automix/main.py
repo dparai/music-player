@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analysis_v2 import analyze_track as analyze_v2  # noqa: E402
+from analysis_v2 import ANALYSIS_VERSION, analyze_track as analyze_v2  # noqa: E402
 from auth import require_user  # noqa: E402
 from navidrome_ids import navidrome_ids  # noqa: E402
 
@@ -68,7 +68,10 @@ def init_db():
         # the scanner re-analyses in the background (old data stays served
         # until each track's new row lands).
         have = {r["name"] for r in conn.execute("PRAGMA table_info(tracks)")}
-        for col, typ in [("key", "TEXT"), ("lufs", "REAL"), ("navidrome_id", "TEXT"), ("grid_source", "TEXT")]:
+        # analysis_version < ANALYSIS_VERSION (or NULL) is re-analysed the same way.
+        for col, typ in [("key", "TEXT"), ("lufs", "REAL"), ("navidrome_id", "TEXT"), ("grid_source", "TEXT"),
+                         ("intro_end", "REAL"), ("outro_end", "REAL"), ("bar_energy", "TEXT"),
+                         ("bar_bass", "TEXT"), ("bar_vocal", "TEXT"), ("analysis_version", "INTEGER")]:
             if col not in have:
                 conn.execute(f"ALTER TABLE tracks ADD COLUMN {col} {typ}")
         conn.execute("CREATE INDEX IF NOT EXISTS tracks_navidrome_id ON tracks(navidrome_id)")
@@ -107,7 +110,8 @@ def _scan():
 
     with _db_lock:
         conn = get_db()
-        done = {row["path"] for row in conn.execute("SELECT path FROM tracks WHERE grid_source IS NOT NULL")}
+        done = {row["path"] for row in conn.execute(
+            "SELECT path FROM tracks WHERE analysis_version >= ?", (ANALYSIS_VERSION,))}
         gone = [row["path"] for row in conn.execute("SELECT path FROM tracks") if row["path"] not in on_disk]
         for path in gone:
             conn.execute("DELETE FROM transitions WHERE from_track = ? OR to_track = ?", (make_track_id(path),) * 2)
@@ -141,14 +145,16 @@ def _scan():
                     INSERT OR REPLACE INTO tracks
                     (id, path, filename, bpm, beats, downbeats, confidence,
                      mix_in_point, mix_out_point, duration, analyzed_at,
-                     key, lufs, grid_source, navidrome_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?,
+                     key, lufs, grid_source, intro_end, outro_end, bar_energy, bar_bass,
+                     bar_vocal, analysis_version, navidrome_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             (SELECT navidrome_id FROM tracks WHERE path = ?))
                 """, (
                     make_track_id(path), path, f.name,
                     r["bpm"], r["beats"], r["downbeats"], r["confidence"],
                     r["mix_in_point"], r["mix_out_point"], r["duration"],
-                    r["key"], r["lufs"], r["grid_source"], path,
+                    r["key"], r["lufs"], r["grid_source"], r["intro_end"], r["outro_end"],
+                    r["bar_energy"], r["bar_bass"], r["bar_vocal"], r["analysis_version"], path,
                 ))
                 c.commit()
                 c.close()
@@ -184,8 +190,8 @@ def get_track(track_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Track not found")
     result = dict(row)
-    result["beats"] = json.loads(result["beats"]) if result["beats"] else []
-    result["downbeats"] = json.loads(result["downbeats"]) if result["downbeats"] else []
+    for k in ("beats", "downbeats", "bar_energy", "bar_bass", "bar_vocal"):
+        result[k] = json.loads(result[k]) if result.get(k) else []
     return result
 
 @app.post("/automix/rescan", dependencies=[Depends(require_user)])
@@ -198,7 +204,8 @@ def rescan():
 def stats():
     conn = get_db()
     total = conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
-    analyzed = conn.execute("SELECT COUNT(*) FROM tracks WHERE grid_source IS NOT NULL").fetchone()[0]
+    analyzed = conn.execute(
+        "SELECT COUNT(*) FROM tracks WHERE analysis_version >= ?", (ANALYSIS_VERSION,)).fetchone()[0]
     avg_bpm = conn.execute("SELECT AVG(bpm) FROM tracks WHERE bpm IS NOT NULL").fetchone()[0]
     conn.close()
     return {
