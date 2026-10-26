@@ -71,7 +71,8 @@ def init_db():
         # analysis_version < ANALYSIS_VERSION (or NULL) is re-analysed the same way.
         for col, typ in [("key", "TEXT"), ("lufs", "REAL"), ("navidrome_id", "TEXT"), ("grid_source", "TEXT"),
                          ("intro_end", "REAL"), ("outro_end", "REAL"), ("bar_energy", "TEXT"),
-                         ("bar_bass", "TEXT"), ("bar_vocal", "TEXT"), ("analysis_version", "INTEGER")]:
+                         ("bar_bass", "TEXT"), ("bar_vocal", "TEXT"), ("analysis_version", "INTEGER"),
+                         ("vocal_source", "TEXT")]:
             if col not in have:
                 conn.execute(f"ALTER TABLE tracks ADD COLUMN {col} {typ}")
         conn.execute("CREATE INDEX IF NOT EXISTS tracks_navidrome_id ON tracks(navidrome_id)")
@@ -146,15 +147,16 @@ def _scan():
                     (id, path, filename, bpm, beats, downbeats, confidence,
                      mix_in_point, mix_out_point, duration, analyzed_at,
                      key, lufs, grid_source, intro_end, outro_end, bar_energy, bar_bass,
-                     bar_vocal, analysis_version, navidrome_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     bar_vocal, analysis_version, vocal_source, navidrome_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             (SELECT navidrome_id FROM tracks WHERE path = ?))
                 """, (
                     make_track_id(path), path, f.name,
                     r["bpm"], r["beats"], r["downbeats"], r["confidence"],
                     r["mix_in_point"], r["mix_out_point"], r["duration"],
                     r["key"], r["lufs"], r["grid_source"], r["intro_end"], r["outro_end"],
-                    r["bar_energy"], r["bar_bass"], r["bar_vocal"], r["analysis_version"], path,
+                    r["bar_energy"], r["bar_bass"], r["bar_vocal"], r["analysis_version"],
+                    r["vocal_source"], path,
                 ))
                 c.commit()
                 c.close()
