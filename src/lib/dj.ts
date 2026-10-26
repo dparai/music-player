@@ -252,7 +252,7 @@ export interface TrackShape {
   introEnd?: number | null;  // where the track's main part (bass) starts
   outroEnd?: number | null;  // end of audible audio
   barEnergy?: number[];      // per bar, 1.0 = typical bar of this track
-  barVocal?: number[];       // per bar, 0..1 foreground share in the vocal band
+  barVocal?: (number | null)[]; // per bar, 0..1 singing score; null = not measured
 }
 
 export interface TransitionPlan {
@@ -264,7 +264,7 @@ export interface TransitionPlan {
   reason: string;       // shown in the UI, handy when a mix sounds off
 }
 
-export const VOCAL_ON = 0.18;     // bar_vocal at or above this counts as singing
+export const VOCAL_ON = 0.5;      // bar_vocal is a 0..1 singing score (server analysis v4); 0.5 = singing
 const MAX_FADE_BARS = 32;
 const MAX_FADE_SECONDS = 45;
 const DEFAULT_BARS = 8;           // incoming intro unknown
@@ -280,10 +280,10 @@ export function barIndexAt(downbeats: number[], t: number): number {
   return best;
 }
 
-function barValue(shape: TrackShape, values: number[] | undefined, t: number): number | null {
+function barValue(shape: TrackShape, values: (number | null)[] | undefined, t: number): number | null {
   if (!values?.length || !shape.downbeats?.length) return null;
   const i = barIndexAt(shape.downbeats, t);
-  return i >= 0 && i < values.length ? values[i]! : null;
+  return i >= 0 && i < values.length ? values[i] ?? null : null;
 }
 
 function powerOfTwoAtMost(n: number): number {

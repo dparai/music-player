@@ -22,9 +22,11 @@ Standalone check:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import librosa
 import numpy as np
@@ -36,7 +38,18 @@ MAX_INTRO_CUE = 30.0  # matches NowPlaying.tsx: don't skip more intro than this
 MAX_OUTRO = 40.0      # never start the mix-out earlier than this before the end
 # Bumped when analysis output changes; main.py re-analyses rows below it.
 # 3: per-bar structure profile (energy, bass, vocals) + intro_end / outro_end.
-ANALYSIS_VERSION = 3
+# 4: vocals from Demucs source separation (heuristic only as a fallback).
+ANALYSIS_VERSION = 4
+# Demucs runs in its own venv (CPU torch); see vocals_demucs.py.
+DEMUCS_PYTHON = os.environ.get("AUTOMIX_DEMUCS_PYTHON", "/opt/demucs/venv/bin/python")
+DEMUCS_SCRIPT = Path(__file__).resolve().parent / "vocals_demucs.py"
+DEMUCS_TIMEOUT = 1800
+# bar_vocal is a 0..1 "singing" score, 0.5 = singing, whichever detector ran:
+# Demucs vocal-stem energy share 0.05 (instrumental bars read ~0.000-0.01,
+# sung bars 0.15-0.40) and the REPET heuristic ratio 0.18 both map to 0.5.
+DEMUCS_SINGING = 0.05
+REPET_SINGING = 0.18
+HEAD_SECONDS = 47.0   # incoming side: the planner reads up to 45 s after mix_in
 VOCAL_HOP = 2048      # ~93 ms frames for the vocal estimate (keeps nn_filter small)
 
 
@@ -284,8 +297,6 @@ def structure_profile(y: np.ndarray, S: np.ndarray, downbeats: np.ndarray, durat
 
     energy = rel(_per_bar(rms, t, edges))
     bass = rel(_per_bar(low, t, edges))
-    vt, vr = _vocal_ratio(y)
-    vocal = _per_bar(vr, vt, edges, agg=np.median)
 
     start = int(np.searchsorted(downbeats, mix_in - 0.05))
     intro_end = float(downbeats[start])
@@ -308,8 +319,57 @@ def structure_profile(y: np.ndarray, S: np.ndarray, downbeats: np.ndarray, durat
         "outro_end": round(min(outro_end, duration), 3),
         "bar_energy": json.dumps(r2(energy)),
         "bar_bass": json.dumps(r2(bass)),
-        "bar_vocal": json.dumps(r2(vocal)),
     }
+
+
+def _vocals_demucs(path: str, head_end: float, tail_start: float) -> tuple[np.ndarray, np.ndarray] | None:
+    """(frame times, vocal share) from Demucs, NaN outside the separated windows; None if unavailable."""
+    if not (os.path.exists(DEMUCS_PYTHON) and DEMUCS_SCRIPT.exists()):
+        return None
+    try:
+        r = subprocess.run(
+            [DEMUCS_PYTHON, "-I", str(DEMUCS_SCRIPT), path, f"{head_end:.2f}", f"{tail_start:.2f}"],
+            capture_output=True, text=True, timeout=DEMUCS_TIMEOUT,
+        )
+        d = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        print(f"demucs failed: {e}", file=sys.stderr)
+        return None
+    if not d or not d.get("vocal"):
+        print(f"demucs failed: exit {r.returncode}: {r.stderr.strip()[-300:]}", file=sys.stderr)
+        return None
+    vocal = np.array([np.nan if v is None else v for v in d["vocal"]], dtype=float)
+    total = np.array(d["total"][: len(vocal)], dtype=float)
+    share = vocal ** 2 / (total ** 2 + 1e-10)
+    times = np.arange(len(share)) * float(d["hop"])
+    return times, share
+
+
+def bar_vocals(path: str, y: np.ndarray, downbeats: np.ndarray, duration: float,
+               mix_in: float, mix_out: float) -> tuple[str | None, str]:
+    """Per-bar singing score JSON (0..1, 0.5 = singing; null where not measured) and its source.
+
+    Demucs separates only the parts a transition reads: mix_in to +47 s (this
+    song as the incoming one) and mix_out to the end (as the outgoing one).
+    Without Demucs, the REPET heuristic covers the whole song.
+    """
+    if len(downbeats) < 2:
+        return None, "none"
+    edges = np.r_[downbeats, duration]
+    demucs = _vocals_demucs(path, min(duration, mix_in + HEAD_SECONDS), max(0.0, mix_out - 2.0))
+    if demucs is not None:
+        times, share = demucs
+        score, source = share / (2 * DEMUCS_SINGING), "demucs"
+    else:
+        times, ratio = _vocal_ratio(y)
+        score, source = ratio / (2 * REPET_SINGING), "repet"
+    idx = np.searchsorted(times, edges)
+    out: list[float | None] = []
+    for i in range(len(edges) - 1):
+        seg = score[idx[i]:max(idx[i + 1], idx[i] + 1)]
+        seg = seg[~np.isnan(seg)]
+        out.append(round(float(min(1.0, np.median(seg))), 2) if len(seg) else None)
+    return json.dumps(out), source
 
 
 def analyze_track(path: str) -> dict:
@@ -343,12 +403,15 @@ def analyze_track(path: str) -> dict:
             if len(earlier) and earlier[-1] >= duration / 2:
                 mix_out = float(earlier[-1])
 
+    vocal_json, vocal_source = bar_vocals(path, y, downbeats, duration, mix_in, mix_out)
+
     return {
         "intro_end": profile.get("intro_end"),
         "outro_end": profile.get("outro_end"),
         "bar_energy": profile.get("bar_energy"),
         "bar_bass": profile.get("bar_bass"),
-        "bar_vocal": profile.get("bar_vocal"),
+        "bar_vocal": vocal_json,
+        "vocal_source": vocal_source,
         "analysis_version": ANALYSIS_VERSION,
         "bpm": round(bpm, 2),
         "beats": json.dumps([round(float(b), 4) for b in beats]),
@@ -370,5 +433,5 @@ if __name__ == "__main__":
         r["downbeats"] = f"<{len(json.loads(r['downbeats']))} downbeats>"
         for k in ("bar_energy", "bar_bass", "bar_vocal"):
             if r.get(k):
-                r[k] = " ".join(f"{x:.1f}" for x in json.loads(r[k]))
+                r[k] = " ".join("-" if x is None else f"{x:.1f}" for x in json.loads(r[k]))
         print(p, json.dumps(r, indent=2))
