@@ -53,7 +53,8 @@ Brook doesn't just play the next song — it **mixes** like a real DJ:
 - **Outro Cues** — the server finds where each song's outro starts and mixes there, not just "15 s before the end"
 - **Loudness Levelling** — every song trimmed to about −14 LUFS, plus a master limiter, so volume doesn't jump between songs
 - **Smart Song Endings** — detects real silence/fade-outs and starts the mix early instead of waiting for dead air
-- **Server-Side Analysis (AutoMix)** — FastAPI + librosa on the VM: BPM, beat grid with real downbeats, cue points, key, loudness, and a per-bar structure profile (energy, bass, intro/outro, and vocals from Demucs source separation) for every song, matched to Navidrome song IDs
+- **Server-Side Analysis (AutoMix)** — FastAPI + librosa on the VM: BPM, beat grid with real downbeats, cue points, key, loudness, and a per-bar structure profile (energy, bass, intro/outro, and vocals) for every song, matched to Navidrome song IDs
+- **Reliable Vocal Detection** — Demucs source separation first; if it fails, it is retried with safer settings and backed up by Open-Unmix, then a PANNs singing classifier, then a heuristic, so every song always gets a vocal map
 
 ### How DJ Song Selection Works
 

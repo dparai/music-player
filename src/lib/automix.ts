@@ -58,7 +58,7 @@ export interface AutoMixTrackDetail extends AutoMixTrack {
   bar_energy?: number[];
   bar_bass?: number[];
   bar_vocal?: (number | null)[];  // 0..1 singing score, null where not measured
-  vocal_source?: "demucs" | "repet" | "none" | null;
+  vocal_source?: "demucs" | "umxl" | "panns" | "repet" | "none" | null;
 }
 
 let trackCache: AutoMixTrack[] | null = null;
