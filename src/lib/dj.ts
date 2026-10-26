@@ -200,10 +200,17 @@ export function buildCrossfadeCurves(points: number, swapStart: number, swapEnd:
   const shelfOut = new Float32Array(points);
   const shelfIn = new Float32Array(points);
   const swapLen = Math.max(1e-3, swapEnd - swapStart);
+  // The faders cross where the bass swaps. A late swap (long incoming intro)
+  // keeps the outgoing deck up until its bass hands over; with the crossover
+  // left in the middle, the shelf (max +6 dB) can't hold the outgoing bass
+  // up while its fader closes, and the bass would be missing for ~16% of the mix.
+  const centre = Math.min(0.98, Math.max(0.02, (swapStart + swapEnd) / 2));
+  const warp = (p: number) => (p <= centre ? 0.5 * (p / centre) : 0.5 + 0.5 * ((p - centre) / (1 - centre)));
   for (let i = 0; i < points; i++) {
     const p = i / (points - 1);
-    const gOut = Math.cos((p * Math.PI) / 2);
-    const gIn = Math.sin((p * Math.PI) / 2);
+    const q = warp(p);
+    const gOut = Math.cos((q * Math.PI) / 2);
+    const gIn = Math.sin((q * Math.PI) / 2);
     const s = Math.max(0, Math.min(1, (p - swapStart) / swapLen));
     const bassOut = Math.cos((s * Math.PI) / 2);
     const bassIn = Math.sin((s * Math.PI) / 2);
@@ -233,6 +240,144 @@ export function loudnessTrimDb(
   const peak = replayGain?.trackPeak;
   if (typeof peak === "number" && peak > 0) db = Math.min(db, -20 * Math.log10(peak));
   return Math.max(-12, Math.min(6, db));
+}
+
+// --- Transition planning -------------------------------------------------
+
+// What the planner knows about one track (from the AutoMix beat-grid detail).
+export interface TrackShape {
+  bpm: number | null;
+  duration: number;
+  downbeats?: number[];
+  introEnd?: number | null;  // where the track's main part (bass) starts
+  outroEnd?: number | null;  // end of audible audio
+  barEnergy?: number[];      // per bar, 1.0 = typical bar of this track
+  barVocal?: number[];       // per bar, 0..1 foreground share in the vocal band
+}
+
+export interface TransitionPlan {
+  seconds: number;      // fade length, wall clock
+  bars: number | null;  // in outgoing bars; null without a tempo
+  swapStart: number;    // bass-swap window, as fractions of the fade
+  swapEnd: number;
+  style: "blend" | "cut" | "fade";
+  reason: string;       // shown in the UI, handy when a mix sounds off
+}
+
+export const VOCAL_ON = 0.18;     // bar_vocal at or above this counts as singing
+const MAX_FADE_BARS = 32;
+const MAX_FADE_SECONDS = 45;
+const DEFAULT_BARS = 8;           // incoming intro unknown
+const HIGH_ENERGY = 0.85;         // both sides this loud: keep the overlap short
+
+// Index of the bar containing `t`, or -1 before the first downbeat.
+export function barIndexAt(downbeats: number[], t: number): number {
+  let lo = 0, hi = downbeats.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (downbeats[mid]! <= t) { best = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return best;
+}
+
+function barValue(shape: TrackShape, values: number[] | undefined, t: number): number | null {
+  if (!values?.length || !shape.downbeats?.length) return null;
+  const i = barIndexAt(shape.downbeats, t);
+  return i >= 0 && i < values.length ? values[i]! : null;
+}
+
+function powerOfTwoAtMost(n: number): number {
+  let p = 1;
+  while (p * 2 <= n) p *= 2;
+  return p;
+}
+
+// Decide how this particular pair should be mixed. The length follows the
+// music: as long as the incoming intro (so its bass arrives when the mix is
+// done), never longer than the outgoing track has audio left, shorter when
+// both are at full energy, and cut before two vocals would overlap. Lengths
+// snap to 1/2/4/8/16/32 bars so the mix ends on a phrase line. The bass swap
+// lands where the incoming bass enters (intro_end) when that's inside the mix.
+//
+// `cueOut`: outgoing time the mix starts. `inStart`: incoming time it starts
+// from (its first downbeat). `match`: tempo match, null if too far apart.
+export function planTransition(
+  out: TrackShape | null,
+  inn: TrackShape | null,
+  match: TempoMatch | null,
+  cueOut: number,
+  inStart: number,
+): TransitionPlan {
+  const outBpm = out?.bpm ?? null;
+  if (!out || !outBpm || !(outBpm > 0)) {
+    return { seconds: CROSSFADE_DURATION, bars: null, swapStart: 0.45, swapEnd: 0.55, style: "fade", reason: "no tempo" };
+  }
+  const bar = 240 / outBpm;
+  if (!match) {
+    const seconds = Math.max(6, Math.min(10, 4 * bar));
+    return { seconds, bars: Math.round(seconds / bar), swapStart: 0.4, swapEnd: 0.6, style: "fade", reason: "tempos too far apart" };
+  }
+
+  const reasons: string[] = [];
+  const end = out.outroEnd && out.outroEnd > cueOut ? out.outroEnd : out.duration;
+  const available = Math.floor((end - cueOut) / bar + 0.01);
+
+  // Incoming intro length, converted to outgoing bars (wall clock).
+  let introBars: number | null = null;
+  if (inn?.introEnd != null && inn.introEnd > inStart) {
+    introBars = Math.round((inn.introEnd - inStart) / match.rate / bar);
+  }
+  let n = introBars !== null ? Math.max(introBars, 4) : DEFAULT_BARS;
+  reasons.push(introBars !== null ? `intro ${introBars} bars` : "intro unknown");
+  if (available < n) { n = available; reasons.push(`outro ${available} bars`); }
+  n = Math.min(n, MAX_FADE_BARS, Math.floor(MAX_FADE_SECONDS / bar));
+
+  const inTimeAt = (k: number) => inStart + (k + 0.5) * bar * match.rate; // middle of mix bar k, incoming time
+  const outTimeAt = (k: number) => cueOut + (k + 0.5) * bar;
+
+  if (inn && n > 8) {
+    let outE = 0, inE = 0, count = 0;
+    for (let k = 0; k < n; k++) {
+      const o = barValue(out, out.barEnergy, outTimeAt(k));
+      const i = barValue(inn, inn.barEnergy, inTimeAt(k));
+      if (o === null || i === null) continue;
+      outE += o; inE += i; count++;
+    }
+    if (count > 0 && outE / count >= HIGH_ENERGY && inE / count >= HIGH_ENERGY) {
+      n = 8;
+      reasons.push("both loud");
+    }
+  }
+
+  if (inn) {
+    // First bar where both are singing for two bars in a row: end the mix before it.
+    for (let k = 0; k < n - 1; k++) {
+      const sings = (j: number) =>
+        (barValue(out, out.barVocal, outTimeAt(j)) ?? 0) >= VOCAL_ON &&
+        (barValue(inn, inn.barVocal, inTimeAt(j)) ?? 0) >= VOCAL_ON;
+      if (sings(k) && sings(k + 1)) {
+        n = k;
+        reasons.push("vocals would overlap");
+        break;
+      }
+    }
+  }
+
+  n = powerOfTwoAtMost(Math.max(1, n));
+  const style = n <= 2 ? "cut" : "blend";
+  let swapStart: number, swapEnd: number;
+  if (n <= 2) {
+    swapStart = 0.25; swapEnd = 0.75;
+  } else {
+    // Swap when the incoming bass arrives. An intro as long as (or longer than)
+    // the mix means its bass only comes at the end: swap in the last bar, else
+    // the middle of the mix would have no bass at all.
+    const centre = introBars !== null ? Math.min(Math.max(introBars, 0.5), n - 0.5) / n : 0.5;
+    const half = 0.5 / n; // one bar
+    swapStart = Math.max(0.02, centre - half);
+    swapEnd = Math.min(0.98, centre + half);
+  }
+  return { seconds: n * bar, bars: n, swapStart, swapEnd, style, reason: reasons.join(", ") };
 }
 
 // Last downbeat at or before `t` (the start of the phrase to mix out on).

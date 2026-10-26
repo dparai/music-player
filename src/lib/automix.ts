@@ -52,6 +52,12 @@ export interface AutoMixTrackDetail extends AutoMixTrack {
   path: string;
   beats: number[];
   downbeats: number[];
+  // Structure profile (analysis version 3); empty/absent on older rows.
+  intro_end?: number | null;
+  outro_end?: number | null;
+  bar_energy?: number[];
+  bar_bass?: number[];
+  bar_vocal?: number[];
 }
 
 let trackCache: AutoMixTrack[] | null = null;
