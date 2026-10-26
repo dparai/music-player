@@ -1,5 +1,5 @@
 #!/bin/bash
-# /home/ubuntu/sync-music.sh, run by cron every 2 days (0 0 */2 * *).
+# /home/ubuntu/sync-music.sh, run by cron daily at 00:00 (0 0 * * *).
 # Same as the original, plus the AutoMix rescan at the end: before, new
 # songs only got DJ data (beat grid, cues, key, loudness) when the
 # automix service restarted.
