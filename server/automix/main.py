@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException
 import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analysis_v2 import ANALYSIS_VERSION, analyze_track as analyze_v2  # noqa: E402
+from analysis_v2 import ANALYSIS_VERSION, analyze_track as analyze_v2, demucs_available  # noqa: E402
 from auth import require_user  # noqa: E402
 from navidrome_ids import navidrome_ids  # noqa: E402
 
@@ -124,8 +124,13 @@ def _prune_and_link(on_disk: set[str]) -> tuple[set[str], set[str]]:
             conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
         conn.commit()
         link_navidrome_ids(conn)
+        # A song whose Demucs run failed (timeout, out of memory, a restart
+        # mid-song) fell back to the REPET heuristic: retry it on each scan,
+        # after new and outdated songs, as long as Demucs is installed.
+        retry_heuristic = demucs_available()
         done = {row["path"] for row in conn.execute(
-            "SELECT path FROM tracks WHERE analysis_version >= ?", (ANALYSIS_VERSION,))}
+            "SELECT path, vocal_source FROM tracks WHERE analysis_version >= ?", (ANALYSIS_VERSION,))
+            if not (retry_heuristic and row["vocal_source"] == "repet")}
         known = {row["path"] for row in conn.execute("SELECT path FROM tracks")}
         conn.close()
     if gone:
@@ -236,6 +241,9 @@ def get_track(track_id: str):
 
 @app.post("/automix/rescan", dependencies=[Depends(require_user)])
 def rescan():
+    if _scan_lock.locked():
+        _rescan_requested.set()
+        return {"status": "queued"}  # the running scan picks new files up next
     thread = threading.Thread(target=scan_and_analyze, daemon=True)
     thread.start()
     return {"status": "scan_started"}
