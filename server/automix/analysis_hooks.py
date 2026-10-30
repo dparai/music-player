@@ -29,7 +29,7 @@ from analysis_v2 import HOP, KEY_NAMES, SINGING_LEVEL, SR, _vocal_ratio
 
 # Bumped when the cues change; main.py re-runs the hook pass on rows below it
 # (without re-running the full analysis).
-HOOK_VERSION = 1
+HOOK_VERSION = 2
 
 BUILD_BARS = 8        # hook_in = hook_drop - this: the build the incoming deck plays under the mix
 MAX_POST_BARS = 8     # outgoing may keep playing this long after hook_out while the next build rises
@@ -383,6 +383,17 @@ def detect_hooks(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: flo
         boundary = nov[drop_bar + 7:drop_bar + 10].max()
         if second >= 0.85 * energy[drop_bar:drop_bar + 8].mean() and (same >= tau or boundary < 0.5):
             hook_bars = 16
+    if lyric_used:
+        # Lyrics say where the chorus block ends: play through its last line
+        # (a hand-off mid-line cuts a word), 8 to 24 bars.
+        t0 = downbeats[drop_bar]
+        block_end = next((b for a, b in lyric_chorus_spans(lyrics) if a - 2 * bar_len - 0.5 <= t0 <= b), None)
+        if block_end is not None:
+            k = int(np.searchsorted(downbeats, block_end - 0.3 * bar_len))
+            k = min(max(k, drop_bar + 8), drop_bar + 24, nb)
+            while k > drop_bar + 8 and edges[k] > end:
+                k -= 1
+            hook_bars = k - drop_bar
     out_bar = min(drop_bar + hook_bars, nb)
     post = 0
     while post < MAX_POST_BARS and out_bar + post + 1 <= nb and edges[out_bar + post + 1] <= end:
@@ -449,6 +460,51 @@ def _cue_dict(downbeats: np.ndarray, edges: np.ndarray, drop: int, bars: int, nb
     }
 
 
+_STOPWORDS = {
+    "en": set("the you and i to me my it a in your is that be we on all of so it's i'm don't know love just like".split()),
+    "desi": set("hai main tu ki di nu ve na mera tera ae je ni kar ho ke hain mainu tenu nal te vi kya dil yaar".split()),
+    "es": set("que el la y de mi te yo en no tu me lo es se por una con mas".split()),
+}
+
+
+def lyric_language(lines: list[tuple[float, str]] | None) -> str:
+    """Rough language group of the lyrics, for keeping a DJ set in one language:
+    'inst' (no lyrics), 'desi' (Hindi / Punjabi / Urdu, any script), 'en',
+    'es', 'ru', 'east-asia'."""
+    words = [t for _, t in lines or []]
+    if len(words) < 4:
+        return "inst"
+    text = " ".join(words)
+    scripts: dict[str, int] = {}
+    for ch in text:
+        if ch.isalpha():
+            name = unicodedata.name(ch, "X").split()[0]
+            scripts[name] = scripts.get(name, 0) + 1
+    top = max(scripts, key=scripts.get) if scripts else "LATIN"
+    if top in ("DEVANAGARI", "GURMUKHI", "ARABIC"):
+        return "desi"
+    if top == "CYRILLIC":
+        return "ru"
+    if top in ("HANGUL", "HIRAGANA", "KATAKANA", "CJK"):
+        return "east-asia"
+    toks = re.findall(r"[a-z']+", text.lower())
+    counts = {k: sum(w in v for w in toks) for k, v in _STOPWORDS.items()}
+    return max(counts, key=counts.get)
+
+
+def sound_profile(S: np.ndarray, bpm: float) -> list[float]:
+    """Raw timbre / texture summary of a track (MFCC mean + spread, spectral
+    contrast, onset density, tempo). The API z-scores these across the library,
+    so songs that sound alike end up close (the DJ picker's "fits together")."""
+    mel = librosa.feature.melspectrogram(S=S ** 2, sr=SR, n_mels=64)
+    db = librosa.power_to_db(mel)
+    mf = librosa.feature.mfcc(S=db, n_mfcc=20)[1:]
+    con = librosa.feature.spectral_contrast(S=S, sr=SR)
+    on = librosa.onset.onset_strength(S=db, sr=SR)
+    v = np.r_[mf.mean(1), mf.std(1), con.mean(1), np.log2(max(bpm, 40.0)), on.mean()]
+    return [round(float(x), 4) for x in v]
+
+
 def _fallback(downbeats: np.ndarray, duration: float, energy: np.ndarray, bar_len: float, why: str) -> dict:
     """Loudest 8 bars after the first 10%: better than nothing, flagged as low confidence."""
     nb = len(downbeats)
@@ -494,7 +550,16 @@ def analyze_hooks(path: str, row: dict, lyrics: list[tuple[float, str]] | None =
     r = detect_hooks(y, downbeats, duration, float(row["bpm"] or 0), energy, bass, vocal,
                      row.get("outro_end"), lyrics, weights=weights, cache=cache, pick_only=pick_only)
     if not pick_only:
-        r["bar_vocal_full"] = json.dumps([round(float(v), 2) for v in vocal])
+        # For the DJ planner: the estimate misses a lot of singing; lyric line
+        # timing, where there is some, is the better record of when someone sings.
+        full = vocal
+        if lyrics:
+            full = np.maximum(np.nan_to_num(vocal), lyric_vocal_bars(lyrics, np.r_[downbeats, duration]))
+        r["bar_vocal_full"] = json.dumps([round(float(v), 2) for v in full])
+        S = cache.get("S") if cache else None
+        r["sound_profile"] = json.dumps(sound_profile(S if S is not None else np.abs(librosa.stft(y, n_fft=2048, hop_length=HOP)),
+                                                      float(row["bpm"] or 0)))
+        r["lyric_lang"] = lyric_language(lyrics)
     return r
 
 

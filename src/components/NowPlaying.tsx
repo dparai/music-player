@@ -9,7 +9,7 @@ import {
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
-import type { TrackShape, MixMode } from "@/lib/dj";
+import type { TrackShape, MixMode, HookPlan } from "@/lib/dj";
 
 interface Props {
   song: SubsonicSong | null;
@@ -148,6 +148,9 @@ export function NowPlaying({
   const mixModeRef = useRef(mixMode);
   mixModeRef.current = mixMode;
   const cueExtendRef = useRef(0); // DJ: bars the current cue was pushed back (incoming not ready)
+  // DJ: the hand-off planned for this song pair and hook end, kept while the
+  // cue approaches (re-planning each poll would shrink the blend as time runs out).
+  const djPlanRef = useRef<{ key: string; plan: HookPlan | null } | null>(null);
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
   const [activeDeck, setActiveDeck] = useState<Deck>("A");
@@ -461,18 +464,42 @@ export function NowPlaying({
     preloadRef.current = { songId: next.id, deck, anchor, hook: !!hook };
   }
 
+  // DJ: plan the hand-off whose incoming drop lands at `mixEnd` (outgoing time).
+  // The outgoing hook keeps its first half (at most 8 bars) to itself.
+  function djPlanFor(mixEnd: number, now: number): HookPlan | null {
+    const { serverTrack: outTrack, serverNextTrack: inTrack, effectiveBpm: outBpm, effectiveNextBpm: inBpm } = liveRef.current;
+    const inHook = trustedHook(inTrack);
+    if (!inHook || !outBpm) return null;
+    const key = `${outTrack?.id}|${inTrack?.id}|${mixEnd.toFixed(2)}|${inBpm}`;
+    if (djPlanRef.current?.key === key) return djPlanRef.current.plan;
+    const bar = 240 / outBpm;
+    const outHook = trustedHook(outTrack);
+    const keep = outHook ? Math.min(8, Math.floor((outHook.out - outHook.drop) / bar / 2)) * bar + outHook.drop : 0;
+    const room = Math.floor((mixEnd - Math.max(now + SCHEDULE_LEAD + 0.5, keep)) / bar + 0.01);
+    const match = inBpm ? tempoMatch(outBpm, inBpm) : null;
+    const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, NaN, true);
+    const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, NaN, true);
+    const plan = planHookTransition(outShape, inShape, match, mixEnd, inHook.drop, room);
+    djPlanRef.current = { key, plan };
+    return plan;
+  }
+
   // Where the outgoing track should start mixing out, in its own time.
-  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean; hook: boolean } {
+  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean; hook: boolean; plan: HookPlan | null } {
     const { serverTrack: track, effectiveBpm: bpm } = liveRef.current;
     const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
     const grid = !!(detail?.downbeats?.length && bpm && track!.confidence >= MIN_CONFIDENCE);
-    // DJ: mix out where the hook ends, pushed back by whole bars while the
-    // incoming deck isn't ready.
+    // DJ: the incoming hook lands where this hook ends (pushed back by whole
+    // bars while the incoming deck isn't ready); the mix starts the plan's
+    // length before that.
     const hook = mixModeRef.current === "dj" ? trustedHook(track) : null;
     if (hook && bpm) {
       const at = djCueOut(detail?.downbeats, hook, audio.currentTime);
-      const pushed = at === null ? null : at + cueExtendRef.current * (240 / bpm);
-      if (pushed !== null && pushed < audio.duration - 2) return { at: pushed, onDownbeat: grid, hook: true };
+      const mixEnd = at === null ? null : at + cueExtendRef.current * (240 / bpm);
+      if (mixEnd !== null && mixEnd < audio.duration - 2) {
+        const plan = djPlanFor(mixEnd, audio.currentTime);
+        return { at: plan ? plan.cueOut : mixEnd, onDownbeat: grid, hook: true, plan };
+      }
     }
     // The server's mix_out_point is phrase-aligned and leaves room for a
     // mix; the transition planner decides how long the mix is from there.
@@ -483,9 +510,9 @@ export function NowPlaying({
 
     if (grid) {
       const snapped = downbeatAtOrBefore(detail!.downbeats, at);
-      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm!) return { at: snapped, onDownbeat: true, hook: false };
+      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm!) return { at: snapped, onDownbeat: true, hook: false, plan: null };
     }
-    return { at, onDownbeat: false, hook: false };
+    return { at, onDownbeat: false, hook: false, plan: null };
   }
 
   // Mean-square level of the last SILENCE_READINGS polls (~1.6 s). Three
@@ -523,7 +550,7 @@ export function NowPlaying({
         const delay = Math.max(0, (cue.at - audio.currentTime) / audio.playbackRate);
         startTimerRef.current = window.setTimeout(() => {
           startTimerRef.current = null;
-          startCrossfade(cue.at, cue.onDownbeat, cue.hook);
+          startCrossfade(cue.at, cue.onDownbeat, cue.hook, cue.plan);
         }, delay * 1000);
         return;
       }
@@ -565,7 +592,7 @@ export function NowPlaying({
 
   // `target`: the outgoing time this start was timed to (null: start now, e.g.
   // silence detected). `onDownbeat`: target is a downbeat, so beat-sync.
-  function startCrossfade(target: number | null, onDownbeat: boolean, outHook = false) {
+  function startCrossfade(target: number | null, onDownbeat: boolean, outHook = false, djPlan: HookPlan | null = null) {
     const outgoing = getActiveAudio();
     const incoming = getInactiveAudio();
     const next = nextSongRef.current;
@@ -599,16 +626,16 @@ export function NowPlaying({
     incoming.playbackRate = (match?.rate ?? 1) * outRate;
 
     // DJ: the incoming build is timed so its hook lands where the mix ends.
-    const outHookCues = outHook ? trustedHook(outTrack) : null;
     const inHook = mixModeRef.current === "dj" && preloadRef.current?.hook ? trustedHook(inTrack) : null;
     const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, outgoing.duration, !!inHook);
     const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration, !!inHook);
+    // Planned with the cue; else (a late or unsynced start) a one-bar swap from now.
     const hookPlan = inHook
-      ? planHookTransition(outShape, inShape, match, outgoing.currentTime, inHook.drop, outHookCues?.postBars ?? 8)
+      ? djPlan ?? planHookTransition(outShape, inShape, match, outgoing.currentTime + (outBpm ? 240 / outBpm : 2), inHook.drop, 0)
       : null;
     if (hookPlan && target !== null) {
       // Not buffered at the build yet: let the outgoing play on 4 more bars
-      // (its post-hook) instead of starting into a stall.
+      // (past its hook) instead of starting into a stall.
       const ready = incoming.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && isBuffered(incoming, hookPlan.inStart, 4);
       if (!ready && outHook && cueExtendRef.current < 4 * MAX_CUE_EXTENSIONS) {
         cueExtendRef.current += 4;
@@ -631,7 +658,7 @@ export function NowPlaying({
     const bar = outBpm ? 240 / outBpm : fadeLen / 8;
     const curves = buildCrossfadeCurves(CURVE_POINTS, plan.swapStart, plan.swapEnd);
     setMixLabel(hookPlan
-      ? hookPlan.style === "cut" ? "DJ CUT" : `DJ ${plan.bars} BARS`
+      ? hookPlan.style === "cut" ? "DJ SWAP" : `DJ ${plan.bars} BARS`
       : plan.bars ? `MIX ${plan.bars} BAR${plan.bars > 1 ? "S" : ""}` : "CROSSFADING");
     console.info("[brook] mix plan", plan);
 
@@ -655,8 +682,9 @@ export function NowPlaying({
         schedule(inn.hpf.frequency, fx.hpfIn);
         schedule(inn.mid.gain, fx.midIn);
         if (hookPlan.style === "cut" && outBpm) {
-          // Dub echo on the outgoing's last beat: a dotted-eighth delay that
-          // keeps ringing (damped) after the deck is gone.
+          // Swap: the outgoing washes out through a rising high-pass into a
+          // dotted-eighth dub echo that keeps ringing (damped) after the deck is gone.
+          schedule(out.hpf.frequency, fx.hpfOut);
           const beat = 60 / outBpm;
           out.echoDelay.delayTime.cancelScheduledValues(0);
           out.echoDelay.delayTime.setValueAtTime(Math.min(1.9, beat * 0.75), ctx.currentTime);

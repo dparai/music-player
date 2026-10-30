@@ -90,6 +90,19 @@ export interface ScoredSong {
   score: number;
 }
 
+// How well two songs go together in a set: sound profile similarity (0..60)
+// plus 30 for the same lyric language (instrumentals count as one language).
+export function fitScore(a: { lang?: string | null; style?: number[] }, b: { lang?: string | null; style?: number[] }): number {
+  let s = 0;
+  if (a.style?.length && b.style?.length === a.style.length) {
+    let dot = 0;
+    for (let i = 0; i < a.style.length; i++) dot += a.style[i]! * b.style[i]!;
+    s += 60 * Math.max(0, dot);
+  }
+  if (a.lang && b.lang && a.lang === b.lang) s += 30;
+  return s;
+}
+
 export function pickNextDJ(
   currentAnalysis: SongAnalysis,
   allSongs: SubsonicSong[],
@@ -140,6 +153,10 @@ export function pickNextDJ(
       if (d >= -0.05 && d <= 0.12) score += 20;
       else if (Math.abs(d) <= 0.2) score += 8;
     }
+
+    // DJ: songs that sound alike and are sung in the same language, so a set
+    // doesn't lurch from metalcore to Punjabi pop to a game theme.
+    if (dj) score += fitScore(currentAnalysis, analysis);
 
     // Small random factor to avoid always picking the same song
     score += Math.random() * 10;
@@ -418,6 +435,7 @@ export function trustedHook(t: {
 }
 
 export interface HookPlan extends TransitionPlan {
+  cueOut: number;  // outgoing time the mix starts (its drop-to-be lands at cueOut + seconds)
   inStart: number; // incoming time the mix starts from (a downbeat; its drop lands at the mix end)
 }
 
@@ -431,106 +449,125 @@ function barsBefore(shape: TrackShape | null, t: number, bars: number, barSec: n
   return Math.max(0, t - bars * barSec);
 }
 
-// DJ hand-off: the incoming build plays under the outgoing post-hook, and the
-// incoming hook lands on the bar where the outgoing is gone:
+// DJ hand-off, hook to hook. The incoming hook lands on the bar where the
+// outgoing hook ends (`mixEnd`); nothing plays past the outgoing hook, which
+// is where the next verse (more singing) would start.
 //
-//   outgoing  … HOOK |cueOut| post-hook, fading (n bars) |
-//   incoming         | build, rising (n bars)            |DROP …
+//   blend:  outgoing  … HOOK ………………… last n bars ……|
+//           incoming      | build, filtered, rising   |DROP …
 //
-// n is the longest of 8/4/2 bars that the outgoing has audio for and where
-// the two decks don't sing over each other for more than one bar. Without a
-// tempo match (or room) it is a short cut: the incoming starts a bar before
-// its drop and the outgoing fades in about one bar.
+//   swap:   outgoing  … HOOK ………… last bar: filter up + echo |
+//           incoming                  pickup, filtered, rising |DROP …
+//
+// Blend (8/4/2 bars) only where the two decks never sing at the same time
+// before the last bar; a bar without vocal data counts as singing, since a
+// clash is the worst a DJ can do and a clean swap is always fine. The blend
+// may use at most `room` bars of the outgoing hook (the hook keeps a few bars
+// to itself). Everything else, and any pair that can't be beat-matched, is a
+// one-bar swap: the outgoing washes out into a dub echo while the incoming
+// pickup rises, filtered, into its drop.
 export function planHookTransition(
   out: TrackShape | null,
   inn: TrackShape | null,
   match: TempoMatch | null,
-  cueOut: number,
+  mixEnd: number,
   inDrop: number,
-  outPostBars: number,
+  room: number,
 ): HookPlan {
   const outBpm = out?.bpm ?? null;
   const inBpm = inn?.bpm ?? null;
   const inBar = inBpm && inBpm > 0 ? 240 / inBpm : 2;
-  if (!out || !outBpm || !(outBpm > 0) || !match) {
-    const seconds = Math.max(1.5, Math.min(3, outBpm ? 240 / outBpm : 2));
+  const bar = outBpm && outBpm > 0 ? 240 / outBpm : 2;
+  const swap = (why: string): HookPlan => {
+    // Unmatched tempos: the incoming plays at its own speed; start it one of
+    // ITS bars early so its drop still lands on the outgoing's last downbeat.
+    const seconds = match ? bar : Math.max(1.5, Math.min(3, inBar));
     return {
-      seconds, bars: outBpm ? 1 : null, swapStart: 0.3, swapEnd: 0.7, style: "cut",
-      reason: !match ? "dj: tempos too far apart, cut on the drop" : "dj: no tempo, cut on the drop",
-      inStart: barsBefore(inn, inDrop, 1, inBar),
+      seconds, bars: outBpm ? 1 : null, swapStart: 0.75, swapEnd: 0.98, style: "cut",
+      reason: `dj: swap on the drop, ${why}`, cueOut: mixEnd - seconds,
+      // A half-time incoming bar is two outgoing bars: then start half a bar early.
+      inStart: match && match.factor <= 1 ? barsBefore(inn, inDrop, Math.round(1 / match.factor), inBar)
+        : Math.max(0, inDrop - seconds * (match?.rate ?? 1)),
     };
-  }
-  const bar = 240 / outBpm;
-  const end = out.outroEnd && out.outroEnd > cueOut ? out.outroEnd : out.duration;
-  const room = Math.min(Math.max(0, outPostBars), Math.floor((end - cueOut) / bar + 0.01));
+  };
+  if (!out || !outBpm || !(outBpm > 0)) return swap("no tempo");
+  if (!match) return swap("tempos too far apart");
 
+  // Singing in the bar around time t (unknown counts as singing).
   const sings = (shape: TrackShape | null, t: number) => {
     const v = shape?.barVocal;
     const d = shape?.downbeats;
-    if (!v?.length || !d?.length) return false;
+    if (!v?.length || !d?.length) return true;
     const i = barIndexAt(d, t);
-    return i >= 0 && i < v.length && (v[i] ?? 0) >= VOCAL_ON;
+    if (i < 0 || i >= v.length) return true;
+    const x = v[i];
+    return x == null || x >= VOCAL_ON;
   };
 
   const reasons: string[] = [];
   for (const n of [8, 4, 2]) {
     if (n > room) continue;
+    const cueOut = mixEnd - n * bar;
     // One outgoing bar is 1/factor incoming bars (half-time incoming: half a bar).
     const inStart = barsBefore(inn, inDrop, Math.max(1, Math.round(n / match.factor)), inBar);
     let both = 0;
-    for (let k = 0; k < n; k++) {
-      const o = sings(out, cueOut + (k + 0.5) * bar);
-      const i = sings(inn, inStart + (k + 0.5) * bar * match.rate);
-      if (o && i) both++;
+    for (let k = 0; k < n - 1; k++) {  // the last bar may carry a pickup into the hook
+      if (sings(out, cueOut + (k + 0.5) * bar) && sings(inn, inStart + (k + 0.5) * bar * match.rate)) both++;
     }
-    if (both > 1) { reasons.push(`${n} bars: vocals overlap ${both}`); continue; }
+    if (both > 0) { reasons.push(`${n} bars: both sing ${both}`); continue; }
     // Bass swap in the last bar: the incoming bass arrives with its hook.
     return {
       seconds: n * bar, bars: n, swapStart: (n - 1) / n, swapEnd: 0.98, style: "blend",
       reason: [`dj: ${n}-bar build into the drop`, ...reasons].join(", "),
-      inStart,
+      cueOut, inStart,
     };
   }
-  reasons.push(room < 2 ? `post-hook room ${room} bars` : "");
-  return {
-    seconds: bar, bars: 1, swapStart: 0.25, swapEnd: 0.75, style: "cut",
-    reason: ["dj: cut on the drop", ...reasons.filter(Boolean)].join(", "),
-    inStart: barsBefore(inn, inDrop, 1, inBar),
-  };
+  return swap(reasons.join(", ") || `room ${room} bars`);
 }
 
 export interface HookFxCurves {
   hpfIn: Float32Array;   // incoming high-pass cutoff, Hz
   midIn: Float32Array;   // incoming 1 kHz gain, dB
+  hpfOut: Float32Array;  // outgoing high-pass cutoff, Hz
   echoOut: Float32Array; // outgoing echo send, 0..1
 }
 
-// DJ effects on top of the fader/bass curves. Blend: the incoming build is
-// thinned by a high-pass that dives from 400 Hz to nothing, and its mids sit
-// 6 dB down so the outgoing vocal stays clear; both open fully on the last
-// bar, so the hook arrives full-range. Cut: no filter, but the outgoing gets
-// an echo sent from just before its fader falls.
+// DJ effects on top of the fader/bass curves.
+// Blend: the incoming build is thinned by a high-pass that dives from 400 Hz
+// to nothing and its mids sit 6 dB down, so the outgoing hook stays in front;
+// both open on the last bar, so the hook arrives full-range.
+// Swap (one bar): the outgoing washes out, a high-pass rising to 1 kHz while
+// a dub echo is fed from the third beat (its tail rings on after the fader is
+// gone); the incoming pickup rises under a high-pass falling from 1.5 kHz, and
+// opens on the drop.
 export function buildHookFxCurves(points: number, style: "blend" | "cut" | "fade", bars: number): HookFxCurves {
   const hpfIn = new Float32Array(points);
   const midIn = new Float32Array(points);
+  const hpfOut = new Float32Array(points);
   const echoOut = new Float32Array(points);
   const lastBar = bars > 1 ? (bars - 1) / bars : 0.5;
   for (let i = 0; i < points; i++) {
     const p = i / (points - 1);
+    hpfOut[i] = 10;
     if (style === "blend") {
       // Exponential sweep (even in pitch), done by the start of the last bar.
       hpfIn[i] = p < lastBar ? 400 * Math.pow(20 / 400, p / lastBar) : 10;
       midIn[i] = p < lastBar ? -6 : -6 * (1 - (p - lastBar) / (1 - lastBar));
+    } else if (style === "cut") {
+      hpfIn[i] = p < 0.97 ? 1500 * Math.pow(30 / 1500, p / 0.97) : 10;
+      midIn[i] = 0;
+      hpfOut[i] = p < 0.25 ? 10 : 20 * Math.pow(1000 / 20, (p - 0.25) / 0.75);
+      echoOut[i] = p < 0.5 ? 0 : p < 0.75 ? 0.7 * (p - 0.5) / 0.25 : 0.7;
     } else {
       hpfIn[i] = 10;
       midIn[i] = 0;
     }
-    echoOut[i] = style === "cut" ? (p < 0.15 ? 0 : p < 0.9 ? 0.6 : 0.6 * (1 - (p - 0.9) / 0.1)) : 0;
   }
   midIn[points - 1] = 0;
   hpfIn[points - 1] = 10;
+  hpfOut[points - 1] = style === "cut" ? 1000 : 10; // the outgoing is silent by now; reset on finish
   echoOut[points - 1] = 0;
-  return { hpfIn, midIn, echoOut };
+  return { hpfIn, midIn, hpfOut, echoOut };
 }
 
 // Where to mix out in DJ mode: the end of the hook, or (when that has passed,

@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 import uvicorn
 
@@ -81,7 +82,8 @@ def init_db():
                          ("hook_in", "REAL"), ("hook_drop", "REAL"), ("hook_out", "REAL"),
                          ("hook_post_bars", "INTEGER"), ("hook_kind", "TEXT"), ("hook_confidence", "REAL"),
                          ("hook_energy", "REAL"), ("hook_key", "TEXT"), ("hook_alts", "TEXT"),
-                         ("hook_lyrics", "INTEGER"), ("hook_version", "INTEGER"), ("bar_vocal_full", "TEXT")]:
+                         ("hook_lyrics", "INTEGER"), ("hook_version", "INTEGER"), ("bar_vocal_full", "TEXT"),
+                         ("sound_profile", "TEXT"), ("lyric_lang", "TEXT")]:
             if col not in have:
                 conn.execute(f"ALTER TABLE tracks ADD COLUMN {col} {typ}")
         conn.execute("CREATE INDEX IF NOT EXISTS tracks_navidrome_id ON tracks(navidrome_id)")
@@ -263,11 +265,11 @@ def _hook_one(path: str) -> None:
         c.execute("""
             UPDATE tracks SET hook_in = ?, hook_drop = ?, hook_out = ?, hook_post_bars = ?, hook_kind = ?,
                 hook_confidence = ?, hook_energy = ?, hook_key = ?, hook_alts = ?, hook_lyrics = ?,
-                hook_version = ?, bar_vocal_full = ?
+                hook_version = ?, bar_vocal_full = ?, sound_profile = ?, lyric_lang = ?
             WHERE path = ?
         """, (r["hook_in"], r["hook_drop"], r["hook_out"], r["hook_post_bars"], r["hook_kind"],
               r["hook_confidence"], r["hook_energy"], r["hook_key"], r["hook_alts"], int(bool(r["hook_lyrics"])),
-              r["hook_version"], r.get("bar_vocal_full"), path))
+              r["hook_version"], r.get("bar_vocal_full"), r.get("sound_profile"), r.get("lyric_lang"), path))
         c.commit()
         c.close()
     print(f"  hook {Path(path).name}: {r['hook_kind']} at {r['hook_drop']} "
@@ -359,10 +361,36 @@ def list_tracks():
     rows = conn.execute(
         "SELECT id, filename, bpm, confidence, mix_in_point, mix_out_point, duration,"
         " navidrome_id, key, lufs, hook_in, hook_drop, hook_out, hook_post_bars, hook_kind,"
-        " hook_confidence, hook_energy, hook_key FROM tracks ORDER BY filename"
+        " hook_confidence, hook_energy, hook_key, lyric_lang, sound_profile FROM tracks ORDER BY filename"
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    _add_style(out)
+    return out
+
+
+def _add_style(tracks: list[dict]) -> None:
+    """Replace each raw sound_profile with `style`: z-scored across the library
+    and scaled to unit length, so the app compares two songs with a dot product
+    (1 = sound alike, 0 = unrelated)."""
+    raw = {}
+    for t in tracks:
+        p = t.pop("sound_profile", None)
+        if p:
+            try:
+                raw[t["id"]] = np.asarray(json.loads(p), float)
+            except (ValueError, TypeError):
+                pass
+    sizes = {len(v) for v in raw.values()}
+    if len(raw) < 8 or len(sizes) != 1:
+        return
+    X = np.stack(list(raw.values()))
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+    X /= np.linalg.norm(X, axis=1, keepdims=True) + 1e-9
+    style = dict(zip(raw, X))
+    for t in tracks:
+        if t["id"] in style:
+            t["style"] = [round(float(x), 3) for x in style[t["id"]]]
 
 @app.get("/automix/tracks/{track_id}", dependencies=[Depends(require_user)])
 def get_track(track_id: str):
