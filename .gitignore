@@ -10,4 +10,3 @@ tsconfig.tsbuildinfo
 .claude/
 SYSTEM.md
 __pycache__/
-dj-renders/
