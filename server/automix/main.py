@@ -9,12 +9,15 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analysis_v2 import ANALYSIS_VERSION, MAX_DEMUCS_ATTEMPTS, analyze_track as analyze_v2, demucs_available  # noqa: E402
+from analysis_hooks import HOOK_VERSION, analyze_hooks, parse_lrc  # noqa: E402
 from auth import require_user  # noqa: E402
+from lyrics import get_synced_lyrics  # noqa: E402
 from navidrome_ids import navidrome_ids  # noqa: E402
 
 # --- Config ---
@@ -74,10 +77,19 @@ def init_db():
                          ("intro_end", "REAL"), ("outro_end", "REAL"), ("bar_energy", "TEXT"),
                          ("bar_bass", "TEXT"), ("bar_vocal", "TEXT"), ("analysis_version", "INTEGER"),
                          ("vocal_source", "TEXT"), ("vocal_attempts", "INTEGER"), ("vocal_error", "TEXT"),
-                         ("file_sig", "TEXT")]:
+                         ("file_sig", "TEXT"),
+                         # DJ mode hook pass (analysis_hooks.py), versioned on its own
+                         ("hook_in", "REAL"), ("hook_drop", "REAL"), ("hook_out", "REAL"),
+                         ("hook_post_bars", "INTEGER"), ("hook_kind", "TEXT"), ("hook_confidence", "REAL"),
+                         ("hook_energy", "REAL"), ("hook_key", "TEXT"), ("hook_alts", "TEXT"),
+                         ("hook_lyrics", "INTEGER"), ("hook_version", "INTEGER"), ("bar_vocal_full", "TEXT"),
+                         ("sound_profile", "TEXT"), ("lyric_lang", "TEXT")]:
             if col not in have:
                 conn.execute(f"ALTER TABLE tracks ADD COLUMN {col} {typ}")
         conn.execute("CREATE INDEX IF NOT EXISTS tracks_navidrome_id ON tracks(navidrome_id)")
+        # Synced lyrics cache, apart from tracks: a re-analysis (INSERT OR REPLACE)
+        # must not throw it away. synced = '' means "LRCLIB has none".
+        conn.execute("CREATE TABLE IF NOT EXISTS lyrics (path TEXT PRIMARY KEY, synced TEXT, fetched_at TEXT)")
         conn.commit()
         conn.close()
 
@@ -216,6 +228,72 @@ def _demucs_retry_paths() -> set[str]:
         c.close()
     return rows
 
+LYRICS_RECHECK_DAYS = 30  # LRCLIB grows: look again for songs it had no lyrics for
+
+def _lyrics_for(path: str, duration: float) -> list[tuple[float, str]]:
+    with _db_lock:
+        c = get_db()
+        row = c.execute(
+            "SELECT synced, julianday('now') - julianday(fetched_at) AS age FROM lyrics WHERE path = ?",
+            (path,)).fetchone()
+        c.close()
+    if row and (row["synced"] or (row["age"] or 0) < LYRICS_RECHECK_DAYS):
+        return parse_lrc(row["synced"])
+    text = get_synced_lyrics(path, duration)
+    if text is None:
+        return []  # network trouble: audio only for now, fetched again next scan
+    with _db_lock:
+        c = get_db()
+        c.execute("INSERT OR REPLACE INTO lyrics (path, synced, fetched_at) VALUES (?, ?, datetime('now'))",
+                  (path, text))
+        c.commit()
+        c.close()
+    return parse_lrc(text)
+
+def _hook_one(path: str) -> None:
+    with _db_lock:
+        c = get_db()
+        row = c.execute("SELECT * FROM tracks WHERE path = ?", (path,)).fetchone()
+        c.close()
+    if not row:
+        return
+    row = dict(row)
+    lines = _lyrics_for(path, float(row["duration"] or 0))
+    r = analyze_hooks(path, row, lines or None)
+    with _db_lock:
+        c = get_db()
+        c.execute("""
+            UPDATE tracks SET hook_in = ?, hook_drop = ?, hook_out = ?, hook_post_bars = ?, hook_kind = ?,
+                hook_confidence = ?, hook_energy = ?, hook_key = ?, hook_alts = ?, hook_lyrics = ?,
+                hook_version = ?, bar_vocal_full = ?, sound_profile = ?, lyric_lang = ?
+            WHERE path = ?
+        """, (r["hook_in"], r["hook_drop"], r["hook_out"], r["hook_post_bars"], r["hook_kind"],
+              r["hook_confidence"], r["hook_energy"], r["hook_key"], r["hook_alts"], int(bool(r["hook_lyrics"])),
+              r["hook_version"], r.get("bar_vocal_full"), r.get("sound_profile"), r.get("lyric_lang"), path))
+        c.commit()
+        c.close()
+    print(f"  hook {Path(path).name}: {r['hook_kind']} at {r['hook_drop']} "
+          f"(confidence {r['hook_confidence']}{', lyrics' if r['hook_lyrics'] else ''})", flush=True)
+
+def _hook_pass() -> bool:
+    """Hook cues for analysed rows without current ones. False if a rescan interrupted it."""
+    with _db_lock:
+        c = get_db()
+        paths = [r["path"] for r in c.execute(
+            "SELECT path FROM tracks WHERE analysis_version >= ? AND (hook_version IS NULL OR hook_version < ?)"
+            " ORDER BY path", (ANALYSIS_VERSION, HOOK_VERSION))]
+        c.close()
+    if paths:
+        print(f"Finding hooks for {len(paths)} tracks...", flush=True)
+    for path in paths:
+        if _rescan_requested.is_set():
+            return False
+        try:
+            _hook_one(path)
+        except Exception as e:
+            print(f"  hook FAILED {Path(path).name}: {e}", flush=True)
+    return True
+
 def _scan():
     try:
         os.nice(10)  # this thread only (Linux): keep Navidrome streaming smooth
@@ -229,6 +307,8 @@ def _scan():
     queue = sorted(on_disk - done, key=lambda p: (p in known, p in retries, p))
     if not queue:
         print("No new tracks to analyze.", flush=True)
+        if not _hook_pass():
+            _scan()  # new files arrived: analyse them first, then finish the hooks
         return
 
     print(f"Analyzing {len(queue)} tracks...", flush=True)
@@ -267,8 +347,8 @@ def _scan():
         link_navidrome_ids(conn)  # files new since the start of the scan
         conn.close()
     print("Analysis complete.", flush=True)
-    if _rescan_requested.is_set():
-        _scan()  # a request arrived during the very last track
+    if _rescan_requested.is_set() or not _hook_pass():
+        _scan()  # a request arrived during the very last track or the hook pass
 
 # --- API Endpoints ---
 @app.get("/automix/health")
@@ -280,10 +360,37 @@ def list_tracks():
     conn = get_db()
     rows = conn.execute(
         "SELECT id, filename, bpm, confidence, mix_in_point, mix_out_point, duration,"
-        " navidrome_id, key, lufs FROM tracks ORDER BY filename"
+        " navidrome_id, key, lufs, hook_in, hook_drop, hook_out, hook_post_bars, hook_kind,"
+        " hook_confidence, hook_energy, hook_key, lyric_lang, sound_profile FROM tracks ORDER BY filename"
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    _add_style(out)
+    return out
+
+
+def _add_style(tracks: list[dict]) -> None:
+    """Replace each raw sound_profile with `style`: z-scored across the library
+    and scaled to unit length, so the app compares two songs with a dot product
+    (1 = sound alike, 0 = unrelated)."""
+    raw = {}
+    for t in tracks:
+        p = t.pop("sound_profile", None)
+        if p:
+            try:
+                raw[t["id"]] = np.asarray(json.loads(p), float)
+            except (ValueError, TypeError):
+                pass
+    sizes = {len(v) for v in raw.values()}
+    if len(raw) < 8 or len(sizes) != 1:
+        return
+    X = np.stack(list(raw.values()))
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+    X /= np.linalg.norm(X, axis=1, keepdims=True) + 1e-9
+    style = dict(zip(raw, X))
+    for t in tracks:
+        if t["id"] in style:
+            t["style"] = [round(float(x), 3) for x in style[t["id"]]]
 
 @app.get("/automix/tracks/{track_id}", dependencies=[Depends(require_user)])
 def get_track(track_id: str):
@@ -293,7 +400,7 @@ def get_track(track_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Track not found")
     result = dict(row)
-    for k in ("beats", "downbeats", "bar_energy", "bar_bass", "bar_vocal"):
+    for k in ("beats", "downbeats", "bar_energy", "bar_bass", "bar_vocal", "bar_vocal_full", "hook_alts"):
         result[k] = json.loads(result[k]) if result.get(k) else []
     return result
 
