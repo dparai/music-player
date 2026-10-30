@@ -9,3 +9,4 @@ Thumbs.db
 tsconfig.tsbuildinfo
 .claude/
 SYSTEM.md
+__pycache__/

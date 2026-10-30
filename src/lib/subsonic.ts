@@ -133,6 +133,11 @@ export function coverArtUrl(creds: SubsonicCredentials, coverArtId: string, size
 export interface SongAnalysis {
   bpm: number;
   key: string;
+  // DJ mode (AutoMix hook pass): key and 0..1 energy over the hook, and
+  // whether its hook cues are trusted enough to play.
+  hookKey?: string | null;
+  hookEnergy?: number | null;
+  hookTrusted?: boolean;
 }
 
 let analysisCache: Record<string, SongAnalysis> | null = null;

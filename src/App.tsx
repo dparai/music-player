@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
 import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
-import { pickNextDJ } from "@/lib/dj";
+import { pickNextDJ, trustedHook, type MixMode } from "@/lib/dj";
 import type { AutoMixTrack } from "@/lib/automix";
 import { getAutoMixTracks, findAutoMixTrack } from "@/lib/automix";
 import {
@@ -16,7 +16,8 @@ import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
 
-const RECENT_HISTORY = 20;
+// DJ mode plays ~50 s per song: 20 would repeat songs within ~17 minutes.
+const RECENT_HISTORY = 40;
 
 function shuffleArray<T>(arr: T[]): T[] {
   const copy = [...arr];
@@ -37,7 +38,9 @@ export function App() {
   const togglePlayRef = useRef<(() => void) | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
   const [autoMixTracks, setAutoMixTracks] = useState<AutoMixTrack[]>([]);
-  const [djMode, setDjMode] = useState(false);
+  const [mixMode, setMixMode] = useState<MixMode>("off");
+  // Both Crossfade and DJ pick the next song by key/BPM and mix into it.
+  const mixing = mixMode !== "off";
   const [shuffled, setShuffled] = useState(false);
   const [currentSongId, setCurrentSongId] = useState<string | null>(null);
   const [playNextQueue, setPlayNextQueue] = useState<SubsonicSong[]>([]);
@@ -63,8 +66,10 @@ export function App() {
   const lookupSong = useCallback(
     (map: Record<string, SongAnalysis>, song: SubsonicSong): SongAnalysis | null => {
       const t = findAutoMixTrack(autoMixTracks, song);
-      if (t?.key && t.bpm > 0) return { bpm: t.bpm, key: t.key };
-      return lookupAnalysis(map, song);
+      const hook = t ? { hookKey: t.hook_key, hookEnergy: t.hook_energy, hookTrusted: !!trustedHook(t) } : {};
+      if (t?.key && t.bpm > 0) return { bpm: t.bpm, key: t.key, ...hook };
+      const a = lookupAnalysis(map, song);
+      return a ? { ...a, ...hook } : null;
     },
     [autoMixTracks],
   );
@@ -80,17 +85,21 @@ export function App() {
     const exclude = new Set(recentIdsRef.current);
     if (currentSongId) exclude.add(currentSongId);
     if (currentAnalysis) {
-      return pickNextDJ(currentAnalysis, songs, analysisData, exclude, lookupSong);
+      return pickNextDJ(currentAnalysis, songs, analysisData, exclude, lookupSong, mixMode === "dj");
     }
     // No key/BPM for this song: keep the mix going with a random track
     // instead of returning null, which used to stop DJ mode dead.
-    const available = songs.filter((s) => !exclude.has(s.id));
+    let available = songs.filter((s) => !exclude.has(s.id));
+    if (mixMode === "dj") {
+      const hooked = available.filter((s) => lookupSong(analysisData, s)?.hookTrusted);
+      if (hooked.length > 0) available = hooked;
+    }
     return available.length > 0 ? available[Math.floor(Math.random() * available.length)]! : null;
-  }, [songs, currentSongId, currentAnalysis, analysisData, lookupSong]);
+  }, [songs, currentSongId, currentAnalysis, analysisData, lookupSong, mixMode]);
 
   const getNextSong = useCallback((): SubsonicSong | null => {
     if (playNextQueue.length > 0) return playNextQueue[0]!;
-    if (djMode) {
+    if (mixing) {
       if (!djNextSong.current || djNextSong.current.id === currentSongId) {
         djNextSong.current = pickDJ();
       }
@@ -101,14 +110,15 @@ export function App() {
     }
     if (playOrder.length > 0) return playOrder[0]!;
     return null;
-  }, [playNextQueue, djMode, pickDJ, currentSongId, currentIndex, playOrder]);
+  }, [playNextQueue, mixing, pickDJ, currentSongId, currentIndex, playOrder]);
 
   const nextSong = getNextSong();
   const nextAnalysis = nextSong ? lookupSong(analysisData, nextSong) : null;
 
+  // A new song, or a switch between Crossfade and DJ (different picking), re-picks.
   useEffect(() => {
     djNextSong.current = null;
-  }, [currentSongId]);
+  }, [currentSongId, mixMode]);
 
   useEffect(() => {
     if (currentSong) {
@@ -164,7 +174,7 @@ export function App() {
     setSongs([]);
     setCurrentSongId(null);
     setPlayNextQueue([]);
-    setDjMode(false);
+    setMixMode("off");
     setShuffled(false);
   }
 
@@ -181,7 +191,7 @@ export function App() {
       return;
     }
 
-    if (djMode) {
+    if (mixing) {
       const next = djNextSong.current ?? pickDJ();
       djNextSong.current = null;
       if (next) {
@@ -195,7 +205,7 @@ export function App() {
     } else if (playOrder.length > 0) {
       setCurrentSongId(playOrder[0]!.id);
     }
-  }, [playNextQueue, djMode, currentIndex, playOrder, pickDJ]);
+  }, [playNextQueue, mixing, currentIndex, playOrder, pickDJ]);
 
   // A DJ crossfade finished on `song`; it is already playing, so just follow it.
   const handleAdvance = useCallback((song: SubsonicSong) => {
@@ -260,8 +270,8 @@ export function App() {
                 song={currentSong}
                 creds={creds}
                 analysis={currentAnalysis}
-                djMode={djMode}
-                onDjModeToggle={() => setDjMode((d) => !d)}
+                mixMode={mixMode}
+                onMixModeChange={setMixMode}
                 shuffled={shuffled}
                 onShuffleToggle={handleShuffle}
                 onNext={handleNext}
