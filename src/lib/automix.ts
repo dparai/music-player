@@ -46,6 +46,17 @@ export interface AutoMixTrack {
   navidrome_id?: string | null;
   key?: string | null;
   lufs?: number | null;
+  // DJ mode hook cues (server/automix/analysis_hooks.py); null until the hook pass ran.
+  hook_in?: number | null;
+  hook_drop?: number | null;
+  hook_out?: number | null;
+  hook_post_bars?: number | null;
+  hook_kind?: "chorus" | "drop" | "energy" | "none" | null;
+  hook_confidence?: number | null;
+  hook_energy?: number | null; // 0..1, for energy flow between songs
+  hook_key?: string | null;    // key over the hook only (final choruses modulate)
+  lyric_lang?: string | null;  // inst | desi | en | es | ru | east-asia
+  style?: number[];           // sound profile, unit length: dot product = how alike two songs sound
 }
 
 export interface AutoMixTrackDetail extends AutoMixTrack {
@@ -59,6 +70,8 @@ export interface AutoMixTrackDetail extends AutoMixTrack {
   bar_bass?: number[];
   bar_vocal?: (number | null)[];  // 0..1 singing score, null where not measured
   vocal_source?: "demucs" | "umxl" | "panns" | "repet" | "none" | null;
+  // bar_vocal with the unmeasured middle filled by a cheap estimate (hook pass).
+  bar_vocal_full?: number[];
 }
 
 let trackCache: AutoMixTrack[] | null = null;

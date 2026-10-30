@@ -4,19 +4,19 @@ import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
   tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
-  downbeatAtOrBefore, phaseError,
+  downbeatAtOrBefore, phaseError, trustedHook, planHookTransition, djCueOut, buildHookFxCurves,
 } from "@/lib/dj";
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
-import type { TrackShape } from "@/lib/dj";
+import type { TrackShape, MixMode, HookPlan } from "@/lib/dj";
 
 interface Props {
   song: SubsonicSong | null;
   creds: SubsonicCredentials;
   analysis: SongAnalysis | null;
-  djMode: boolean;
-  onDjModeToggle: () => void;
+  mixMode: MixMode;
+  onMixModeChange: (mode: MixMode) => void;
   shuffled: boolean;
   onShuffleToggle: () => void;
   onNext: () => void;
@@ -33,13 +33,21 @@ interface Props {
 type Deck = "A" | "B";
 
 // Per-deck channel strip:
-// <audio> → source → preGain (loudness trim) → analyser → lowshelf (bass) → fader → master limiter
+// <audio> → source → preGain (loudness trim) → analyser → lowshelf (bass) → mid (vocal pocket)
+//   → highpass (DJ filter dive) ┬→ fader → master limiter
+//                               └→ echo send → delay ⇄ (lowpass → feedback) → master limiter
+// The echo is tapped before the fader and returns straight to the master, so
+// its tail keeps ringing after the deck is faded out and stopped.
 interface DeckNodes {
   source: MediaElementAudioSourceNode;
   preGain: GainNode;
   analyser: AnalyserNode;
   shelf: BiquadFilterNode;
+  mid: BiquadFilterNode;
+  hpf: BiquadFilterNode;
   fader: GainNode;
+  echoSend: GainNode;
+  echoDelay: DelayNode;
 }
 
 interface BeatSync {
@@ -66,6 +74,7 @@ interface Preload {
   songId: string;
   deck: Deck;
   anchor: number | null; // first downbeat the deck is cued to, if known
+  hook: boolean;         // DJ mode: cued to the build before its hook
 }
 
 const PRELOAD_LEAD = 30;    // seconds before the cue to start buffering the next song
@@ -73,7 +82,9 @@ const SCHEDULE_LEAD = 1.5;  // seconds before the cue to arm the precise start t
 const MIN_CONFIDENCE = 0.4; // beat-grid confidence needed to beat-sync
 const MAX_INTRO_CUE = 30;   // don't skip more intro than this to reach the first downbeat
 const CURVE_POINTS = 128;
+const HPF_OPEN = 10;   // Hz: high-pass "off"
 const SILENCE_READINGS = 8; // × 200 ms polls
+const MAX_CUE_EXTENSIONS = 2; // DJ: incoming not buffered at the cue → wait 4 bars, at most this often
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds)) return "0:00";
@@ -87,6 +98,7 @@ function shapeOf(
   detail: AutoMixTrackDetail | null,
   bpm: number | null,
   duration: number,
+  fullVocals = false,
 ): TrackShape | null {
   if (!bpm && !track) return null;
   const d = detail && track && detail.id === track.id ? detail : null;
@@ -97,8 +109,18 @@ function shapeOf(
     introEnd: d?.intro_end ?? null,
     outroEnd: d?.outro_end ?? null,
     barEnergy: d?.bar_energy,
-    barVocal: d?.bar_vocal,
+    // DJ mixes mid-track, where only the hook pass's filled-in estimate exists.
+    barVocal: fullVocals && d?.bar_vocal_full?.length ? d.bar_vocal_full : d?.bar_vocal,
   };
+}
+
+// Whether `seconds` of audio from `t` are already buffered.
+function isBuffered(audio: HTMLAudioElement, t: number, seconds: number): boolean {
+  const b = audio.buffered;
+  for (let i = 0; i < b.length; i++) {
+    if (b.start(i) <= t + 0.05 && b.end(i) >= Math.min(t + seconds, audio.duration - 0.1)) return true;
+  }
+  return false;
 }
 
 function dbToGain(db: number): number {
@@ -114,13 +136,21 @@ function stopDeck(audio: HTMLAudioElement) {
 
 export function NowPlaying({
   song, creds, analysis,
-  djMode, onDjModeToggle,
+  mixMode, onMixModeChange,
   shuffled, onShuffleToggle,
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, togglePlayRef,
   autoMixTracks,
 }: Props) {
+  // DJ mixes like Crossfade until hook cues exist (docs/HOOK-MIX.md).
+  const mixing = mixMode !== "off";
+  const mixModeRef = useRef(mixMode);
+  mixModeRef.current = mixMode;
+  const cueExtendRef = useRef(0); // DJ: bars the current cue was pushed back (incoming not ready)
+  // DJ: the hand-off planned for this song pair and hook end, kept while the
+  // cue approaches (re-planning each poll would shrink the blend as time runs out).
+  const djPlanRef = useRef<{ key: string; plan: HookPlan | null } | null>(null);
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
   const [activeDeck, setActiveDeck] = useState<Deck>("A");
@@ -153,6 +183,8 @@ export function NowPlaying({
   onPrevRef.current = onPrev;
   onAdvanceRef.current = onAdvance;
   nextSongRef.current = nextSong;
+  const songIdRef = useRef(song?.id);
+  songIdRef.current = song?.id;
 
   const serverTrack = useMemo(
     () => song && autoMixTracks ? findAutoMixTrack(autoMixTracks, song) : null,
@@ -239,8 +271,27 @@ export function NowPlaying({
       const fader = ctx.createGain();
       // During a legacy fade both decks are audible and element volume does the fading.
       fader.gain.value = deck === activeDeckRef.current || fadeRef.current?.legacy ? 1 : 0;
-      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(masterRef.current!);
-      decksRef.current[deck] = { source, preGain, analyser, shelf, fader };
+      const mid = ctx.createBiquadFilter();
+      mid.type = "peaking";
+      mid.frequency.value = 1000;
+      mid.Q.value = 0.8;
+      mid.gain.value = 0;
+      const hpf = ctx.createBiquadFilter();
+      hpf.type = "highpass";
+      hpf.frequency.value = HPF_OPEN;
+      hpf.Q.value = 0.7;
+      const echoSend = ctx.createGain();
+      echoSend.gain.value = 0;
+      const echoDelay = ctx.createDelay(2);
+      const echoTone = ctx.createBiquadFilter(); // each repeat duller: a dub echo, not a metallic one
+      echoTone.type = "lowpass";
+      echoTone.frequency.value = 2500;
+      const echoFeedback = ctx.createGain();
+      echoFeedback.gain.value = 0.45;
+      source.connect(preGain).connect(analyser).connect(shelf).connect(mid).connect(hpf).connect(fader).connect(masterRef.current!);
+      hpf.connect(echoSend).connect(echoDelay).connect(masterRef.current!);
+      echoDelay.connect(echoTone).connect(echoFeedback).connect(echoDelay);
+      decksRef.current[deck] = { source, preGain, analyser, shelf, mid, hpf, fader, echoSend, echoDelay };
     }
     return true;
   }
@@ -284,6 +335,9 @@ export function NowPlaying({
     if (!nodes) return;
     setParam(nodes.fader.gain, fader);
     setParam(nodes.shelf.gain, 0);
+    setParam(nodes.mid.gain, 0);
+    setParam(nodes.hpf.frequency, HPF_OPEN);
+    setParam(nodes.echoSend.gain, 0); // the echo tail already in the delay rings out
   }
 
   function clearTimers() {
@@ -369,6 +423,15 @@ export function NowPlaying({
     audio.preservesPitch = true;
     audio.playbackRate = 1;
     setStreamSrc(audio, song.id);
+    cueExtendRef.current = 0;
+    // DJ mode keeps the hook flow: a song picked by hand starts at its build.
+    const hook = mixModeRef.current === "dj" ? trustedHook(serverTrack) : null;
+    if (hook) {
+      const id = song.id;
+      const seek = () => { if (lastSongIdRef.current === id && audio.currentTime < hook.in) audio.currentTime = hook.in; };
+      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) seek();
+      else audio.addEventListener("loadedmetadata", seek, { once: true });
+    }
     audio.play().then(() => setPlaying(true)).catch(() => {});
     updateMediaSession(song);
   }, [song, creds, getActiveAudio]);
@@ -382,7 +445,11 @@ export function NowPlaying({
     const { serverNextTrack: track } = liveRef.current;
     const detail = track && nextDetailRef.current?.id === track.id ? nextDetailRef.current : null;
     const first = detail?.downbeats?.[0] ?? null;
-    const anchor = first !== null && first <= MAX_INTRO_CUE ? first : null;
+    const hook = mixModeRef.current === "dj" ? trustedHook(track) : null;
+    // DJ: cue two bars before the build (a swap starts one bar before it); the
+    // mix may start later, a short seek inside what is already buffered.
+    const nextBar = liveRef.current.effectiveNextBpm ? 240 / liveRef.current.effectiveNextBpm : 2;
+    const anchor = hook ? Math.max(0, hook.in - 2 * nextBar) : first !== null && first <= MAX_INTRO_CUE ? first : null;
 
     audio.pause();
     audio.preload = "auto";
@@ -395,12 +462,46 @@ export function NowPlaying({
       if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) cue();
       else audio.addEventListener("loadedmetadata", cue, { once: true });
     }
-    preloadRef.current = { songId: next.id, deck, anchor };
+    preloadRef.current = { songId: next.id, deck, anchor, hook: !!hook };
+  }
+
+  // DJ: plan the hand-off whose incoming drop lands at `mixEnd` (outgoing time).
+  // The outgoing hook keeps its first half (at most 8 bars) to itself.
+  function djPlanFor(mixEnd: number, now: number): HookPlan | null {
+    const { serverTrack: outTrack, serverNextTrack: inTrack, effectiveBpm: outBpm, effectiveNextBpm: inBpm } = liveRef.current;
+    const inHook = trustedHook(inTrack);
+    if (!inHook || !outBpm) return null;
+    const key = `${outTrack?.id}|${inTrack?.id}|${mixEnd.toFixed(2)}|${inBpm}`;
+    if (djPlanRef.current?.key === key) return djPlanRef.current.plan;
+    const bar = 240 / outBpm;
+    const outHook = trustedHook(outTrack);
+    const keep = outHook ? Math.min(8, Math.floor((outHook.out - outHook.drop) / bar / 2)) * bar + outHook.drop : 0;
+    const room = Math.floor((mixEnd - Math.max(now + SCHEDULE_LEAD + 0.5, keep)) / bar + 0.01);
+    const match = inBpm ? tempoMatch(outBpm, inBpm) : null;
+    const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, NaN, true);
+    const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, NaN, true);
+    const plan = planHookTransition(outShape, inShape, match, mixEnd, inHook.drop, room, inHook.in);
+    djPlanRef.current = { key, plan };
+    return plan;
   }
 
   // Where the outgoing track should start mixing out, in its own time.
-  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean } {
+  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean; hook: boolean; plan: HookPlan | null } {
     const { serverTrack: track, effectiveBpm: bpm } = liveRef.current;
+    const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
+    const grid = !!(detail?.downbeats?.length && bpm && track!.confidence >= MIN_CONFIDENCE);
+    // DJ: the incoming hook lands where this hook ends (pushed back by whole
+    // bars while the incoming deck isn't ready); the mix starts the plan's
+    // length before that.
+    const hook = mixModeRef.current === "dj" ? trustedHook(track) : null;
+    if (hook && bpm) {
+      const at = djCueOut(detail?.downbeats, hook, audio.currentTime);
+      const mixEnd = at === null ? null : at + cueExtendRef.current * (240 / bpm);
+      if (mixEnd !== null && mixEnd < audio.duration - 2) {
+        const plan = djPlanFor(mixEnd, audio.currentTime);
+        return { at: plan ? plan.cueOut : mixEnd, onDownbeat: grid, hook: true, plan };
+      }
+    }
     // The server's mix_out_point is phrase-aligned and leaves room for a
     // mix; the transition planner decides how long the mix is from there.
     const fadeLen = fadeDurationFor(bpm);
@@ -408,12 +509,11 @@ export function NowPlaying({
     at = Math.min(at, audio.duration - (bpm ? 240 / bpm : 2));
     at = Math.max(at, audio.duration / 2);
 
-    const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
-    if (detail?.downbeats?.length && bpm && track!.confidence >= MIN_CONFIDENCE) {
-      const snapped = downbeatAtOrBefore(detail.downbeats, at);
-      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm) return { at: snapped, onDownbeat: true };
+    if (grid) {
+      const snapped = downbeatAtOrBefore(detail!.downbeats, at);
+      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm!) return { at: snapped, onDownbeat: true, hook: false, plan: null };
     }
-    return { at, onDownbeat: false };
+    return { at, onDownbeat: false, hook: false, plan: null };
   }
 
   // Mean-square level of the last SILENCE_READINGS polls (~1.6 s). Three
@@ -422,18 +522,26 @@ export function NowPlaying({
   const silenceLevelsRef = useRef<number[]>([]);
 
   useEffect(() => {
-    if (!djMode) return;
+    if (!mixing) return;
 
     const check = () => {
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
       const next = nextSongRef.current;
       if (crossfadeStartedRef.current || !next) return;
+      // Just after a mix, until React catches up, props still describe the
+      // previous song (its cues, and the song now playing as "next").
+      if (songIdRef.current !== lastSongIdRef.current || next.id === lastSongIdRef.current) return;
 
       const cue = cueOutFor(audio);
       const remaining = audio.duration - audio.currentTime;
 
-      if (audio.currentTime >= cue.at - PRELOAD_LEAD && preloadRef.current?.songId !== next.id) {
+      // DJ songs last ~50 s: buffer the next one as soon as this one is on.
+      const lead = mixModeRef.current === "dj" ? Infinity : PRELOAD_LEAD;
+      // Re-buffer when the cue point changed with the mode (Crossfade <-> DJ).
+      const wantHook = mixModeRef.current === "dj" && !!trustedHook(liveRef.current.serverNextTrack);
+      const stale = preloadRef.current?.songId !== next.id || preloadRef.current.hook !== wantHook;
+      if (audio.currentTime >= cue.at - lead && stale) {
         preload(next);
       }
 
@@ -443,7 +551,7 @@ export function NowPlaying({
         const delay = Math.max(0, (cue.at - audio.currentTime) / audio.playbackRate);
         startTimerRef.current = window.setTimeout(() => {
           startTimerRef.current = null;
-          startCrossfade(cue.at, cue.onDownbeat);
+          startCrossfade(cue.at, cue.onDownbeat, cue.hook, cue.plan);
         }, delay * 1000);
         return;
       }
@@ -481,11 +589,11 @@ export function NowPlaying({
         crossfadeStartedRef.current = false;
       }
     };
-  }, [djMode, getActiveAudio]);
+  }, [mixing, getActiveAudio]);
 
   // `target`: the outgoing time this start was timed to (null: start now, e.g.
   // silence detected). `onDownbeat`: target is a downbeat, so beat-sync.
-  function startCrossfade(target: number | null, onDownbeat: boolean) {
+  function startCrossfade(target: number | null, onDownbeat: boolean, outHook = false, djPlan: HookPlan | null = null) {
     const outgoing = getActiveAudio();
     const incoming = getInactiveAudio();
     const next = nextSongRef.current;
@@ -518,22 +626,41 @@ export function NowPlaying({
     incoming.preservesPitch = true;
     incoming.playbackRate = (match?.rate ?? 1) * outRate;
 
-    const inAnchor = preloadRef.current?.anchor ?? null;
+    // DJ: the incoming build is timed so its hook lands where the mix ends.
+    const inHook = mixModeRef.current === "dj" && preloadRef.current?.hook ? trustedHook(inTrack) : null;
+    const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, outgoing.duration, !!inHook);
+    const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration, !!inHook);
+    // Planned with the cue; else (a late or unsynced start) a one-bar swap from now.
+    const hookPlan = inHook
+      ? djPlan ?? planHookTransition(outShape, inShape, match, outgoing.currentTime + (outBpm ? 240 / outBpm : 2), inHook.drop, 0, inHook.in)
+      : null;
+    if (hookPlan && target !== null) {
+      // Not buffered at the build yet: let the outgoing play on 4 more bars
+      // (past its hook) instead of starting into a stall.
+      const ready = incoming.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && isBuffered(incoming, hookPlan.inStart, 4);
+      if (!ready && outHook && cueExtendRef.current < 4 * MAX_CUE_EXTENSIONS) {
+        cueExtendRef.current += 4;
+        crossfadeStartedRef.current = false;
+        console.info("[brook] dj: next song not buffered, mixing 4 bars later");
+        return;
+      }
+    }
+    if (hookPlan && Math.abs(incoming.currentTime - hookPlan.inStart) > 0.03) incoming.currentTime = hookPlan.inStart;
+
+    const inAnchor = hookPlan ? hookPlan.inStart : preloadRef.current?.anchor ?? null;
     const sync: BeatSync | null =
       anchor !== null && inAnchor !== null && match && outBpm && inBpm &&
       (outTrack?.confidence ?? 0) >= MIN_CONFIDENCE && (inTrack?.confidence ?? 0) >= MIN_CONFIDENCE
         ? { outAnchor: anchor, inAnchor, outBeat: 60 / outBpm, inBeat: 60 / (inBpm * match.factor), outRate }
         : null;
 
-    const plan = planTransition(
-      shapeOf(outTrack, currentDetailRef.current, outBpm, outgoing.duration),
-      shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration),
-      match, outgoing.currentTime, inAnchor ?? 0,
-    );
+    const plan = hookPlan ?? planTransition(outShape, inShape, match, outgoing.currentTime, inAnchor ?? 0);
     const fadeLen = plan.seconds;
     const bar = outBpm ? 240 / outBpm : fadeLen / 8;
     const curves = buildCrossfadeCurves(CURVE_POINTS, plan.swapStart, plan.swapEnd);
-    setMixLabel(plan.bars ? `MIX ${plan.bars} BAR${plan.bars > 1 ? "S" : ""}` : "CROSSFADING");
+    setMixLabel(hookPlan
+      ? hookPlan.style === "cut" ? "DJ SWAP" : `DJ ${plan.bars} BARS`
+      : plan.bars ? `MIX ${plan.bars} BAR${plan.bars > 1 ? "S" : ""}` : "CROSSFADING");
     console.info("[brook] mix plan", plan);
 
     let end = 0;
@@ -551,6 +678,20 @@ export function NowPlaying({
       schedule(inn.fader.gain, curves.gainIn);
       schedule(out.shelf.gain, curves.shelfOut);
       schedule(inn.shelf.gain, curves.shelfIn);
+      if (hookPlan) {
+        const fx = buildHookFxCurves(CURVE_POINTS, hookPlan.style, hookPlan.bars ?? 1);
+        schedule(inn.hpf.frequency, fx.hpfIn);
+        schedule(inn.mid.gain, fx.midIn);
+        if (hookPlan.style === "cut" && outBpm) {
+          // Swap: the outgoing washes out through a rising high-pass into a
+          // dotted-eighth dub echo that keeps ringing (damped) after the deck is gone.
+          schedule(out.hpf.frequency, fx.hpfOut);
+          const beat = 60 / outBpm;
+          out.echoDelay.delayTime.cancelScheduledValues(0);
+          out.echoDelay.delayTime.setValueAtTime(Math.min(1.9, beat * 0.75), ctx.currentTime);
+          schedule(out.echoSend.gain, fx.echoOut);
+        }
+      }
       end = t0 + fadeLen;
     } else {
       incoming.volume = 0;
@@ -619,6 +760,7 @@ export function NowPlaying({
     fadeRef.current = null;
     preloadRef.current = null;
     crossfadeStartedRef.current = false;
+    cueExtendRef.current = 0;
     lastSongIdRef.current = fade.song.id;
 
     if (inc) {
@@ -839,8 +981,16 @@ export function NowPlaying({
 
         <div className={styles.extras}>
           <button
-            className={`${styles.djToggle} ${djMode ? styles.djActive : ""}`}
-            onClick={onDjModeToggle}
+            className={`${styles.djToggle} ${mixMode === "crossfade" ? styles.djActive : ""}`}
+            onClick={() => onMixModeChange(mixMode === "crossfade" ? "off" : "crossfade")}
+            aria-pressed={mixMode === "crossfade"}
+          >
+            Crossfade
+          </button>
+          <button
+            className={`${styles.djToggle} ${mixMode === "dj" ? styles.djActive : ""}`}
+            onClick={() => onMixModeChange(mixMode === "dj" ? "off" : "dj")}
+            aria-pressed={mixMode === "dj"}
           >
             DJ
           </button>
