@@ -67,7 +67,8 @@ def load_tracks(args) -> list[dict]:
             lyr[p] = text
             lyr_file.write_text(json.dumps(lyr))
             time.sleep(1.0)  # be polite to the free API
-        row["truth"] = ah.lyric_choruses(ah.parse_lrc(lyr[p]))
+        row["spans"] = ah.lyric_chorus_spans(ah.parse_lrc(lyr[p]))
+        row["truth"] = [a for a, _ in row["spans"]]
         out.append(row)
     return out
 
@@ -82,11 +83,16 @@ def audio(row: dict, cache_dir: str) -> np.ndarray:
 
 
 def is_hit(row: dict, drop: float | None) -> tuple[bool, float]:
+    """Hit: the hook starts inside a lyric chorus region (2 bars before the
+    repeated block up to 4 bars before its end). The block is usually
+    pre-chorus + chorus, so the chorus proper starts inside it. Also returns
+    the distance to the nearest block start, in bars."""
     bar = 240.0 / float(row["bpm"] or 120)
     if drop is None:
         return False, 99.0
     err = min(abs(drop - t) for t in row["truth"])
-    return err <= 2 * bar + 0.5, err / bar
+    inside = any(a - 2 * bar - 0.5 <= drop <= max(a, b - 4 * bar) for a, b in row["spans"])
+    return inside, err / bar
 
 
 def report(args, rows: list[dict]) -> None:
@@ -113,7 +119,9 @@ def report(args, rows: list[dict]) -> None:
               f"c={r['hook_confidence']:.2f} truth {rec['truth']} err {rec.get('err_bars', '-')}", flush=True)
     print(f"\n{len(rows)} tracks, {n_truth} with lyric choruses, hook pass {t_total / max(len(rows), 1):.1f} s/track")
     if n_truth:
-        print(f"hit rate (±2 bars): {hits}/{n_truth} = {hits / n_truth:.0%}")
+        print(f"hit rate (inside a lyric chorus region): {hits}/{n_truth} = {hits / n_truth:.0%}")
+        near = sum(1 for o in out if o.get("err_bars", 99) <= 2)
+        print(f"at a lyric block start (±2 bars): {near}/{n_truth}")
         for k, v in by_kind.items():
             print(f"  {k}: {sum(v)}/{len(v)}")
         for lo in (0.0, 0.45, 0.6, 0.75):
