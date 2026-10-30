@@ -1,3 +1,5 @@
+> **Removed (2026-10-30).** The DJ (hook mix) mode was taken out of the app after hands-on testing: the result did not sound good enough, so the app has a single **Crossfade** mode again. This document and the server-side hook analysis (`analysis_hooks.py`, `lyrics.py`, `hooks_eval.py`, `render_dj.py`) are kept for reference only; nothing in the app reads them any more. The beat-grid findings in §5b still apply to Crossfade.
+
 # DJ Mode (Hook Mix)
 
 > Goal: in **DJ** mode, play the part of each song people know (the chorus, or the drop) and hand off to the next song's build-up so its hook lands exactly when the previous one ends, the way an open-format club DJ quick-mixes.
