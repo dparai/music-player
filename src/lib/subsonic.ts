@@ -138,6 +138,8 @@ export interface SongAnalysis {
   hookKey?: string | null;
   hookEnergy?: number | null;
   hookTrusted?: boolean;
+  lang?: string | null;
+  style?: number[];
 }
 
 let analysisCache: Record<string, SongAnalysis> | null = null;

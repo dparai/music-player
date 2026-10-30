@@ -55,6 +55,8 @@ export interface AutoMixTrack {
   hook_confidence?: number | null;
   hook_energy?: number | null; // 0..1, for energy flow between songs
   hook_key?: string | null;    // key over the hook only (final choruses modulate)
+  lyric_lang?: string | null;  // inst | desi | en | es | ru | east-asia
+  style?: number[];           // sound profile, unit length: dot product = how alike two songs sound
 }
 
 export interface AutoMixTrackDetail extends AutoMixTrack {

@@ -66,7 +66,7 @@ export function App() {
   const lookupSong = useCallback(
     (map: Record<string, SongAnalysis>, song: SubsonicSong): SongAnalysis | null => {
       const t = findAutoMixTrack(autoMixTracks, song);
-      const hook = t ? { hookKey: t.hook_key, hookEnergy: t.hook_energy, hookTrusted: !!trustedHook(t) } : {};
+      const hook = t ? { hookKey: t.hook_key, hookEnergy: t.hook_energy, hookTrusted: !!trustedHook(t), lang: t.lyric_lang, style: t.style } : {};
       if (t?.key && t.bpm > 0) return { bpm: t.bpm, key: t.key, ...hook };
       const a = lookupAnalysis(map, song);
       return a ? { ...a, ...hook } : null;
