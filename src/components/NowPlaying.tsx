@@ -4,19 +4,19 @@ import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
   tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
-  downbeatAtOrBefore, phaseError, trustedHook, planHookTransition, djCueOut, buildHookFxCurves,
+  downbeatAtOrBefore, phaseError,
 } from "@/lib/dj";
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
-import type { TrackShape, MixMode, HookPlan } from "@/lib/dj";
+import type { TrackShape } from "@/lib/dj";
 
 interface Props {
   song: SubsonicSong | null;
   creds: SubsonicCredentials;
   analysis: SongAnalysis | null;
-  mixMode: MixMode;
-  onMixModeChange: (mode: MixMode) => void;
+  djMode: boolean;
+  onDjModeToggle: () => void;
   shuffled: boolean;
   onShuffleToggle: () => void;
   onNext: () => void;
@@ -33,21 +33,13 @@ interface Props {
 type Deck = "A" | "B";
 
 // Per-deck channel strip:
-// <audio> → source → preGain (loudness trim) → analyser → lowshelf (bass) → mid (vocal pocket)
-//   → highpass (DJ filter dive) ┬→ fader → master limiter
-//                               └→ echo send → delay ⇄ (lowpass → feedback) → master limiter
-// The echo is tapped before the fader and returns straight to the master, so
-// its tail keeps ringing after the deck is faded out and stopped.
+// <audio> → source → preGain (loudness trim) → analyser → lowshelf (bass) → fader → master limiter
 interface DeckNodes {
   source: MediaElementAudioSourceNode;
   preGain: GainNode;
   analyser: AnalyserNode;
   shelf: BiquadFilterNode;
-  mid: BiquadFilterNode;
-  hpf: BiquadFilterNode;
   fader: GainNode;
-  echoSend: GainNode;
-  echoDelay: DelayNode;
 }
 
 interface BeatSync {
@@ -74,7 +66,6 @@ interface Preload {
   songId: string;
   deck: Deck;
   anchor: number | null; // first downbeat the deck is cued to, if known
-  hook: boolean;         // DJ mode: cued to the build before its hook
 }
 
 const PRELOAD_LEAD = 30;    // seconds before the cue to start buffering the next song
@@ -82,9 +73,15 @@ const SCHEDULE_LEAD = 1.5;  // seconds before the cue to arm the precise start t
 const MIN_CONFIDENCE = 0.4; // beat-grid confidence needed to beat-sync
 const MAX_INTRO_CUE = 30;   // don't skip more intro than this to reach the first downbeat
 const CURVE_POINTS = 128;
-const HPF_OPEN = 10;   // Hz: high-pass "off"
+// Short fades for the moments that are not mixes (what Poweramp does for
+// play/pause, seek and a manual skip): a hard start, stop or jump of a playing
+// stream clicks, and skipping mid-phrase cuts the old song dead.
+const FADE_PAUSE_S = 0.15;     // pause out / play in
+const FADE_SEEK_OUT_S = 0.04;  // seek: mute, jump, then...
+const FADE_SEEK_IN_S = 0.06;   // ...fade back in (about 100 ms in all)
+const FADE_SKIP_OUT_S = 0.15;  // manual skip: old song out
+const FADE_SKIP_IN_S = 0.25;   // ...new song in
 const SILENCE_READINGS = 8; // × 200 ms polls
-const MAX_CUE_EXTENSIONS = 2; // DJ: incoming not buffered at the cue → wait 4 bars, at most this often
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds)) return "0:00";
@@ -98,7 +95,6 @@ function shapeOf(
   detail: AutoMixTrackDetail | null,
   bpm: number | null,
   duration: number,
-  fullVocals = false,
 ): TrackShape | null {
   if (!bpm && !track) return null;
   const d = detail && track && detail.id === track.id ? detail : null;
@@ -109,18 +105,8 @@ function shapeOf(
     introEnd: d?.intro_end ?? null,
     outroEnd: d?.outro_end ?? null,
     barEnergy: d?.bar_energy,
-    // DJ mixes mid-track, where only the hook pass's filled-in estimate exists.
-    barVocal: fullVocals && d?.bar_vocal_full?.length ? d.bar_vocal_full : d?.bar_vocal,
+    barVocal: d?.bar_vocal,
   };
-}
-
-// Whether `seconds` of audio from `t` are already buffered.
-function isBuffered(audio: HTMLAudioElement, t: number, seconds: number): boolean {
-  const b = audio.buffered;
-  for (let i = 0; i < b.length; i++) {
-    if (b.start(i) <= t + 0.05 && b.end(i) >= Math.min(t + seconds, audio.duration - 0.1)) return true;
-  }
-  return false;
 }
 
 function dbToGain(db: number): number {
@@ -136,21 +122,13 @@ function stopDeck(audio: HTMLAudioElement) {
 
 export function NowPlaying({
   song, creds, analysis,
-  mixMode, onMixModeChange,
+  djMode, onDjModeToggle,
   shuffled, onShuffleToggle,
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, togglePlayRef,
   autoMixTracks,
 }: Props) {
-  // DJ mixes like Crossfade until hook cues exist (docs/HOOK-MIX.md).
-  const mixing = mixMode !== "off";
-  const mixModeRef = useRef(mixMode);
-  mixModeRef.current = mixMode;
-  const cueExtendRef = useRef(0); // DJ: bars the current cue was pushed back (incoming not ready)
-  // DJ: the hand-off planned for this song pair and hook end, kept while the
-  // cue approaches (re-planning each poll would shrink the blend as time runs out).
-  const djPlanRef = useRef<{ key: string; plan: HookPlan | null } | null>(null);
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
   const [activeDeck, setActiveDeck] = useState<Deck>("A");
@@ -171,6 +149,9 @@ export function NowPlaying({
   const fadeTimerRef = useRef<number | null>(null);
   const startTimerRef = useRef<number | null>(null);
   const rampTimerRef = useRef<number | null>(null);
+  const pauseTimerRef = useRef<number | null>(null);  // a fade-out before pause() is under way
+  const seekRef = useRef<{ timer: number; target: number; deck: Deck } | null>(null);
+  const skipTimerRef = useRef<number | null>(null);   // a fade-out before a manual skip loads
   const preloadRef = useRef<Preload | null>(null);
   const crossfadeStartedRef = useRef(false);
   const currentDetailRef = useRef<AutoMixTrackDetail | null>(null);
@@ -183,8 +164,6 @@ export function NowPlaying({
   onPrevRef.current = onPrev;
   onAdvanceRef.current = onAdvance;
   nextSongRef.current = nextSong;
-  const songIdRef = useRef(song?.id);
-  songIdRef.current = song?.id;
 
   const serverTrack = useMemo(
     () => song && autoMixTracks ? findAutoMixTrack(autoMixTracks, song) : null,
@@ -271,27 +250,8 @@ export function NowPlaying({
       const fader = ctx.createGain();
       // During a legacy fade both decks are audible and element volume does the fading.
       fader.gain.value = deck === activeDeckRef.current || fadeRef.current?.legacy ? 1 : 0;
-      const mid = ctx.createBiquadFilter();
-      mid.type = "peaking";
-      mid.frequency.value = 1000;
-      mid.Q.value = 0.8;
-      mid.gain.value = 0;
-      const hpf = ctx.createBiquadFilter();
-      hpf.type = "highpass";
-      hpf.frequency.value = HPF_OPEN;
-      hpf.Q.value = 0.7;
-      const echoSend = ctx.createGain();
-      echoSend.gain.value = 0;
-      const echoDelay = ctx.createDelay(2);
-      const echoTone = ctx.createBiquadFilter(); // each repeat duller: a dub echo, not a metallic one
-      echoTone.type = "lowpass";
-      echoTone.frequency.value = 2500;
-      const echoFeedback = ctx.createGain();
-      echoFeedback.gain.value = 0.45;
-      source.connect(preGain).connect(analyser).connect(shelf).connect(mid).connect(hpf).connect(fader).connect(masterRef.current!);
-      hpf.connect(echoSend).connect(echoDelay).connect(masterRef.current!);
-      echoDelay.connect(echoTone).connect(echoFeedback).connect(echoDelay);
-      decksRef.current[deck] = { source, preGain, analyser, shelf, mid, hpf, fader, echoSend, echoDelay };
+      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(masterRef.current!);
+      decksRef.current[deck] = { source, preGain, analyser, shelf, fader };
     }
     return true;
   }
@@ -311,6 +271,46 @@ export function NowPlaying({
     const ctx = audioCtxRef.current;
     // iOS uses "interrupted" (calls, Siri) as well as "suspended".
     if (ctx && ctx.state !== "running" && ctx.state !== "closed") ctx.resume().catch(() => {});
+  }
+
+  // Whether the Web Audio graph can carry a fade right now (it can't while the
+  // context is suspended, e.g. before the first tap on some browsers).
+  function fadeable(): boolean {
+    const ctx = audioCtxRef.current;
+    return !!ctx && ctx.state === "running" && !!decksRef.current[activeDeckRef.current];
+  }
+
+  // Ramp the active deck's fader to `to` from wherever it is. False: no fade
+  // possible, nothing was changed. Never call during a mix (it owns the faders).
+  function rampActiveFader(to: number, seconds: number): boolean {
+    if (!fadeable()) return false;
+    const ctx = audioCtxRef.current!;
+    const g = decksRef.current[activeDeckRef.current]!.fader.gain;
+    const now = ctx.currentTime;
+    const from = g.value;
+    g.cancelScheduledValues(0);
+    g.setValueAtTime(from, now);
+    g.linearRampToValueAtTime(to, now + seconds);
+    return true;
+  }
+
+  // Fade the active deck back to full level; if fades are unavailable, just
+  // make sure it isn't left silent.
+  function rampUp(seconds: number) {
+    if (!rampActiveFader(1, seconds)) resetStrip(activeDeckRef.current, 1);
+  }
+
+  // Apply a seek that was waiting for its mute, and drop pending fade-outs.
+  function cancelPendingFades() {
+    if (pauseTimerRef.current) { clearTimeout(pauseTimerRef.current); pauseTimerRef.current = null; }
+    if (skipTimerRef.current) { clearTimeout(skipTimerRef.current); skipTimerRef.current = null; }
+    const seek = seekRef.current;
+    if (seek) {
+      clearTimeout(seek.timer);
+      seekRef.current = null;
+      const audio = audioFor(seek.deck);
+      if (audio) audio.currentTime = seek.target;
+    }
   }
 
   // Drop any automation (including a curve already in progress) and hold `value`.
@@ -335,9 +335,6 @@ export function NowPlaying({
     if (!nodes) return;
     setParam(nodes.fader.gain, fader);
     setParam(nodes.shelf.gain, 0);
-    setParam(nodes.mid.gain, 0);
-    setParam(nodes.hpf.frequency, HPF_OPEN);
-    setParam(nodes.echoSend.gain, 0); // the echo tail already in the delay rings out
   }
 
   function clearTimers() {
@@ -413,27 +410,36 @@ export function NowPlaying({
       return;
     }
 
-    cancelCrossfade();
-    const audio = getActiveAudio();
-    if (!audio) return;
+    cancelPendingFades();
+    const load = (fadeIn: boolean) => {
+      if (lastSongIdRef.current !== song.id) return; // a newer pick took over while we faded out
+      cancelCrossfade();
+      const audio = getActiveAudio();
+      if (!audio) return;
 
-    ensureAudioGraph();
-    resumeCtx();
-    setTrim(activeDeckRef.current, song, serverTrack);
-    audio.preservesPitch = true;
-    audio.playbackRate = 1;
-    setStreamSrc(audio, song.id);
-    cueExtendRef.current = 0;
-    // DJ mode keeps the hook flow: a song picked by hand starts at its build.
-    const hook = mixModeRef.current === "dj" ? trustedHook(serverTrack) : null;
-    if (hook) {
-      const id = song.id;
-      const seek = () => { if (lastSongIdRef.current === id && audio.currentTime < hook.in) audio.currentTime = hook.in; };
-      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) seek();
-      else audio.addEventListener("loadedmetadata", seek, { once: true });
+      ensureAudioGraph();
+      resumeCtx();
+      setTrim(activeDeckRef.current, song, serverTrack);
+      audio.preservesPitch = true;
+      audio.playbackRate = 1;
+      // Start silent and fade in once audio is flowing (only when the fade can run).
+      if (fadeIn && fadeable()) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
+      setStreamSrc(audio, song.id);
+      audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
+        .catch(() => { if (fadeIn) resetStrip(activeDeckRef.current, 1); });
+      updateMediaSession(song);
+    };
+
+    // A manual skip while a song is playing (not mid-mix): fade it out first
+    // instead of cutting it dead.
+    const playing = getActiveAudio();
+    if (playing && !playing.paused && !fadeRef.current && rampActiveFader(0, FADE_SKIP_OUT_S)) {
+      clearTimers();
+      crossfadeStartedRef.current = true; // no mix may start while we fade out
+      skipTimerRef.current = window.setTimeout(() => { skipTimerRef.current = null; load(true); }, FADE_SKIP_OUT_S * 1000 + 20);
+      return;
     }
-    audio.play().then(() => setPlaying(true)).catch(() => {});
-    updateMediaSession(song);
+    load(false);
   }, [song, creds, getActiveAudio]);
 
   // Buffer the next song on the idle deck, cued to its first downbeat.
@@ -445,11 +451,7 @@ export function NowPlaying({
     const { serverNextTrack: track } = liveRef.current;
     const detail = track && nextDetailRef.current?.id === track.id ? nextDetailRef.current : null;
     const first = detail?.downbeats?.[0] ?? null;
-    const hook = mixModeRef.current === "dj" ? trustedHook(track) : null;
-    // DJ: cue two bars before the build (a swap starts one bar before it); the
-    // mix may start later, a short seek inside what is already buffered.
-    const nextBar = liveRef.current.effectiveNextBpm ? 240 / liveRef.current.effectiveNextBpm : 2;
-    const anchor = hook ? Math.max(0, hook.in - 2 * nextBar) : first !== null && first <= MAX_INTRO_CUE ? first : null;
+    const anchor = first !== null && first <= MAX_INTRO_CUE ? first : null;
 
     audio.pause();
     audio.preload = "auto";
@@ -462,46 +464,12 @@ export function NowPlaying({
       if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) cue();
       else audio.addEventListener("loadedmetadata", cue, { once: true });
     }
-    preloadRef.current = { songId: next.id, deck, anchor, hook: !!hook };
-  }
-
-  // DJ: plan the hand-off whose incoming drop lands at `mixEnd` (outgoing time).
-  // The outgoing hook keeps its first half (at most 8 bars) to itself.
-  function djPlanFor(mixEnd: number, now: number): HookPlan | null {
-    const { serverTrack: outTrack, serverNextTrack: inTrack, effectiveBpm: outBpm, effectiveNextBpm: inBpm } = liveRef.current;
-    const inHook = trustedHook(inTrack);
-    if (!inHook || !outBpm) return null;
-    const key = `${outTrack?.id}|${inTrack?.id}|${mixEnd.toFixed(2)}|${inBpm}`;
-    if (djPlanRef.current?.key === key) return djPlanRef.current.plan;
-    const bar = 240 / outBpm;
-    const outHook = trustedHook(outTrack);
-    const keep = outHook ? Math.min(8, Math.floor((outHook.out - outHook.drop) / bar / 2)) * bar + outHook.drop : 0;
-    const room = Math.floor((mixEnd - Math.max(now + SCHEDULE_LEAD + 0.5, keep)) / bar + 0.01);
-    const match = inBpm ? tempoMatch(outBpm, inBpm) : null;
-    const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, NaN, true);
-    const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, NaN, true);
-    const plan = planHookTransition(outShape, inShape, match, mixEnd, inHook.drop, room, inHook.in);
-    djPlanRef.current = { key, plan };
-    return plan;
+    preloadRef.current = { songId: next.id, deck, anchor };
   }
 
   // Where the outgoing track should start mixing out, in its own time.
-  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean; hook: boolean; plan: HookPlan | null } {
+  function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean } {
     const { serverTrack: track, effectiveBpm: bpm } = liveRef.current;
-    const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
-    const grid = !!(detail?.downbeats?.length && bpm && track!.confidence >= MIN_CONFIDENCE);
-    // DJ: the incoming hook lands where this hook ends (pushed back by whole
-    // bars while the incoming deck isn't ready); the mix starts the plan's
-    // length before that.
-    const hook = mixModeRef.current === "dj" ? trustedHook(track) : null;
-    if (hook && bpm) {
-      const at = djCueOut(detail?.downbeats, hook, audio.currentTime);
-      const mixEnd = at === null ? null : at + cueExtendRef.current * (240 / bpm);
-      if (mixEnd !== null && mixEnd < audio.duration - 2) {
-        const plan = djPlanFor(mixEnd, audio.currentTime);
-        return { at: plan ? plan.cueOut : mixEnd, onDownbeat: grid, hook: true, plan };
-      }
-    }
     // The server's mix_out_point is phrase-aligned and leaves room for a
     // mix; the transition planner decides how long the mix is from there.
     const fadeLen = fadeDurationFor(bpm);
@@ -509,11 +477,12 @@ export function NowPlaying({
     at = Math.min(at, audio.duration - (bpm ? 240 / bpm : 2));
     at = Math.max(at, audio.duration / 2);
 
-    if (grid) {
-      const snapped = downbeatAtOrBefore(detail!.downbeats, at);
-      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm!) return { at: snapped, onDownbeat: true, hook: false, plan: null };
+    const detail = track && currentDetailRef.current?.id === track.id ? currentDetailRef.current : null;
+    if (detail?.downbeats?.length && bpm && track!.confidence >= MIN_CONFIDENCE) {
+      const snapped = downbeatAtOrBefore(detail.downbeats, at);
+      if (snapped !== null && at - snapped <= (4 * 4 * 60) / bpm) return { at: snapped, onDownbeat: true };
     }
-    return { at, onDownbeat: false, hook: false, plan: null };
+    return { at, onDownbeat: false };
   }
 
   // Mean-square level of the last SILENCE_READINGS polls (~1.6 s). Three
@@ -522,26 +491,18 @@ export function NowPlaying({
   const silenceLevelsRef = useRef<number[]>([]);
 
   useEffect(() => {
-    if (!mixing) return;
+    if (!djMode) return;
 
     const check = () => {
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
       const next = nextSongRef.current;
       if (crossfadeStartedRef.current || !next) return;
-      // Just after a mix, until React catches up, props still describe the
-      // previous song (its cues, and the song now playing as "next").
-      if (songIdRef.current !== lastSongIdRef.current || next.id === lastSongIdRef.current) return;
 
       const cue = cueOutFor(audio);
       const remaining = audio.duration - audio.currentTime;
 
-      // DJ songs last ~50 s: buffer the next one as soon as this one is on.
-      const lead = mixModeRef.current === "dj" ? Infinity : PRELOAD_LEAD;
-      // Re-buffer when the cue point changed with the mode (Crossfade <-> DJ).
-      const wantHook = mixModeRef.current === "dj" && !!trustedHook(liveRef.current.serverNextTrack);
-      const stale = preloadRef.current?.songId !== next.id || preloadRef.current.hook !== wantHook;
-      if (audio.currentTime >= cue.at - lead && stale) {
+      if (audio.currentTime >= cue.at - PRELOAD_LEAD && preloadRef.current?.songId !== next.id) {
         preload(next);
       }
 
@@ -551,7 +512,7 @@ export function NowPlaying({
         const delay = Math.max(0, (cue.at - audio.currentTime) / audio.playbackRate);
         startTimerRef.current = window.setTimeout(() => {
           startTimerRef.current = null;
-          startCrossfade(cue.at, cue.onDownbeat, cue.hook, cue.plan);
+          startCrossfade(cue.at, cue.onDownbeat);
         }, delay * 1000);
         return;
       }
@@ -589,11 +550,11 @@ export function NowPlaying({
         crossfadeStartedRef.current = false;
       }
     };
-  }, [mixing, getActiveAudio]);
+  }, [djMode, getActiveAudio]);
 
   // `target`: the outgoing time this start was timed to (null: start now, e.g.
   // silence detected). `onDownbeat`: target is a downbeat, so beat-sync.
-  function startCrossfade(target: number | null, onDownbeat: boolean, outHook = false, djPlan: HookPlan | null = null) {
+  function startCrossfade(target: number | null, onDownbeat: boolean) {
     const outgoing = getActiveAudio();
     const incoming = getInactiveAudio();
     const next = nextSongRef.current;
@@ -626,41 +587,22 @@ export function NowPlaying({
     incoming.preservesPitch = true;
     incoming.playbackRate = (match?.rate ?? 1) * outRate;
 
-    // DJ: the incoming build is timed so its hook lands where the mix ends.
-    const inHook = mixModeRef.current === "dj" && preloadRef.current?.hook ? trustedHook(inTrack) : null;
-    const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, outgoing.duration, !!inHook);
-    const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration, !!inHook);
-    // Planned with the cue; else (a late or unsynced start) a one-bar swap from now.
-    const hookPlan = inHook
-      ? djPlan ?? planHookTransition(outShape, inShape, match, outgoing.currentTime + (outBpm ? 240 / outBpm : 2), inHook.drop, 0, inHook.in)
-      : null;
-    if (hookPlan && target !== null) {
-      // Not buffered at the build yet: let the outgoing play on 4 more bars
-      // (past its hook) instead of starting into a stall.
-      const ready = incoming.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && isBuffered(incoming, hookPlan.inStart, 4);
-      if (!ready && outHook && cueExtendRef.current < 4 * MAX_CUE_EXTENSIONS) {
-        cueExtendRef.current += 4;
-        crossfadeStartedRef.current = false;
-        console.info("[brook] dj: next song not buffered, mixing 4 bars later");
-        return;
-      }
-    }
-    if (hookPlan && Math.abs(incoming.currentTime - hookPlan.inStart) > 0.03) incoming.currentTime = hookPlan.inStart;
-
-    const inAnchor = hookPlan ? hookPlan.inStart : preloadRef.current?.anchor ?? null;
+    const inAnchor = preloadRef.current?.anchor ?? null;
     const sync: BeatSync | null =
       anchor !== null && inAnchor !== null && match && outBpm && inBpm &&
       (outTrack?.confidence ?? 0) >= MIN_CONFIDENCE && (inTrack?.confidence ?? 0) >= MIN_CONFIDENCE
         ? { outAnchor: anchor, inAnchor, outBeat: 60 / outBpm, inBeat: 60 / (inBpm * match.factor), outRate }
         : null;
 
-    const plan = hookPlan ?? planTransition(outShape, inShape, match, outgoing.currentTime, inAnchor ?? 0);
+    const plan = planTransition(
+      shapeOf(outTrack, currentDetailRef.current, outBpm, outgoing.duration),
+      shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration),
+      match, outgoing.currentTime, inAnchor ?? 0,
+    );
     const fadeLen = plan.seconds;
     const bar = outBpm ? 240 / outBpm : fadeLen / 8;
     const curves = buildCrossfadeCurves(CURVE_POINTS, plan.swapStart, plan.swapEnd);
-    setMixLabel(hookPlan
-      ? hookPlan.style === "cut" ? "DJ SWAP" : `DJ ${plan.bars} BARS`
-      : plan.bars ? `MIX ${plan.bars} BAR${plan.bars > 1 ? "S" : ""}` : "CROSSFADING");
+    setMixLabel(plan.bars ? `MIX ${plan.bars} BAR${plan.bars > 1 ? "S" : ""}` : "CROSSFADING");
     console.info("[brook] mix plan", plan);
 
     let end = 0;
@@ -678,20 +620,6 @@ export function NowPlaying({
       schedule(inn.fader.gain, curves.gainIn);
       schedule(out.shelf.gain, curves.shelfOut);
       schedule(inn.shelf.gain, curves.shelfIn);
-      if (hookPlan) {
-        const fx = buildHookFxCurves(CURVE_POINTS, hookPlan.style, hookPlan.bars ?? 1);
-        schedule(inn.hpf.frequency, fx.hpfIn);
-        schedule(inn.mid.gain, fx.midIn);
-        if (hookPlan.style === "cut" && outBpm) {
-          // Swap: the outgoing washes out through a rising high-pass into a
-          // dotted-eighth dub echo that keeps ringing (damped) after the deck is gone.
-          schedule(out.hpf.frequency, fx.hpfOut);
-          const beat = 60 / outBpm;
-          out.echoDelay.delayTime.cancelScheduledValues(0);
-          out.echoDelay.delayTime.setValueAtTime(Math.min(1.9, beat * 0.75), ctx.currentTime);
-          schedule(out.echoSend.gain, fx.echoOut);
-        }
-      }
       end = t0 + fadeLen;
     } else {
       incoming.volume = 0;
@@ -760,7 +688,6 @@ export function NowPlaying({
     fadeRef.current = null;
     preloadRef.current = null;
     crossfadeStartedRef.current = false;
-    cueExtendRef.current = 0;
     lastSongIdRef.current = fade.song.id;
 
     if (inc) {
@@ -798,11 +725,33 @@ export function NowPlaying({
     if (!audio) return;
     ensureAudioGraph();
     resumeCtx();
-    audio.play().catch(() => {});
+    if (pauseTimerRef.current) {
+      // Pressed play while a pause was fading out: just fade back up.
+      clearTimeout(pauseTimerRef.current);
+      pauseTimerRef.current = null;
+      setPlaying(true);
+      rampUp(FADE_PAUSE_S);
+      return;
+    }
+    const fade = !fadeRef.current && audio.paused && fadeable();
+    if (fade) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
+    audio.play().then(() => { if (fade) rampUp(FADE_PAUSE_S); })
+      .catch(() => { if (fade) resetStrip(activeDeckRef.current, 1); });
     if (fadeRef.current) audioFor(fadeRef.current.inDeck)?.play().catch(() => {});
   }
 
   function pauseAll() {
+    const active = getActiveAudio();
+    if (active && !active.paused && !fadeRef.current && !pauseTimerRef.current && rampActiveFader(0, FADE_PAUSE_S)) {
+      // Fade out on the audio thread, then pause the element once it is silent.
+      const deck = activeDeckRef.current;
+      setPlaying(false); // the button flips now; the element pauses once it is silent
+      pauseTimerRef.current = window.setTimeout(() => {
+        pauseTimerRef.current = null;
+        audioFor(deck)?.pause();
+      }, FADE_PAUSE_S * 1000 + 20);
+      return;
+    }
     getActiveAudio()?.pause();
     if (fadeRef.current) {
       audioFor(fadeRef.current.inDeck)?.pause();
@@ -819,7 +768,7 @@ export function NowPlaying({
   const togglePlay = useCallback(() => {
     const audio = getActiveAudio();
     if (!audio) return;
-    if (audio.paused) playRef.current();
+    if (audio.paused || pauseTimerRef.current) playRef.current();
     else pauseRef.current();
   }, [getActiveAudio]);
 
@@ -853,7 +802,24 @@ export function NowPlaying({
     const rect = el.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     if (fadeRef.current) fadeRef.current.sync = null; // a seek breaks the beat alignment
-    audio.currentTime = ratio * duration;
+    const target = ratio * duration;
+    if (!fadeRef.current && !audio.paused && !pauseTimerRef.current && rampActiveFader(0, FADE_SEEK_OUT_S)) {
+      // Mute, jump while silent, fade back in: a jump in a playing stream clicks.
+      cancelPendingFades();
+      const deck = activeDeckRef.current;
+      seekRef.current = {
+        deck, target,
+        timer: window.setTimeout(() => {
+          seekRef.current = null;
+          const a = audioFor(deck);
+          if (a) a.currentTime = target;
+          if (activeDeckRef.current === deck) rampUp(FADE_SEEK_IN_S);
+        }, FADE_SEEK_OUT_S * 1000 + 10),
+      };
+      setCurrentTime(target);
+      return;
+    }
+    audio.currentTime = target;
     setCurrentTime(audio.currentTime);
   }
 
@@ -981,18 +947,11 @@ export function NowPlaying({
 
         <div className={styles.extras}>
           <button
-            className={`${styles.djToggle} ${mixMode === "crossfade" ? styles.djActive : ""}`}
-            onClick={() => onMixModeChange(mixMode === "crossfade" ? "off" : "crossfade")}
-            aria-pressed={mixMode === "crossfade"}
+            className={`${styles.djToggle} ${djMode ? styles.djActive : ""}`}
+            onClick={onDjModeToggle}
+            aria-pressed={djMode}
           >
             Crossfade
-          </button>
-          <button
-            className={`${styles.djToggle} ${mixMode === "dj" ? styles.djActive : ""}`}
-            onClick={() => onMixModeChange(mixMode === "dj" ? "off" : "dj")}
-            aria-pressed={mixMode === "dj"}
-          >
-            DJ
           </button>
           <button
             className={`${styles.shuffleToggle} ${shuffled ? styles.shuffleActive : ""}`}

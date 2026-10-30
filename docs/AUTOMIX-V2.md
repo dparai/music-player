@@ -1,4 +1,4 @@
-# AutoMix DJ Mode v2
+# AutoMix Crossfade v2
 
 > Goal: transitions that sound like a DJ mixed them: on the beat, on the phrase, no bass mud or bass hole, steady loudness.
 > Built in three layers. Each one works on its own, and every layer falls back to the one below it.

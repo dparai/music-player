@@ -2,7 +2,7 @@
 
 > *"Yohohoho!"* — Brook, Soul King
 
-A personal music streaming PWA themed after the Straw Hat Pirates' beloved skeleton musician. Stream your own music library from anywhere, with a DJ mode that mixes songs like a real DJ: on the beat, on the phrase, planned for each pair of songs.
+A personal music streaming PWA themed after the Straw Hat Pirates' beloved skeleton musician. Stream your own music library from anywhere, with a **Crossfade** mode that blends songs the way a DJ would: on the beat, on the phrase, planned for each pair of songs.
 
 ---
 
@@ -36,15 +36,15 @@ Your Music Collection
 3. **Navidrome** indexes and serves the music via the Subsonic API
 4. **Caddy** handles HTTPS with auto-renewing certificates
 5. **AutoMix** analyses each *new* song once (~2 min): tempo, beat grid with real downbeats, key, loudness, where the intro ends and the outro starts, and where the vocals are (Demucs AI source separation)
-6. **Brook** (this PWA) plays it all in your browser and uses that analysis to plan every DJ transition
+6. **Brook** (this PWA) plays it all in your browser and uses that analysis to plan every transition
 
 ---
 
 ## The Fun Parts
 
-### DJ Mode
+### Crossfade
 
-Brook doesn't just play the next song — it **mixes** like a real DJ:
+Tap **Crossfade** and Brook doesn't just play the next song — it **mixes** it in, like a DJ blending two records:
 
 - **Beat Sync** — the mix starts exactly on a downbeat, the incoming song is tempo-matched (up to ±6%, pitch preserved) and phase-locked to the outgoing beat (within ~10 ms), then eases back to its own tempo
 - **Camelot Wheel** — picks the next song in a harmonically compatible key (so transitions sound musical, not jarring)
@@ -53,9 +53,10 @@ Brook doesn't just play the next song — it **mixes** like a real DJ:
 - **Outro Cues** — the server finds where each song's outro starts (within its last 40 s) and mixes there, not in a bridge or "15 s before the end"
 - **Loudness Levelling** — every song trimmed to about −14 LUFS, plus a master limiter, so volume doesn't jump between songs
 - **Smart Song Endings** — detects real silence/fade-outs and starts the mix early instead of waiting for dead air
+- **Soft Starts, Stops and Skips** — borrowed from Poweramp's approach: pause and play ramp over 150 ms, a seek mutes for the jump and fades back in (~100 ms), and a manual skip fades the old song out (150 ms) and the new one in (250 ms), so nothing clicks or cuts dead
 - **Reliable Vocal Detection** — Demucs separates the vocals from the music to see who is singing when. If it ever fails, it's retried with safer settings, and backed up by Open-Unmix, then a PANNs singing classifier, then a heuristic, so every song always gets a vocal map
 
-### How DJ Song Selection Works
+### How the Next Song Is Chosen
 
 ```
 Current song: 120 BPM, key of Am (Camelot 8A)
@@ -84,7 +85,7 @@ Mix length: incoming intro length, capped by the outgoing outro,
 
 ### Dual Deck Architecture
 
-Brook runs two `<audio>` elements (Deck A and Deck B), like real DJ turntables:
+Brook runs two `<audio>` elements (Deck A and Deck B), like two turntables:
 
 ```
 Deck A: ████████████████░░░░  (playing, fading out)
@@ -135,7 +136,7 @@ Design notes and the plan for server-rendered transitions: [docs/AUTOMIX-V2.md](
 
 ```
 src/
-  App.tsx              Main app — routing, state, DJ song selection
+  App.tsx              Main app — routing, state, next-song selection
   components/
     Login.tsx           Subsonic auth (salted token, not plain password)
     NowPlaying.tsx      The big one — dual-deck engine, beat sync, Web Audio
@@ -152,7 +153,7 @@ server/
   automix/              AutoMix server source (deployed to /opt/automix/app)
   analyze.py            Legacy BPM/key analysis.json generator
 docs/
-  AUTOMIX-V2.md         DJ engine design notes
+  AUTOMIX-V2.md         Crossfade engine design notes
 ```
 
 ### AutoMix Server (on the VM)
