@@ -73,6 +73,14 @@ const SCHEDULE_LEAD = 1.5;  // seconds before the cue to arm the precise start t
 const MIN_CONFIDENCE = 0.4; // beat-grid confidence needed to beat-sync
 const MAX_INTRO_CUE = 30;   // don't skip more intro than this to reach the first downbeat
 const CURVE_POINTS = 128;
+// Short fades for the moments that are not mixes (what Poweramp does for
+// play/pause, seek and a manual skip): a hard start, stop or jump of a playing
+// stream clicks, and skipping mid-phrase cuts the old song dead.
+const FADE_PAUSE_S = 0.15;     // pause out / play in
+const FADE_SEEK_OUT_S = 0.04;  // seek: mute, jump, then...
+const FADE_SEEK_IN_S = 0.06;   // ...fade back in (about 100 ms in all)
+const FADE_SKIP_OUT_S = 0.15;  // manual skip: old song out
+const FADE_SKIP_IN_S = 0.25;   // ...new song in
 const SILENCE_READINGS = 8; // × 200 ms polls
 
 function formatTime(seconds: number): string {
@@ -141,6 +149,9 @@ export function NowPlaying({
   const fadeTimerRef = useRef<number | null>(null);
   const startTimerRef = useRef<number | null>(null);
   const rampTimerRef = useRef<number | null>(null);
+  const pauseTimerRef = useRef<number | null>(null);  // a fade-out before pause() is under way
+  const seekRef = useRef<{ timer: number; target: number; deck: Deck } | null>(null);
+  const skipTimerRef = useRef<number | null>(null);   // a fade-out before a manual skip loads
   const preloadRef = useRef<Preload | null>(null);
   const crossfadeStartedRef = useRef(false);
   const currentDetailRef = useRef<AutoMixTrackDetail | null>(null);
@@ -262,6 +273,46 @@ export function NowPlaying({
     if (ctx && ctx.state !== "running" && ctx.state !== "closed") ctx.resume().catch(() => {});
   }
 
+  // Whether the Web Audio graph can carry a fade right now (it can't while the
+  // context is suspended, e.g. before the first tap on some browsers).
+  function fadeable(): boolean {
+    const ctx = audioCtxRef.current;
+    return !!ctx && ctx.state === "running" && !!decksRef.current[activeDeckRef.current];
+  }
+
+  // Ramp the active deck's fader to `to` from wherever it is. False: no fade
+  // possible, nothing was changed. Never call during a mix (it owns the faders).
+  function rampActiveFader(to: number, seconds: number): boolean {
+    if (!fadeable()) return false;
+    const ctx = audioCtxRef.current!;
+    const g = decksRef.current[activeDeckRef.current]!.fader.gain;
+    const now = ctx.currentTime;
+    const from = g.value;
+    g.cancelScheduledValues(0);
+    g.setValueAtTime(from, now);
+    g.linearRampToValueAtTime(to, now + seconds);
+    return true;
+  }
+
+  // Fade the active deck back to full level; if fades are unavailable, just
+  // make sure it isn't left silent.
+  function rampUp(seconds: number) {
+    if (!rampActiveFader(1, seconds)) resetStrip(activeDeckRef.current, 1);
+  }
+
+  // Apply a seek that was waiting for its mute, and drop pending fade-outs.
+  function cancelPendingFades() {
+    if (pauseTimerRef.current) { clearTimeout(pauseTimerRef.current); pauseTimerRef.current = null; }
+    if (skipTimerRef.current) { clearTimeout(skipTimerRef.current); skipTimerRef.current = null; }
+    const seek = seekRef.current;
+    if (seek) {
+      clearTimeout(seek.timer);
+      seekRef.current = null;
+      const audio = audioFor(seek.deck);
+      if (audio) audio.currentTime = seek.target;
+    }
+  }
+
   // Drop any automation (including a curve already in progress) and hold `value`.
   function setParam(param: AudioParam, value: number) {
     const ctx = audioCtxRef.current;
@@ -359,18 +410,36 @@ export function NowPlaying({
       return;
     }
 
-    cancelCrossfade();
-    const audio = getActiveAudio();
-    if (!audio) return;
+    cancelPendingFades();
+    const load = (fadeIn: boolean) => {
+      if (lastSongIdRef.current !== song.id) return; // a newer pick took over while we faded out
+      cancelCrossfade();
+      const audio = getActiveAudio();
+      if (!audio) return;
 
-    ensureAudioGraph();
-    resumeCtx();
-    setTrim(activeDeckRef.current, song, serverTrack);
-    audio.preservesPitch = true;
-    audio.playbackRate = 1;
-    setStreamSrc(audio, song.id);
-    audio.play().then(() => setPlaying(true)).catch(() => {});
-    updateMediaSession(song);
+      ensureAudioGraph();
+      resumeCtx();
+      setTrim(activeDeckRef.current, song, serverTrack);
+      audio.preservesPitch = true;
+      audio.playbackRate = 1;
+      // Start silent and fade in once audio is flowing (only when the fade can run).
+      if (fadeIn && fadeable()) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
+      setStreamSrc(audio, song.id);
+      audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
+        .catch(() => { if (fadeIn) resetStrip(activeDeckRef.current, 1); });
+      updateMediaSession(song);
+    };
+
+    // A manual skip while a song is playing (not mid-mix): fade it out first
+    // instead of cutting it dead.
+    const playing = getActiveAudio();
+    if (playing && !playing.paused && !fadeRef.current && rampActiveFader(0, FADE_SKIP_OUT_S)) {
+      clearTimers();
+      crossfadeStartedRef.current = true; // no mix may start while we fade out
+      skipTimerRef.current = window.setTimeout(() => { skipTimerRef.current = null; load(true); }, FADE_SKIP_OUT_S * 1000 + 20);
+      return;
+    }
+    load(false);
   }, [song, creds, getActiveAudio]);
 
   // Buffer the next song on the idle deck, cued to its first downbeat.
@@ -656,11 +725,33 @@ export function NowPlaying({
     if (!audio) return;
     ensureAudioGraph();
     resumeCtx();
-    audio.play().catch(() => {});
+    if (pauseTimerRef.current) {
+      // Pressed play while a pause was fading out: just fade back up.
+      clearTimeout(pauseTimerRef.current);
+      pauseTimerRef.current = null;
+      setPlaying(true);
+      rampUp(FADE_PAUSE_S);
+      return;
+    }
+    const fade = !fadeRef.current && audio.paused && fadeable();
+    if (fade) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
+    audio.play().then(() => { if (fade) rampUp(FADE_PAUSE_S); })
+      .catch(() => { if (fade) resetStrip(activeDeckRef.current, 1); });
     if (fadeRef.current) audioFor(fadeRef.current.inDeck)?.play().catch(() => {});
   }
 
   function pauseAll() {
+    const active = getActiveAudio();
+    if (active && !active.paused && !fadeRef.current && !pauseTimerRef.current && rampActiveFader(0, FADE_PAUSE_S)) {
+      // Fade out on the audio thread, then pause the element once it is silent.
+      const deck = activeDeckRef.current;
+      setPlaying(false); // the button flips now; the element pauses once it is silent
+      pauseTimerRef.current = window.setTimeout(() => {
+        pauseTimerRef.current = null;
+        audioFor(deck)?.pause();
+      }, FADE_PAUSE_S * 1000 + 20);
+      return;
+    }
     getActiveAudio()?.pause();
     if (fadeRef.current) {
       audioFor(fadeRef.current.inDeck)?.pause();
@@ -677,7 +768,7 @@ export function NowPlaying({
   const togglePlay = useCallback(() => {
     const audio = getActiveAudio();
     if (!audio) return;
-    if (audio.paused) playRef.current();
+    if (audio.paused || pauseTimerRef.current) playRef.current();
     else pauseRef.current();
   }, [getActiveAudio]);
 
@@ -711,7 +802,24 @@ export function NowPlaying({
     const rect = el.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     if (fadeRef.current) fadeRef.current.sync = null; // a seek breaks the beat alignment
-    audio.currentTime = ratio * duration;
+    const target = ratio * duration;
+    if (!fadeRef.current && !audio.paused && !pauseTimerRef.current && rampActiveFader(0, FADE_SEEK_OUT_S)) {
+      // Mute, jump while silent, fade back in: a jump in a playing stream clicks.
+      cancelPendingFades();
+      const deck = activeDeckRef.current;
+      seekRef.current = {
+        deck, target,
+        timer: window.setTimeout(() => {
+          seekRef.current = null;
+          const a = audioFor(deck);
+          if (a) a.currentTime = target;
+          if (activeDeckRef.current === deck) rampUp(FADE_SEEK_IN_S);
+        }, FADE_SEEK_OUT_S * 1000 + 10),
+      };
+      setCurrentTime(target);
+      return;
+    }
+    audio.currentTime = target;
     setCurrentTime(audio.currentTime);
   }
 
