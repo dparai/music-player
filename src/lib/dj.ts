@@ -457,7 +457,7 @@ function barsBefore(shape: TrackShape | null, t: number, bars: number, barSec: n
 //           incoming      | build, filtered, rising   |DROP …
 //
 //   swap:   outgoing  … HOOK ………… last bar: filter up + echo |
-//           incoming                  pickup, filtered, rising |DROP …
+//           incoming                  pickup, filtered, rising |BUILD … DROP …
 //
 // Blend (8/4/2 bars) only where the two decks never sing at the same time
 // before the last bar; a bar without vocal data counts as singing, since a
@@ -465,7 +465,8 @@ function barsBefore(shape: TrackShape | null, t: number, bars: number, barSec: n
 // may use at most `room` bars of the outgoing hook (the hook keeps a few bars
 // to itself). Everything else, and any pair that can't be beat-matched, is a
 // one-bar swap: the outgoing washes out into a dub echo while the incoming
-// pickup rises, filtered, into its drop.
+// pickup rises, filtered, into its build (`inLand`, the pre-chorus), which
+// then plays on its own and lifts into the hook, as a DJ quick-mixes.
 export function planHookTransition(
   out: TrackShape | null,
   inn: TrackShape | null,
@@ -473,6 +474,7 @@ export function planHookTransition(
   mixEnd: number,
   inDrop: number,
   room: number,
+  inLand = inDrop,
 ): HookPlan {
   const outBpm = out?.bpm ?? null;
   const inBpm = inn?.bpm ?? null;
@@ -484,10 +486,10 @@ export function planHookTransition(
     const seconds = match ? bar : Math.max(1.5, Math.min(3, inBar));
     return {
       seconds, bars: outBpm ? 1 : null, swapStart: 0.75, swapEnd: 0.98, style: "cut",
-      reason: `dj: swap on the drop, ${why}`, cueOut: mixEnd - seconds,
+      reason: `dj: swap into the build, ${why}`, cueOut: mixEnd - seconds,
       // A half-time incoming bar is two outgoing bars: then start half a bar early.
-      inStart: match && match.factor <= 1 ? barsBefore(inn, inDrop, Math.round(1 / match.factor), inBar)
-        : Math.max(0, inDrop - seconds * (match?.rate ?? 1)),
+      inStart: match && match.factor <= 1 ? barsBefore(inn, inLand, Math.round(1 / match.factor), inBar)
+        : Math.max(0, inLand - seconds * (match?.rate ?? 1)),
     };
   };
   if (!out || !outBpm || !(outBpm > 0)) return swap("no tempo");

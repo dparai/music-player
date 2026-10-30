@@ -69,6 +69,15 @@ test("both singing before the last bar: no blend, swap", () => {
   assert.equal(r.bars, 4);
 });
 
+test("swap lands on the incoming build (pre-chorus), not its drop", () => {
+  const p = planHookTransition(OUT, INN, MATCH, 100, 60.5, 0, 44.5);
+  assert.equal(p.style, "cut");
+  assert.equal(p.inStart, 42.5);                 // one bar before the build
+  const b = planHookTransition(OUT, INN, MATCH, 100, 60.5, 8, 44.5);
+  assert.equal(b.style, "blend");
+  assert.equal(b.inStart, 44.5);                 // a blend still lands the drop at the mix end
+});
+
 test("unknown vocals count as singing: swap", () => {
   const p = planHookTransition(shape(120, 0, 200), shape(120, 0.5, 200), MATCH, 100, 60.5, 8); // no vocal data
   assert.equal(p.style, "cut");

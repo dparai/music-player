@@ -446,9 +446,10 @@ export function NowPlaying({
     const detail = track && nextDetailRef.current?.id === track.id ? nextDetailRef.current : null;
     const first = detail?.downbeats?.[0] ?? null;
     const hook = mixModeRef.current === "dj" ? trustedHook(track) : null;
-    // DJ: cue to the start of the build; the mix may start a few bars later
-    // (shorter build), a short seek inside what is already buffered.
-    const anchor = hook ? hook.in : first !== null && first <= MAX_INTRO_CUE ? first : null;
+    // DJ: cue two bars before the build (a swap starts one bar before it); the
+    // mix may start later, a short seek inside what is already buffered.
+    const nextBar = liveRef.current.effectiveNextBpm ? 240 / liveRef.current.effectiveNextBpm : 2;
+    const anchor = hook ? Math.max(0, hook.in - 2 * nextBar) : first !== null && first <= MAX_INTRO_CUE ? first : null;
 
     audio.pause();
     audio.preload = "auto";
@@ -479,7 +480,7 @@ export function NowPlaying({
     const match = inBpm ? tempoMatch(outBpm, inBpm) : null;
     const outShape = shapeOf(outTrack, currentDetailRef.current, outBpm, NaN, true);
     const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, NaN, true);
-    const plan = planHookTransition(outShape, inShape, match, mixEnd, inHook.drop, room);
+    const plan = planHookTransition(outShape, inShape, match, mixEnd, inHook.drop, room, inHook.in);
     djPlanRef.current = { key, plan };
     return plan;
   }
@@ -631,7 +632,7 @@ export function NowPlaying({
     const inShape = shapeOf(inTrack, nextDetailRef.current, inBpm, incoming.duration, !!inHook);
     // Planned with the cue; else (a late or unsynced start) a one-bar swap from now.
     const hookPlan = inHook
-      ? djPlan ?? planHookTransition(outShape, inShape, match, outgoing.currentTime + (outBpm ? 240 / outBpm : 2), inHook.drop, 0)
+      ? djPlan ?? planHookTransition(outShape, inShape, match, outgoing.currentTime + (outBpm ? 240 / outBpm : 2), inHook.drop, 0, inHook.in)
       : null;
     if (hookPlan && target !== null) {
       // Not buffered at the build yet: let the outgoing play on 4 more bars
