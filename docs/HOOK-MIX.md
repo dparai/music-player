@@ -97,10 +97,15 @@ Done (code in this branch, **not deployed to the VM yet**):
 - Phase 3: `lyrics.py` (LRCLIB, backoff for its 503s), `main.py` hook pass (own `hook_version`, lyrics cache table, API fields).
 - Phases 4–7 (app): `planHookTransition`, `djCueOut`, `trustedHook`, `buildHookFxCurves` in `dj.ts`; NowPlaying uses hook cues, early preload, buffered wait + 4-bar cue extension, DJ starts hand-picked songs at their build, HPF dive / mid duck / dub echo; DJ-aware picking (hook key, energy flow, trusted hooks, 40-song window). `npm test` (11/11) and the build pass.
 
-Next, when resuming:
-1. Finish the eval on the VM (`/tmp/hookeval`), copy the latest `analysis_hooks.py`, `lyrics.py`, `hooks_eval.py` there, rerun `hooks_eval.py` (fills lyric gaps) and `hooks_eval.py --grid`; set `WEIGHTS` from the cross-validated result; iterate on features if accuracy stays low.
+Eval results (VM library, 170 analysed tracks):
+- Lyrics: 123 tracks have a repeated lyric block (production path: lyric region + audio entry bar). 37 have none on LRCLIB, almost all instrumentals; 9 have only partial lyrics. Fuzzy line matching was tried: +1 track, but it moved or split the chorus on 44 others, so it was dropped.
+- Audio only (no lyrics): 50/113 = 44% land inside a lyric chorus region; 62% when confidence ≥ 0.75. The weight grid (486 sets, two-fold CV) gives 45%, the same as the current `WEIGHTS`, so they stay: the limit is the features, not the weights.
+- Phase 8: `render_dj.py` renders sample hand-offs (`--pairs N`, tempo-matched like the picker) and a continuous set (`--set N`) with the same plan, curves and FX as the app.
+
+Next:
+1. Listen to the renders; fix what sounds wrong.
 2. Deploy `server/automix/*.py` to the VM (README steps) and restart the service; the hook pass backfills.
-3. Test DJ mode on the phone (Phase 5 gate); then Phase 8 (rendered sample transitions to listen to) and Phase 9 (wrong-hook button).
+3. Test DJ mode on the phone (Phase 5 gate), then Phase 9 (wrong-hook button). Instrumentals (no lyrics) rely on the audio detector and its drop rule.
 
 ## 6. Roadmap (each phase has a gate it must pass)
 
