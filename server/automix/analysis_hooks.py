@@ -31,7 +31,7 @@ from analysis_v2 import HOP, KEY_NAMES, SINGING_LEVEL, SR, _vocal_ratio
 # (without re-running the full analysis).
 HOOK_VERSION = 2
 
-BUILD_BARS = 8        # hook_in = hook_drop - this: the build the incoming deck plays under the mix
+BUILD_BARS = 8        # hook_in = hook_drop - this (lyrics: the pre-chorus start): where a song comes in
 MAX_POST_BARS = 8     # outgoing may keep playing this long after hook_out while the next build rises
 MIN_LAG_BARS = 8      # repeats closer than this are loops inside one section, not a section coming back
 EARLY = 0.10          # hooks don't start in the first 10% (intro) ...
@@ -383,11 +383,20 @@ def detect_hooks(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: flo
         boundary = nov[drop_bar + 7:drop_bar + 10].max()
         if second >= 0.85 * energy[drop_bar:drop_bar + 8].mean() and (same >= tau or boundary < 0.5):
             hook_bars = 16
+    build = BUILD_BARS
     if lyric_used:
         # Lyrics say where the chorus block ends: play through its last line
         # (a hand-off mid-line cuts a word), 8 to 24 bars.
         t0 = downbeats[drop_bar]
-        block_end = next((b for a, b in lyric_chorus_spans(lyrics) if a - 2 * bar_len - 0.5 <= t0 <= b), None)
+        span = next(((a, b) for a, b in lyric_chorus_spans(lyrics) if a - 2 * bar_len - 0.5 <= t0 <= b), None)
+        block_end = span[1] if span else None
+        if span:
+            # ... and where it starts (the pre-chorus): the song comes in there
+            # and builds into its chorus. Whole 4-bar steps, 4 to 16 bars.
+            first = int(np.argmin(np.abs(downbeats - span[0])))
+            b4 = int(round((drop_bar - first) / 4)) * 4
+            if 4 <= b4 <= 16:
+                build = b4
         if block_end is not None:
             k = int(np.searchsorted(downbeats, block_end - 0.3 * bar_len))
             k = min(max(k, drop_bar + 8), drop_bar + 24, nb)
@@ -413,7 +422,7 @@ def detect_hooks(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: flo
         conf = min(conf, 0.4)
 
     if pick_only:
-        return {**_cue_dict(downbeats, edges, drop_bar, hook_bars, nb), "hook_kind": kind,
+        return {**_cue_dict(downbeats, edges, drop_bar, hook_bars, nb, build), "hook_kind": kind,
                 "hook_confidence": round(float(np.clip(conf, 0, 1)), 3)}
 
     # Alternatives: the best two other sections (for the "wrong hook" button).
@@ -435,7 +444,7 @@ def detect_hooks(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: flo
                    + 0.25 * np.clip((centroid - 1000) / 2500, 0, 1))
 
     return {
-        **_cue_dict(downbeats, edges, drop_bar, hook_bars, nb),
+        **_cue_dict(downbeats, edges, drop_bar, hook_bars, nb, build),
         "hook_post_bars": post,
         "hook_kind": kind,
         "hook_confidence": round(float(np.clip(conf, 0, 1)), 3),
@@ -452,9 +461,10 @@ def _cue_triplet(downbeats: np.ndarray, edges: np.ndarray, drop: int, bars: int,
     return [d["hook_in"], d["hook_drop"], d["hook_out"]]
 
 
-def _cue_dict(downbeats: np.ndarray, edges: np.ndarray, drop: int, bars: int, nb: int) -> dict:
+def _cue_dict(downbeats: np.ndarray, edges: np.ndarray, drop: int, bars: int, nb: int,
+              build: int = BUILD_BARS) -> dict:
     return {
-        "hook_in": round(float(downbeats[max(0, drop - BUILD_BARS)]), 3),
+        "hook_in": round(float(downbeats[max(0, drop - build)]), 3),
         "hook_drop": round(float(downbeats[drop]), 3),
         "hook_out": round(float(edges[min(drop + bars, nb)]), 3),
     }

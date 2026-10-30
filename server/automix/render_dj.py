@@ -79,11 +79,13 @@ def plan(out, inn, match, mix_end, room):
     drop = inn["hook"]["drop"]
 
     def swap(why):
+        # Lands on the incoming build (pre-chorus), as planHookTransition's inLand.
+        land = inn["hook"]["in"]
         seconds = bar if match else max(1.5, min(3, in_bar))
         if match and match[1] <= 1:
-            in_start = bars_before(inn["downbeats"], drop, round(1 / match[1]), in_bar)
+            in_start = bars_before(inn["downbeats"], land, round(1 / match[1]), in_bar)
         else:
-            in_start = max(0.0, drop - seconds * (match[0] if match else 1))
+            in_start = max(0.0, land - seconds * (match[0] if match else 1))
         return dict(style="cut", bars=1, seconds=seconds, swap=(0.75, 0.98), cue_out=mix_end - seconds,
                     in_start=in_start, why=why)
 
