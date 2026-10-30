@@ -37,7 +37,7 @@ def get_synced_lyrics(path: str, duration: float) -> str | None:
     results = None
     # The free API answers 503 under load and occasionally drops a connection:
     # back off and retry a few times before leaving it for the next scan.
-    for wait in (0, 2, 6, 15):
+    for wait in (0, 2, 6, 15, 30):
         time.sleep(wait)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})

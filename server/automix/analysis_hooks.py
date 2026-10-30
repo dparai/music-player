@@ -105,7 +105,15 @@ def _norm_line(s: str) -> str:
 
 
 def lyric_choruses(lines: list[tuple[float, str]]) -> list[float]:
-    """Start times of each occurrence of the most-repeated block of lines.
+    """Start times of each occurrence of the most-repeated block of lines."""
+    return [a for a, _ in lyric_chorus_spans(lines)]
+
+
+def lyric_chorus_spans(lines: list[tuple[float, str]]) -> list[tuple[float, float]]:
+    """(start, end) of each occurrence of the most-repeated block of lines.
+
+    The block is usually pre-chorus + chorus, so the chorus itself starts
+    somewhere inside it; detect_hooks lets the audio pick that bar.
 
     A chorus is a run of consecutive lines that comes back. Score each repeated
     run by (lines in it) x (times it occurs); the best run's occurrences are the
@@ -117,6 +125,7 @@ def lyric_choruses(lines: list[tuple[float, str]]) -> list[float]:
     keys = [_norm_line(t) for _, t in lines]
     n = len(keys)
     best: tuple[float, list[int]] = (0.0, [])
+    best_len = [0]
     for i in range(n):
         if not keys[i]:
             continue
@@ -141,9 +150,16 @@ def lyric_choruses(lines: list[tuple[float, str]]) -> list[float]:
             score = min(k, 8) * len(occ)
             if score > best[0]:
                 best = (score, occ)
+                best_len[0] = k
     if not best[1]:
         return []
-    return [lines[s][0] for s in best[1]]
+    k = best_len[0]
+    spans = []
+    for s0 in best[1]:
+        last = s0 + k - 1
+        nxt = lines[last + 1][0] if last + 1 < n else lines[last][0] + 4.0
+        spans.append((lines[s0][0], min(nxt, lines[last][0] + 8.0)))
+    return spans
 
 
 def lyric_vocal_bars(lines: list[tuple[float, str]], edges: np.ndarray) -> np.ndarray:
@@ -302,19 +318,19 @@ def detect_hooks(y: np.ndarray, downbeats: np.ndarray, duration: float, bpm: flo
         starts = [i for i in range(nb) if scores[i] >= 0]
     kind, lyric_used = "chorus", False
 
-    # Lyrics, when they exist, say which section is the chorus. Snap each lyric
-    # chorus start to the nearest downbeat, leaning later: singers often start
-    # on a pickup just before the bar line, and LRC stamps lead the voice.
-    # A clearly stronger section boundary one bar away wins over the nearest.
-    lyric_starts = lyric_choruses(lyrics) if lyrics else []
+    # Lyrics, when they exist, say where the chorus region is (the repeated
+    # block, usually pre-chorus + chorus). The audio picks the entry inside
+    # each region: the best-scoring section start, else the bar where the
+    # block's singing starts (snapped later: singers start on a pickup).
     lyric_bars: list[int] = []
-    for t in lyric_starts:
-        b = int(np.argmin(np.abs(downbeats - (t + 0.2 * bar_len))))
-        for k in (b - 1, b + 1):
-            if 0 <= k < nb and nov[k] > nov[b] + 0.4:
-                b = k
-        if scores[b] >= 0:
-            lyric_bars.append(b)
+    start_set = set(starts)
+    for a, b_end in (lyric_chorus_spans(lyrics) if lyrics else []):
+        first = int(np.argmin(np.abs(downbeats - (a + 0.2 * bar_len))))
+        inside = [k for k in range(first, nb) if downbeats[k] <= b_end - 4 * bar_len
+                  and k in start_set and scores[k] >= 0]
+        cand = inside + ([first] if scores[first] >= 0 else [])
+        if cand:
+            lyric_bars.append(max(cand, key=lambda k: scores[k]))
 
     # Drop: bass comes back hard after a bass-less build. Competes with choruses
     # in tracks that are mostly instrumental.
