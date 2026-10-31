@@ -380,6 +380,142 @@ export function planTransition(
   return { seconds: n * bar, bars: n, swapStart, swapEnd, style, reason: reasons.join(", ") };
 }
 
+// --- Choosing where to exit and where to enter -----------------------------
+
+export const MAX_EXIT_SHIFT = 16;   // s the exit may move earlier or later than the server's cue
+export const MAX_START_SHIFT = 16;  // s the incoming song may start later than its first downbeat
+const MAX_CUE_CANDIDATES = 12;
+const MAX_START_CANDIDATES = 8;
+
+export interface TransitionChoice {
+  cue: number;         // outgoing time the mix starts (a downbeat)
+  inStart: number;     // incoming time the mix starts from (a downbeat)
+  plan: TransitionPlan;
+  exitShift: number;   // s earlier than the default exit (negative: later)
+  startShift: number;  // s later than the default start
+  changed: boolean;    // differs from the default pair
+  reason: string;
+}
+
+// Bars of a `bars`-long mix in which both songs are singing at the same time.
+export function sharedVocalBars(
+  out: TrackShape, inn: TrackShape, match: TempoMatch, bars: number, cue: number, inStart: number,
+): number {
+  if (!out.bpm || !(bars > 0)) return 0;
+  const bar = 240 / out.bpm;
+  let n = 0;
+  for (let k = 0; k < bars; k++) {
+    const o = barValue(out, out.barVocal, cue + (k + 0.5) * bar) ?? 0;
+    const i = barValue(inn, inn.barVocal, inStart + (k + 0.5) * bar * match.rate) ?? 0;
+    if (o >= VOCAL_ON && i >= VOCAL_ON) n++;
+  }
+  return n;
+}
+
+// Downbeats on the song's 4-bar grid, counted from its intro end, in [from, to].
+function phraseLines(shape: TrackShape, from: number, to: number): number[] {
+  const d = shape.downbeats;
+  if (!d?.length) return [];
+  const origin = Math.max(0, barIndexAt(d, shape.introEnd ?? d[0]!));
+  const lines: number[] = [];
+  for (let i = 0; i < d.length; i++) {
+    const t = d[i]!;
+    if (t > to) break;
+    if (t >= from && (((i - origin) % 4) + 4) % 4 === 0) lines.push(t);
+  }
+  return lines;
+}
+
+interface Candidate {
+  cue: number;
+  inStart: number;
+  plan: TransitionPlan;
+  clash: number;
+  good: boolean;
+}
+
+function evaluate(
+  out: TrackShape, inn: TrackShape, match: TempoMatch, cue: number, inStart: number,
+): Candidate {
+  const plan = planTransition(out, inn, match, cue, inStart);
+  const clash = sharedVocalBars(out, inn, match, plan.bars ?? 0, cue, inStart);
+  return { cue, inStart, plan, clash, good: (plan.bars ?? 0) >= 4 && clash === 0 };
+}
+
+// Lower is better for plans that are not good: hard cuts first, then shared vocals.
+function badness(c: Candidate): number {
+  const bars = c.plan.bars ?? 0;
+  return (bars <= 2 ? 1000 : 0) + c.clash * 100 - bars;
+}
+
+// The planner above judges one exit and one start. Real pairs often fail on
+// that single choice: the outgoing song is still singing at its usual exit, or
+// the incoming one sings from its first bar, which forces a 1-2 bar cut or a
+// vocal clash. This tries other exits (4-bar lines within MAX_EXIT_SHIFT of the
+// default) and other starts (4-bar lines up to the incoming bass entry, at most
+// MAX_START_SHIFT later), keeps the default whenever it is already good, and
+// otherwise takes the good plan that moves things the least. If nothing is
+// better, the default stays.
+export function chooseTransition(
+  out: TrackShape | null,
+  inn: TrackShape | null,
+  match: TempoMatch | null,
+  defaultCue: number,
+  defaultStart: number,
+): TransitionChoice {
+  const keep = (plan: TransitionPlan): TransitionChoice => ({
+    cue: defaultCue, inStart: defaultStart, plan, exitShift: 0, startShift: 0, changed: false, reason: "default",
+  });
+  if (!out || !inn || !match || !out.bpm || !out.downbeats?.length || !inn.downbeats?.length) {
+    return keep(planTransition(out, inn, match, defaultCue, defaultStart));
+  }
+  const base = evaluate(out, inn, match, defaultCue, defaultStart);
+  if (base.good) return keep(base.plan);
+
+  const bar = 240 / out.bpm;
+  const outEnd = out.outroEnd && out.outroEnd > defaultCue - MAX_EXIT_SHIFT ? out.outroEnd : out.duration;
+  const cueFrom = Math.max(out.duration / 2, defaultCue - MAX_EXIT_SHIFT);
+  const cueTo = Math.min(defaultCue + MAX_EXIT_SHIFT, outEnd - 2 * bar);
+  const cues = [...new Set([defaultCue, ...phraseLines(out, cueFrom, cueTo)])]
+    .sort((a, b) => Math.abs(a - defaultCue) - Math.abs(b - defaultCue))
+    .slice(0, MAX_CUE_CANDIDATES);
+
+  const startTo = Math.min(inn.introEnd ?? defaultStart, defaultStart + MAX_START_SHIFT);
+  const starts = [...new Set([defaultStart, ...phraseLines(inn, defaultStart, startTo)])]
+    .sort((a, b) => a - b)
+    .slice(0, MAX_START_CANDIDATES);
+
+  let best: Candidate | null = null, bestCost = Infinity;
+  let fallback: Candidate = base;
+  for (const cue of cues) {
+    for (const inStart of starts) {
+      const c = evaluate(out, inn, match, cue, inStart);
+      if (c.good) {
+        // Moving the exit costs a second per second; skipping intro costs half that;
+        // among equals, the longer blend.
+        const cost = Math.abs(cue - defaultCue) + 0.5 * (inStart - defaultStart) - 0.01 * (c.plan.bars ?? 0);
+        if (cost < bestCost) { best = c; bestCost = cost; }
+      } else if (badness(c) < badness(fallback)) {
+        fallback = c;
+      }
+    }
+  }
+  const pick = best ?? (fallback !== base ? fallback : null);
+  if (!pick) return keep(base.plan);
+
+  const exitShift = defaultCue - pick.cue;
+  const startShift = pick.inStart - defaultStart;
+  const parts: string[] = [];
+  if (Math.abs(exitShift) > 0.05) parts.push(`exit ${Math.abs(exitShift).toFixed(1)} s ${exitShift > 0 ? "earlier" : "later"}`);
+  if (startShift > 0.05) parts.push(`start ${startShift.toFixed(1)} s in`);
+  parts.push(pick.good ? "no shared vocals" : "least-bad option");
+  return {
+    cue: pick.cue, inStart: pick.inStart, plan: pick.plan, exitShift, startShift,
+    changed: pick.cue !== defaultCue || pick.inStart !== defaultStart,
+    reason: parts.join(", "),
+  };
+}
+
 // Last downbeat at or before `t` (the start of the phrase to mix out on).
 export function downbeatAtOrBefore(downbeats: number[], t: number): number | null {
   let best: number | null = null;
