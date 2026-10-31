@@ -4,12 +4,12 @@ import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
   tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
-  downbeatAtOrBefore, phaseError,
+  downbeatAtOrBefore, phaseError, chooseTransition,
 } from "@/lib/dj";
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import styles from "./NowPlaying.module.css";
-import type { TrackShape } from "@/lib/dj";
+import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
 interface Props {
   song: SubsonicSong | null;
@@ -153,6 +153,8 @@ export function NowPlaying({
   const seekRef = useRef<{ timer: number; target: number; deck: Deck } | null>(null);
   const skipTimerRef = useRef<number | null>(null);   // a fade-out before a manual skip loads
   const preloadRef = useRef<Preload | null>(null);
+  // The exit and start points chosen for the current pair of songs (see transitionChoice).
+  const choiceRef = useRef<{ key: string; choice: TransitionChoice | null } | null>(null);
   const crossfadeStartedRef = useRef(false);
   const currentDetailRef = useRef<AutoMixTrackDetail | null>(null);
   const nextDetailRef = useRef<AutoMixTrackDetail | null>(null);
@@ -184,6 +186,7 @@ export function NowPlaying({
 
   useEffect(() => {
     currentDetailRef.current = null;
+    choiceRef.current = null;
     if (!serverTrack) return;
     let alive = true;
     getAutoMixTrack(serverTrack.id).then((d) => { if (alive) currentDetailRef.current = d; });
@@ -192,6 +195,7 @@ export function NowPlaying({
 
   useEffect(() => {
     nextDetailRef.current = null;
+    choiceRef.current = null;
     if (!serverNextTrack) return;
     let alive = true;
     getAutoMixTrack(serverNextTrack.id).then((d) => { if (alive) nextDetailRef.current = d; });
@@ -451,7 +455,12 @@ export function NowPlaying({
     const { serverNextTrack: track } = liveRef.current;
     const detail = track && nextDetailRef.current?.id === track.id ? nextDetailRef.current : null;
     const first = detail?.downbeats?.[0] ?? null;
-    const anchor = first !== null && first <= MAX_INTRO_CUE ? first : null;
+    const defaultAnchor = first !== null && first <= MAX_INTRO_CUE ? first : null;
+    // The pair's exit and start are settled here, so the cue, this preload and
+    // the plan all use the same points.
+    const active = getActiveAudio();
+    const choice = active ? transitionChoice(active, true) : null;
+    const anchor = choice ? choice.inStart : defaultAnchor;
 
     audio.pause();
     audio.preload = "auto";
@@ -467,8 +476,51 @@ export function NowPlaying({
     preloadRef.current = { songId: next.id, deck, anchor };
   }
 
-  // Where the outgoing track should start mixing out, in its own time.
+  // Where the outgoing track starts mixing out, in its own time: the exit
+  // chosen for this pair, else the default one.
   function cueOutFor(audio: HTMLAudioElement): { at: number; onDownbeat: boolean } {
+    const choice = transitionChoice(audio, false);
+    return choice ? { at: choice.cue, onDownbeat: true } : defaultCueOut(audio);
+  }
+
+  // Exit and start points for the current song and the next, chosen once per
+  // pair (chooseTransition tries other exits and starts when the default would
+  // be a hard cut or put two vocals on top of each other). `lock`: the choice
+  // is being acted on (preload). If the beat grids haven't loaded by then, the
+  // pair stays on the defaults rather than changing its mind half way.
+  function transitionChoice(audio: HTMLAudioElement, lock: boolean): TransitionChoice | null {
+    const { serverTrack: outTrack, serverNextTrack: inTrack, effectiveBpm: outBpm, effectiveNextBpm: inBpm } = liveRef.current;
+    if (!outTrack || !inTrack || !isFinite(audio.duration)) return null; // nothing to decide yet: cache nothing
+    const key = `${outTrack.id}>${inTrack.id}`;
+    if (choiceRef.current?.key === key) return choiceRef.current.choice;
+
+    const outDetail = currentDetailRef.current?.id === outTrack.id ? currentDetailRef.current : null;
+    const inDetail = nextDetailRef.current?.id === inTrack.id ? nextDetailRef.current : null;
+    if (!outDetail || !inDetail) {
+      if (lock) choiceRef.current = { key, choice: null };
+      return null;
+    }
+    let choice: TransitionChoice | null = null;
+    const match = outBpm && inBpm ? tempoMatch(outBpm, inBpm) : null;
+    const first = inDetail.downbeats?.[0];
+    const def = defaultCueOut(audio);
+    if (match && outBpm && inBpm && def.onDownbeat && first !== undefined && first <= MAX_INTRO_CUE
+        && inTrack.confidence >= MIN_CONFIDENCE) {
+      const c = chooseTransition(
+        shapeOf(outTrack, outDetail, outBpm, audio.duration),
+        shapeOf(inTrack, inDetail, inBpm, NaN),
+        match, def.at, first,
+      );
+      console.info("[brook] transition choice", c.changed ? c : "default kept");
+      // An exit that is already behind the playhead (seeked near the end) is no use.
+      if (c.changed && c.cue > audio.currentTime + 1) choice = c;
+    }
+    choiceRef.current = { key, choice };
+    return choice;
+  }
+
+  // The default exit: the server's phrase-aligned cue.
+  function defaultCueOut(audio: HTMLAudioElement): { at: number; onDownbeat: boolean } {
     const { serverTrack: track, effectiveBpm: bpm } = liveRef.current;
     // The server's mix_out_point is phrase-aligned and leaves room for a
     // mix; the transition planner decides how long the mix is from there.
@@ -499,11 +551,12 @@ export function NowPlaying({
       const next = nextSongRef.current;
       if (crossfadeStartedRef.current || !next) return;
 
-      const cue = cueOutFor(audio);
+      let cue = cueOutFor(audio);
       const remaining = audio.duration - audio.currentTime;
 
       if (audio.currentTime >= cue.at - PRELOAD_LEAD && preloadRef.current?.songId !== next.id) {
         preload(next);
+        cue = cueOutFor(audio); // preloading settles the pair's choice, which can move the exit
       }
 
       if (audio.currentTime >= cue.at - SCHEDULE_LEAD && remaining > 0) {

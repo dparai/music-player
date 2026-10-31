@@ -49,6 +49,7 @@ Tap **Crossfade** and Brook doesn't just play the next song — it **mixes** it 
 - **Beat Sync** — the mix starts exactly on a downbeat, the incoming song is tempo-matched (up to ±6%, pitch preserved) and phase-locked to the outgoing beat (within ~10 ms), then eases back to its own tempo
 - **Camelot Wheel** — picks the next song in a harmonically compatible key (so transitions sound musical, not jarring)
 - **Adaptive Transitions** — every mix is planned for the two songs: as long as the incoming intro (1 to 32 bars), shorter when both songs are loud, cut before two vocals would overlap, never into silence. The screen shows the plan while mixing (`MIX 8 BARS`)
+- **Smart Exit and Entry Points** — if the usual exit would force a hard cut or put two singers on top of each other, Brook tries other phrase boundaries (up to 16 s earlier or later on the outgoing song, up to 16 s into the incoming one's intro) and picks the cleanest. On a 170-song library this took the share of clean transitions from about 68% to 96%
 - **Bass Swap** — only one bassline at a time: the bass changes hands in one bar, exactly when the incoming song's bass comes in. No mud, no bass hole
 - **Outro Cues** — the server finds where each song's outro starts (within its last 40 s) and mixes there, not in a bridge or "15 s before the end"
 - **Loudness Levelling** — every song trimmed to about −14 LUFS, plus a master limiter, so volume doesn't jump between songs
@@ -81,6 +82,9 @@ Incoming song:                  | INTRO (no bass) ░░░░░░░| MAIN �
 Mix length: incoming intro length, capped by the outgoing outro,
             shorter if both are loud or two vocals would overlap,
             snapped to 1 / 2 / 4 / 8 / 16 / 32 bars
+Exit/entry: kept as is when that plan is already clean (4+ bars, no shared
+            vocals); otherwise other 4-bar phrase lines are tried and the
+            clean plan that moves things least wins
 ```
 
 ### Dual Deck Architecture

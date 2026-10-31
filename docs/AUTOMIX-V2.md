@@ -34,11 +34,12 @@ Graph per deck:
 1. **Preload** the next song on the idle deck 30 s before the cue, seeked to its first downbeat.
 2. **Cue** = the server's `mix_out_point` or `duration − fade`, whichever is earlier, snapped to the last downbeat before it.
 3. **Start exactly on the downbeat:** the 200 ms poll arms a `setTimeout` for the precise moment.
-4. **Fade length is planned per pair** (`planTransition`): the incoming intro length (min 4 bars, 8 if unknown), capped by the outgoing audio left, 32 bars and 45 s; at most 8 bars when both are loud; ended before overlapping vocals; snapped to 1/2/4/8/16/32 bars. The bass swap and fader crossover land where the incoming bass enters. The server provides `intro_end`, `outro_end` and per-bar energy/bass/vocal arrays; vocals come from Demucs source separation (analysis v4), with a REPET heuristic as fallback.
-5. **Curves** run on the audio thread (`setValueCurveAtTime`): equal-power faders plus a **one-bar bass swap** in the middle. The shelf offsets the fader, so bass power stays at 0.0 dB the whole time (the old fade dipped to −20 dB).
-6. **Phase lock** every 100 ms: compare beat phases. If off by more than 80 ms, jump into phase; if off by more than 5 ms, nudge `playbackRate` by up to ±2%.
-7. **Tempo** match up to ±6% with `preservesPitch`, then ease back to 1.0 over 4 bars (no audible snap).
-8. **Pause mid-mix** suspends the AudioContext, so the curves freeze and resume where they stopped.
+4. **Exit and entry points are chosen per pair** (`chooseTransition`): when the default plan would be a hard cut or have a bar where both songs sing, other 4-bar phrase lines (exit within 16 s of the default, start up to 16 s into the incoming intro) are tried and the cleanest plan wins; clean defaults are left alone.
+5. **Fade length is planned per pair** (`planTransition`): the incoming intro length (min 4 bars, 8 if unknown), capped by the outgoing audio left, 32 bars and 45 s; at most 8 bars when both are loud; ended before overlapping vocals; snapped to 1/2/4/8/16/32 bars. The bass swap and fader crossover land where the incoming bass enters. The server provides `intro_end`, `outro_end` and per-bar energy/bass/vocal arrays; vocals come from Demucs source separation (analysis v4), with a REPET heuristic as fallback.
+6. **Curves** run on the audio thread (`setValueCurveAtTime`): equal-power faders plus a **one-bar bass swap** in the middle. The shelf offsets the fader, so bass power stays at 0.0 dB the whole time (the old fade dipped to −20 dB).
+7. **Phase lock** every 100 ms: compare beat phases. If off by more than 80 ms, jump into phase; if off by more than 5 ms, nudge `playbackRate` by up to ±2%.
+8. **Tempo** match up to ±6% with `preservesPitch`, then ease back to 1.0 over 4 bars (no audible snap).
+9. **Pause mid-mix** suspends the AudioContext, so the curves freeze and resume where they stopped.
 
 Falls back to an unsynced crossfade when either track lacks a confident grid, tempos are more than 6% apart, or the user seeks.
 
@@ -68,7 +69,7 @@ Ops:
 
 ## Rollout
 
-1. ✅ Browser engine (this repo).
-2. Deploy `server/automix/` (analysis v2, Navidrome IDs, auth, cron): see `server/automix/README.md`. Re-analyse the library once.
-3. Point `pickNextDJ` at server key/BPM; retire `/api/analysis.json`.
-4. Layer 3 render endpoint, then the clip playback path in the PWA.
+10. ✅ Browser engine (this repo).
+11. Deploy `server/automix/` (analysis v2, Navidrome IDs, auth, cron): see `server/automix/README.md`. Re-analyse the library once.
+12. Point `pickNextDJ` at server key/BPM; retire `/api/analysis.json`.
+13. Layer 3 render endpoint, then the clip playback path in the PWA.
