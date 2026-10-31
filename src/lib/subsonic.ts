@@ -121,6 +121,27 @@ export async function getAllSongs(creds: SubsonicCredentials): Promise<SubsonicS
   return songs;
 }
 
+interface StructuredLyrics {
+  synced: boolean;
+  line: { start?: number; value: string }[]; // start in milliseconds
+}
+
+// OpenSubsonic: lyrics from the file's tags or a sidecar. Throws if the server lacks the endpoint.
+export async function getStructuredLyrics(creds: SubsonicCredentials, songId: string): Promise<StructuredLyrics[]> {
+  const data = await fetchApi<{ lyricsList?: { structuredLyrics?: StructuredLyrics[] } }>(
+    creds,
+    "getLyricsBySongId",
+    { id: songId },
+  );
+  return data.lyricsList?.structuredLyrics ?? [];
+}
+
+// Classic Subsonic getLyrics: plain text (or LRC) matched by artist and title.
+export async function getPlainLyrics(creds: SubsonicCredentials, artist: string, title: string): Promise<string> {
+  const data = await fetchApi<{ lyrics?: { value?: string } }>(creds, "getLyrics", { artist, title });
+  return data.lyrics?.value ?? "";
+}
+
 export function streamUrl(creds: SubsonicCredentials, songId: string): string {
   return apiUrl(creds, "stream", { id: songId });
 }

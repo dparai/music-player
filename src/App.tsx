@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
-import { getAllSongs, fetchAnalysis, lookupAnalysis } from "@/lib/subsonic";
+import { getAllSongs, fetchAnalysis, lookupAnalysis, coverArtUrl } from "@/lib/subsonic";
+import { useAlbumAccent } from "@/lib/albumAccent";
 import { pickNextDJ } from "@/lib/dj";
 import type { AutoMixTrack } from "@/lib/automix";
 import { getAutoMixTracks, findAutoMixTrack } from "@/lib/automix";
@@ -153,6 +154,10 @@ export function App() {
     return () => window.removeEventListener("brook-logout", onLogout);
   }, []);
 
+  const accentStyle = useAlbumAccent(
+    creds && currentSong?.coverArt ? coverArtUrl(creds, currentSong.coverArt, "64") : null,
+  );
+
   function handleLogin(c: SubsonicCredentials) {
     saveCredentials(c);
     setCreds(c);
@@ -249,13 +254,20 @@ export function App() {
   if (!creds) return <Login onLogin={handleLogin} />;
 
   return (
-    <div className={styles.layout}>
+    <div className={styles.layout} style={accentStyle}>
       <main className={styles.main}>
         {loading ? (
-          <p className={styles.loading}>Loading your library...</p>
+          <div className={styles.loading} role="status" aria-label="Loading your library">
+            {Array.from({ length: 8 }, (_, i) => (
+              <div key={i} className={styles.skeletonRow}>
+                <span className={styles.skeletonArt} />
+                <span className={styles.skeletonLines}><span /><span /></span>
+              </div>
+            ))}
+          </div>
         ) : (
           <>
-            <div className={styles.view} style={{ display: view === "nowplaying" ? "flex" : "none" }}>
+            <div className={`${styles.view} ${styles.viewNow}`} style={{ display: view === "nowplaying" ? "flex" : "none" }}>
               <NowPlaying
                 song={currentSong}
                 creds={creds}
@@ -274,7 +286,7 @@ export function App() {
                 autoMixTracks={autoMixTracks}
               />
             </div>
-            <div className={styles.view} style={{ display: view === "library" ? "flex" : "none" }}>
+            <div className={`${styles.view} ${styles.viewLib}`} style={{ display: view === "library" ? "flex" : "none" }}>
               <Library
                 songs={songs}
                 creds={creds}

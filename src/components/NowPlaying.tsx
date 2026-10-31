@@ -8,6 +8,9 @@ import {
 } from "@/lib/dj";
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
+import { PlayIcon, PauseIcon, PrevIcon, NextIcon, ShuffleIcon, MixIcon, NoteIcon, LyricsIcon } from "./icons";
+import { LyricsView } from "./LyricsView";
+import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
 import styles from "./NowPlaying.module.css";
 import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
@@ -139,6 +142,8 @@ export function NowPlaying({
   const [crossfading, setCrossfading] = useState(false);
   const [mixLabel, setMixLabel] = useState("CROSSFADING");
   const waveformRef = useRef<HTMLDivElement>(null);
+  const [mixZone, setMixZone] = useState<{ start: number; end: number } | null>(null);
+  const [scrub, setScrub] = useState<number | null>(null); // seconds, while the thumb is being dragged
   const lastSongIdRef = useRef<string | null>(null);
   const skipNextLoadRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -387,10 +392,6 @@ export function NowPlaying({
     } catch {}
     audio.src = url;
   }
-
-  const waveformBars = useMemo(() => {
-    return Array.from({ length: 60 }, () => 10 + Math.random() * 35);
-  }, [song?.id]);
 
   useEffect(() => {
     if (!song) return;
@@ -837,6 +838,13 @@ export function NowPlaying({
     const audio = getActiveAudio();
     if (audio) {
       setCurrentTime(audio.currentTime);
+      if (djMode && nextSongRef.current && isFinite(audio.duration)) {
+        const start = cueOutFor(audio).at;
+        const end = Math.min(audio.duration, start + fadeDurationFor(liveRef.current.effectiveBpm));
+        setMixZone((z) => (z && Math.abs(z.start - start) < 0.05 && Math.abs(z.end - end) < 0.05 ? z : { start, end }));
+      } else {
+        setMixZone((z) => (z ? null : z));
+      }
       if (onPlayingChangeRef.current && audio.duration > 0) {
         onPlayingChangeRef.current(!audio.paused, audio.currentTime / audio.duration);
       }
@@ -848,12 +856,16 @@ export function NowPlaying({
     if (audio) setDuration(audio.duration);
   }
 
-  function handleWaveformClick(e: React.MouseEvent) {
-    const audio = getActiveAudio();
+  function ratioFromPointer(e: React.PointerEvent): number {
     const el = waveformRef.current;
-    if (!audio || !el) return;
+    if (!el) return 0;
     const rect = el.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  }
+
+  function seekToRatio(ratio: number) {
+    const audio = getActiveAudio();
+    if (!audio || !(duration > 0)) return;
     if (fadeRef.current) fadeRef.current.sync = null; // a seek breaks the beat alignment
     const target = ratio * duration;
     if (!fadeRef.current && !audio.paused && !pauseTimerRef.current && rampActiveFader(0, FADE_SEEK_OUT_S)) {
@@ -906,11 +918,40 @@ export function NowPlaying({
     onNextRef.current();
   }
 
-  const progress = duration > 0 ? currentTime / duration : 0;
   const coverSrc = useMemo(
     () => song?.coverArt ? coverArtUrl(creds, song.coverArt, "512") : null,
     [song?.id, song?.coverArt, creds],
   );
+
+  // Keep the previous cover under the new one so the backdrop crossfades.
+  const [bg, setBg] = useState<{ cur: string | null; prev: string | null }>({ cur: coverSrc, prev: null });
+  useEffect(() => {
+    setBg((b) => (b.cur === coverSrc ? b : { cur: coverSrc, prev: b.cur }));
+  }, [coverSrc]);
+
+  // Lyrics are fetched on first open, then on every song change while the panel is open.
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const [lyricsSeen, setLyricsSeen] = useState(false);
+  const [lyricsState, setLyricsState] = useState<{ status: "loading" | "ready" | "none" | "error"; data: Lyrics | null }>(
+    { status: "none", data: null },
+  );
+  const [lyricsTry, setLyricsTry] = useState(0);
+  useEffect(() => {
+    if (lyricsOpen) setLyricsSeen(true);
+  }, [lyricsOpen]);
+  useEffect(() => {
+    if (!lyricsOpen || !song) return;
+    let alive = true;
+    setLyricsState({ status: "loading", data: null });
+    fetchLyrics(creds, song).then((r) => {
+      if (!alive) return;
+      setLyricsState(
+        r.lyrics ? { status: "ready", data: r.lyrics }
+          : { status: r.error ? "error" : "none", data: null },
+      );
+    });
+    return () => { alive = false; };
+  }, [lyricsOpen, song?.id, creds, lyricsTry]);
 
   // The decks stay mounted even with no song: they are wired into the
   // AudioContext once, and a remounted element would play outside the graph.
@@ -939,94 +980,167 @@ export function NowPlaying({
     return (
       <div className={styles.empty}>
         {decks}
-        <div className={styles.emptyIcon}>&#9835;</div>
-        <p className={styles.emptyText}>No song playing</p>
-        <p className={styles.emptyHint}>Go to Library and pick a song</p>
+        <div className={styles.emptyIcon}><NoteIcon size={40} /></div>
+        <p className={styles.emptyText}>Nothing playing yet</p>
+        <p className={styles.emptyHint}>Open your library and pick a song.</p>
       </div>
     );
+  }
+
+  const shownTime = scrub ?? currentTime;
+  const pct = duration > 0 ? Math.min(1, shownTime / duration) : 0;
+  // Where the next crossfade will happen, as fractions of the track (DJ mode only).
+  const zone = djMode && mixZone && duration > 0
+    ? {
+        s: Math.min(1, mixZone.start / duration),
+        w: Math.max(0, Math.min(1, mixZone.end / duration) - Math.min(1, mixZone.start / duration)),
+        inside: currentTime >= mixZone.start && currentTime < mixZone.end,
+      }
+    : null;
+  const key = serverTrack?.key ?? analysis?.key;
+  const chips = [
+    song.suffix?.toUpperCase(),
+    song.bitRate ? `${song.bitRate} kbps` : null,
+    effectiveBpm ? `${Math.round(effectiveBpm)} BPM` : null,
+    key ?? null,
+  ].filter(Boolean) as string[];
+
+  function onSeekKey(e: React.KeyboardEvent) {
+    if (!(duration > 0)) return;
+    const step = e.key === "ArrowLeft" || e.key === "ArrowDown" ? -5
+      : e.key === "ArrowRight" || e.key === "ArrowUp" ? 5 : 0;
+    if (step) {
+      e.preventDefault();
+      seekToRatio(Math.max(0, Math.min(1, (currentTime + step) / duration)));
+    } else if (e.key === "Home") { e.preventDefault(); seekToRatio(0); }
+    else if (e.key === "End") { e.preventDefault(); seekToRatio(0.999); }
   }
 
   return (
     <div className={styles.container}>
       {decks}
-      {coverSrc && <div className={styles.bgBlur} style={{ backgroundImage: `url(${coverSrc})` }} />}
+      {bg.prev && <div className={styles.bgBlur} style={{ backgroundImage: `url(${bg.prev})` }} />}
+      {bg.cur && <div key={bg.cur} className={`${styles.bgBlur} ${styles.bgFade}`} style={{ backgroundImage: `url(${bg.cur})` }} />}
       <div className={styles.bgOverlay} />
 
       <div className={styles.player}>
-        <div className={styles.coverWrap}>
-          {coverSrc ? (
-            <img className={styles.cover} src={coverSrc} alt="" />
-          ) : (
-            <div className={styles.coverPlaceholder}>&#9835;</div>
-          )}
-          {coverSrc && <div className={styles.coverGlow} style={{ backgroundImage: `url(${coverSrc})` }} />}
+        <div className={`${styles.coverCollapse} ${lyricsOpen ? styles.collapsed : ""}`} aria-hidden={lyricsOpen}>
+          <div className={styles.coverInner}>
+            <div className={styles.coverWrap}>
+              {coverSrc ? (
+                <img key={coverSrc} className={styles.cover} src={coverSrc} alt={`Cover of ${song.album ?? song.title}`} />
+              ) : (
+                <div className={styles.coverPlaceholder}><NoteIcon size={64} /></div>
+              )}
+            </div>
+          </div>
         </div>
 
-        <div className={styles.songInfo}>
-          <div className={styles.titlePill}>{song.title}</div>
-          <div className={styles.albumPill}>{song.album ?? "Unknown"}</div>
-          <div className={styles.artist}>{song.artist ?? "Unknown"}</div>
+        <div className={styles.songRow}>
+          <div className={styles.songInfo}>
+            <h2 className={styles.title}>{song.title}</h2>
+            <p className={styles.artist}>{song.artist ?? "Unknown artist"}</p>
+            {song.album && <p className={styles.album}>{song.album}</p>}
+          </div>
+          <button
+            className={`${styles.lyricsBtn} ${lyricsOpen ? styles.lyricsBtnOn : ""}`}
+            onClick={() => setLyricsOpen((o) => !o)}
+            aria-pressed={lyricsOpen}
+            aria-label="Lyrics"
+          >
+            <LyricsIcon size={22} />
+          </button>
         </div>
 
-        <div className={styles.waveformWrap} ref={waveformRef} onClick={handleWaveformClick}>
-          {waveformBars.map((h, i) => (
-            <div
-              key={i}
-              className={`${styles.bar} ${i / waveformBars.length < progress ? styles.barPast : styles.barFuture}`}
-              style={{ height: `${h}px` }}
+        <div className={`${styles.lyricsWrap} ${lyricsOpen ? styles.lyricsOpen : ""}`} aria-hidden={!lyricsOpen}>
+          {lyricsSeen && (
+            <LyricsView
+              status={lyricsState.status}
+              lyrics={lyricsState.data}
+              time={currentTime}
+              open={lyricsOpen}
+              onRetry={() => setLyricsTry((n) => n + 1)}
+              onSeek={(s) => seekToRatio(s / duration)}
             />
-          ))}
+          )}
         </div>
 
-        <div className={styles.timeRow}>
-          <span>{formatTime(currentTime)}</span>
-          <span>
-            {crossfading && <span className={styles.crossfadeLabel}>{mixLabel}</span>}
-            {formatTime(duration)}
-          </span>
+        <div className={styles.seekBlock}>
+          <div
+            className={`${styles.seek} ${scrub !== null ? styles.seeking : ""}`}
+            ref={waveformRef}
+            role="slider"
+            tabIndex={0}
+            aria-label="Seek"
+            aria-valuemin={0}
+            aria-valuemax={Math.round(duration) || 0}
+            aria-valuenow={Math.round(shownTime)}
+            aria-valuetext={`${formatTime(shownTime)} of ${formatTime(duration)}`}
+            style={{ "--p": pct } as React.CSSProperties}
+            onPointerDown={(e) => {
+              if (!(duration > 0)) return;
+              e.currentTarget.setPointerCapture(e.pointerId);
+              setScrub(ratioFromPointer(e) * duration);
+            }}
+            onPointerMove={(e) => { if (scrub !== null) setScrub(ratioFromPointer(e) * duration); }}
+            onPointerUp={(e) => {
+              if (scrub === null) return;
+              seekToRatio(ratioFromPointer(e));
+              setScrub(null);
+            }}
+            onPointerCancel={() => setScrub(null)}
+            onKeyDown={onSeekKey}
+          >
+            <div className={styles.seekTrack}>
+              <div className={styles.seekFill} />
+              {zone && <div className={styles.mixZone} style={{ left: `${zone.s * 100}%`, width: `${zone.w * 100}%` }} />}
+            </div>
+            {zone && (
+              <span className={styles.mixTag} style={{ left: `${zone.s * 100}%` }}>
+                {zone.inside ? "mixing" : "mix"}
+              </span>
+            )}
+            <div className={styles.seekThumb} />
+            <div className={styles.seekBubble}>{formatTime(shownTime)}</div>
+          </div>
+          <div className={styles.timeRow}>
+            <span>{formatTime(shownTime)}</span>
+            {crossfading && <span className={styles.mixChip}><i />{mixLabel}</span>}
+            <span>{formatTime(duration)}</span>
+          </div>
         </div>
 
         <div className={styles.controls}>
-          <button className={styles.ctrlSide} onClick={onPrev} aria-label="Previous">&#9198;</button>
-          <button className={styles.ctrlPlay} onClick={togglePlay} aria-label={playing ? "Pause" : "Play"}>
-            {playing ? (
-              <span className={styles.pauseIcon}>
-                <span /><span />
-              </span>
-            ) : "▶"}
-          </button>
-          <button className={styles.ctrlSide} onClick={onNext} aria-label="Next">&#9197;</button>
-        </div>
-
-        <div className={styles.extras}>
           <button
-            className={`${styles.djToggle} ${djMode ? styles.djActive : ""}`}
+            className={`${styles.toggle} ${djMode ? styles.toggleOn : ""}`}
             onClick={onDjModeToggle}
             aria-pressed={djMode}
           >
-            Crossfade
+            <MixIcon size={22} />
+            <span>Crossfade</span>
           </button>
+          <button className={styles.ctrlSide} onClick={onPrev} aria-label="Previous"><PrevIcon size={30} /></button>
+          <button className={styles.ctrlPlay} onClick={togglePlay} aria-label={playing ? "Pause" : "Play"}>
+            {playing ? <PauseIcon size={32} /> : <PlayIcon size={32} />}
+          </button>
+          <button className={styles.ctrlSide} onClick={onNext} aria-label="Next"><NextIcon size={30} /></button>
           <button
-            className={`${styles.shuffleToggle} ${shuffled ? styles.shuffleActive : ""}`}
+            className={`${styles.toggle} ${shuffled ? styles.toggleOn : ""}`}
             onClick={onShuffleToggle}
+            aria-pressed={shuffled}
           >
-            Shuffle
+            <ShuffleIcon size={22} />
+            <span>Shuffle</span>
           </button>
         </div>
 
-        <div className={styles.quality}>
-          {song.suffix?.toUpperCase() ?? "MP3"} &middot; {song.bitRate ? `${song.bitRate} KBPS` : ""}
-          {effectiveBpm && (
-            <> &middot; {Math.round(effectiveBpm)} BPM</>
-          )}
-          {(serverTrack?.key ?? analysis?.key) && (
-            <> &middot; {serverTrack?.key ?? analysis?.key}</>
-          )}
-          {serverTrack && (
-            <> &middot; v2</>
-          )}
-        </div>
       </div>
+
+      {chips.length > 0 && (
+        <ul className={styles.chips}>
+          {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
+        </ul>
+      )}
     </div>
   );
 }

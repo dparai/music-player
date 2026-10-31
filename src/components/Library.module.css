@@ -1,7 +1,9 @@
 .wrapper {
+  position: relative;
   display: flex;
   flex-direction: column;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -9,25 +11,29 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 16px 8px;
+  padding: calc(16px + var(--safe-top)) 20px 8px;
   flex-shrink: 0;
 }
 
 .title {
-  font-size: 22px;
+  font-size: 28px;
   font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 .logoutBtn {
-  font-size: 13px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--text-dim);
-  padding: 6px 12px;
-  border-radius: var(--radius-sm);
-  transition: background 0.1s;
+  border-radius: 50%;
+  transition: background 0.15s, color 0.15s;
 }
 
 .logoutBtn:hover {
-  background: var(--bg-input);
+  background: var(--surface);
   color: var(--text);
 }
 
@@ -38,18 +44,35 @@
   flex-shrink: 0;
 }
 
-.search {
+.searchBox {
   flex: 1;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 14px;
-  font-size: 15px;
-  color: var(--text);
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  height: 46px;
+  border-radius: 14px;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  transition: border-color 0.15s;
 }
 
-.search:focus {
+.searchBox:focus-within {
   border-color: var(--accent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 0;
+}
+
+.search {
+  flex: 1;
+  min-width: 0;
+  font-size: 16px;
+  color: var(--text);
+  outline: none;
 }
 
 .search::placeholder {
@@ -57,25 +80,47 @@
 }
 
 .sort {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  height: 46px;
+  padding: 0 12px;
   font-size: 14px;
   color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  border-radius: 14px;
   cursor: pointer;
 }
 
+.sort option {
+  background: #14141c;
+  color: var(--text);
+}
+
 .count {
-  padding: 0 16px 8px;
+  padding: 0 20px 8px;
   font-size: 13px;
   color: var(--text-dim);
   flex-shrink: 0;
 }
 
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 15px;
+  text-align: center;
+  padding: 24px;
+}
+
 .list {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 0 8px;
 }
 
@@ -87,19 +132,14 @@
 
 .letterBadge {
   position: absolute;
-  left: 4px;
+  left: 6px;
   top: 50%;
   transform: translateY(-50%);
   width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  background: var(--accent);
-  color: white;
-  font-size: 11px;
+  text-align: center;
+  font-size: 12px;
   font-weight: 700;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  color: var(--accent);
   z-index: 1;
 }
 
@@ -108,40 +148,41 @@
   align-items: center;
   gap: 12px;
   flex: 1;
-  padding: 8px 8px 8px 32px;
+  min-height: 56px;
+  padding: 6px 8px 6px 34px;
   border-radius: var(--radius-sm);
   text-align: left;
-  transition: background 0.1s;
+  transition: background 0.12s;
   min-width: 0;
 }
 
 .row:hover {
-  background: var(--bg-card);
+  background: var(--surface);
 }
 
 .active {
-  background: var(--bg-card);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
 }
 
-.cover {
-  width: 44px;
-  height: 44px;
-  border-radius: 6px;
+.active .songTitle {
+  color: var(--accent);
+}
+
+.cover,
+.coverPlaceholder {
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
   object-fit: cover;
   flex-shrink: 0;
 }
 
 .coverPlaceholder {
-  width: 44px;
-  height: 44px;
-  border-radius: 6px;
-  background: var(--bg-input);
+  background: var(--surface);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
   color: var(--text-dim);
-  flex-shrink: 0;
 }
 
 .info {
@@ -173,61 +214,76 @@
   color: var(--text-dim);
   flex-shrink: 0;
   margin-right: 2px;
+  font-variant-numeric: tabular-nums;
 }
 
 .moreBtn {
-  font-size: 20px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--text-dim);
-  padding: 8px;
   flex-shrink: 0;
-  transition: color 0.15s;
+  border-radius: 50%;
+  transition: color 0.15s, background 0.15s;
 }
 
 .moreBtn:hover {
   color: var(--text);
+  background: var(--surface);
 }
 
 /* Context menu */
 .ctxMenu {
   position: fixed;
   z-index: 100;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: var(--surface-strong);
+  border: 1px solid var(--stroke);
+  border-radius: 14px;
   padding: 4px;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-  min-width: 160px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: 0 16px 40px -8px rgba(0, 0, 0, 0.7);
+  min-width: 170px;
 }
 
 .ctxOption {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
+  min-height: 44px;
   text-align: left;
-  padding: 10px 14px;
-  font-size: 14px;
-  border-radius: 6px;
+  padding: 0 14px;
+  font-size: 15px;
+  border-radius: 10px;
   transition: background 0.1s;
 }
 
 .ctxOption:hover {
-  background: rgba(255,255,255,0.08);
+  background: var(--surface-hover);
 }
 
 /* Toast */
 .toast {
   position: fixed;
-  bottom: 80px;
+  bottom: calc(96px + var(--safe-bottom));
   left: 50%;
   transform: translateX(-50%);
   background: var(--accent);
-  color: white;
+  color: var(--accent-ink);
   padding: 10px 20px;
-  border-radius: 20px;
-  font-size: 13px;
-  font-weight: 500;
+  border-radius: 99px;
+  font-size: 14px;
+  font-weight: 600;
   z-index: 200;
-  animation: toastIn 0.25s ease-out;
-  box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+  max-width: calc(100vw - 32px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: toastIn 0.25s var(--ease);
+  box-shadow: 0 10px 30px -10px color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
 @keyframes toastIn {

@@ -16,6 +16,8 @@ with or without this deployed: the new fields are optional.
 | `vocals_classify.py` | Singing probability over time via the PANNs CNN14 classifier; runs in `/opt/demucs/venv` |
 | `navidrome_ids.py` | `{file path: Navidrome song id}` from Navidrome's DB, for exact matching in the PWA |
 | `auth.py` | FastAPI dependency: verifies the Brook user against Navidrome; a bearer token (in `/opt/automix/automix.env`) works only for local scripts |
+| `lrclib.py` | LRCLIB lookups with retries; used by `GET /automix/lyrics` (answers cached in the `lyrics_cache` table, created on startup) and `fetch_lrc.py` |
+| `fetch_lrc.py` | Saves synced lyrics as `Song.lrc` beside each song (dry run unless `--write`), titles from Navidrome's DB. Navidrome serves these as lyrics, and the PWA asks Navidrome first. Safe to re-run; it stops when LRCLIB is down |
 | `sync-music.sh` | rclone sync + automatic `/automix/rescan` |
 
 ## 1. Copy and install

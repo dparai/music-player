@@ -1,5 +1,6 @@
 import type { SubsonicSong, SubsonicCredentials } from "@/lib/subsonic";
 import { coverArtUrl } from "@/lib/subsonic";
+import { PlayIcon, PauseIcon, NoteIcon } from "./icons";
 import styles from "./MiniPlayer.module.css";
 
 interface Props {
@@ -13,26 +14,36 @@ interface Props {
 
 export function MiniPlayer({ song, creds, playing, progress, onToggle, onClick }: Props) {
   return (
-    <div className={styles.bar} onClick={onClick}>
+    <div
+      className={styles.bar}
+      role="button"
+      tabIndex={0}
+      aria-label={`Open player: ${song.title}`}
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+    >
       {song.coverArt ? (
-        <img className={styles.art} src={coverArtUrl(creds, song.coverArt, "80")} alt="" />
+        <img className={styles.art} src={coverArtUrl(creds, song.coverArt, "96")} alt="" />
       ) : (
-        <div className={styles.artPlaceholder}>&#9835;</div>
+        <div className={styles.artPlaceholder}><NoteIcon size={20} /></div>
       )}
       <div className={styles.info}>
         <div className={styles.title}>{song.title}</div>
-        <div className={styles.artist}>{song.artist ?? "Unknown"}</div>
+        <div className={styles.artist}>{song.artist ?? "Unknown artist"}</div>
       </div>
       <button
         className={styles.playBtn}
         onClick={(e) => { e.stopPropagation(); onToggle(); }}
         aria-label={playing ? "Pause" : "Play"}
       >
-        {playing ? (
-          <span className={styles.pauseIcon}><span /><span /></span>
-        ) : "▶"}
+        {playing ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
       </button>
-      <div className={styles.progress} style={{ width: `${progress * 100}%` }} />
+      <div className={styles.progress} style={{ transform: `scaleX(${progress})` }} />
     </div>
   );
 }
