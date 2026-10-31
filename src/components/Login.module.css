@@ -1,17 +1,37 @@
 .container {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: center;
   justify-content: center;
   min-height: 100%;
   padding: 16px;
+  background: var(--bg);
+}
+
+.container::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(90% 55% at 50% 0%, color-mix(in srgb, var(--accent) 38%, transparent), transparent 65%),
+    linear-gradient(180deg, var(--tint), var(--bg) 75%);
 }
 
 .form {
   width: 100%;
-  max-width: 380px;
+  max-width: 400px;
   display: flex;
   flex-direction: column;
   gap: 16px;
+  padding: 32px 28px;
+  border-radius: 28px;
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.8);
 }
 
 .icon {
@@ -20,8 +40,9 @@
 }
 
 .title {
-  font-size: 28px;
+  font-size: 30px;
   font-weight: 700;
+  letter-spacing: -0.02em;
   text-align: center;
 }
 
@@ -40,38 +61,45 @@
 }
 
 .input {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px 14px;
+  height: 50px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--stroke);
+  border-radius: 14px;
+  padding: 0 16px;
   font-size: 16px;
   color: var(--text);
-  transition: border-color 0.15s;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 .input:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 .error {
-  color: #ef4444;
+  color: #ff8a8a;
   font-size: 14px;
   text-align: center;
 }
 
 .button {
+  height: 52px;
   background: var(--accent);
-  color: white;
-  border-radius: var(--radius-sm);
-  padding: 14px;
+  color: var(--accent-ink);
+  border-radius: 14px;
   font-size: 16px;
-  font-weight: 600;
+  font-weight: 700;
   margin-top: 8px;
-  transition: background 0.15s;
+  transition: transform 0.15s var(--ease), filter 0.15s;
 }
 
 .button:hover:not(:disabled) {
-  background: var(--accent-hover);
+  filter: brightness(1.08);
+}
+
+.button:active:not(:disabled) {
+  transform: scale(0.98);
 }
 
 .button:disabled {

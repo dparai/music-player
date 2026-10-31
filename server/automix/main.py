@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analysis_v2 import ANALYSIS_VERSION, MAX_DEMUCS_ATTEMPTS, analyze_track as analyze_v2, demucs_available  # noqa: E402
 from auth import require_user  # noqa: E402
 from navidrome_ids import navidrome_ids  # noqa: E402
+from lrclib import lookup as lrclib_lookup  # noqa: E402
 
 # --- Config ---
 MUSIC_DIR = Path("/srv/music")
@@ -63,6 +64,13 @@ def init_db():
                 last_used TEXT,
                 FOREIGN KEY (from_track) REFERENCES tracks(id),
                 FOREIGN KEY (to_track) REFERENCES tracks(id)
+            );
+            CREATE TABLE IF NOT EXISTS lyrics_cache (
+                key TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                lrc TEXT,
+                synced INTEGER,
+                fetched REAL NOT NULL
             );
         """)
         # v2 columns. grid_source IS NULL marks rows from v1 analysis, which
@@ -296,6 +304,38 @@ def get_track(track_id: str):
     for k in ("beats", "downbeats", "bar_energy", "bar_bass", "bar_vocal"):
         result[k] = json.loads(result[k]) if result.get(k) else []
     return result
+
+# Lyrics for the PWA. The server asks LRCLIB (with retries) and remembers the
+# answer, so one slow or failed lookup in the browser does not repeat.
+LYRICS_TTL = {"ok": 365 * 86400, "none": 14 * 86400}
+LYRICS_COOLDOWN = 60  # after LRCLIB fails, answer "unavailable" for this long without asking again
+_lyrics_down_until = 0.0
+
+@app.get("/automix/lyrics", dependencies=[Depends(require_user)])
+def lyrics(artist: str = "", title: str = "", album: str = "", duration: float = 0.0):
+    """{'status': 'ok'|'none'|'unavailable', 'lrc': text|None, 'synced': bool}"""
+    global _lyrics_down_until
+    key = hashlib.sha1("|".join([artist.strip().lower(), title.strip().lower(),
+                                 album.strip().lower(), str(round(duration))]).encode()).hexdigest()
+    now = time.time()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT status, lrc, synced, fetched FROM lyrics_cache WHERE key = ?", (key,)).fetchone()
+        if row and now - row["fetched"] < LYRICS_TTL.get(row["status"], 0):
+            return {"status": row["status"], "lrc": row["lrc"], "synced": bool(row["synced"])}
+        if now < _lyrics_down_until:
+            return {"status": "unavailable", "lrc": None, "synced": False}
+        status, res = lrclib_lookup(artist, title, album, duration)
+        if status == "unavailable":
+            _lyrics_down_until = now + LYRICS_COOLDOWN
+            return {"status": status, "lrc": None, "synced": False}
+        with _db_lock:
+            conn.execute("INSERT OR REPLACE INTO lyrics_cache (key, status, lrc, synced, fetched) VALUES (?,?,?,?,?)",
+                         (key, status, res["lrc"] if res else None, int(bool(res and res["synced"])), now))
+            conn.commit()
+        return {"status": status, "lrc": res["lrc"] if res else None, "synced": bool(res and res["synced"])}
+    finally:
+        conn.close()
 
 @app.post("/automix/rescan", dependencies=[Depends(require_user)])
 def rescan():
