@@ -1,4 +1,5 @@
 import md5 from "md5";
+import { stableToken } from "./stableToken";
 import { buildNameIndex, matchByName, type NameIndex } from "./match";
 
 interface SubsonicCredentials {
@@ -42,9 +43,17 @@ interface SubsonicResponse<T> {
 const APP_NAME = "DeepakMusic";
 const API_VERSION = "1.16.1";
 
-function buildParams(creds: SubsonicCredentials): URLSearchParams {
-  const salt = Math.random().toString(36).slice(2, 10);
-  const token = md5(creds.password + salt);
+// `stable`: for URLs the browser may cache (cover art): one salt for all of
+// them, so the same image always has the same URL. API calls get a fresh salt.
+function buildParams(creds: SubsonicCredentials, stable = false): URLSearchParams {
+  let salt: string;
+  let token: string;
+  if (stable) {
+    ({ salt, token } = stableToken(creds.password));
+  } else {
+    salt = Math.random().toString(36).slice(2, 10);
+    token = md5(creds.password + salt);
+  }
   return new URLSearchParams({
     u: creds.username,
     t: token,
@@ -55,8 +64,8 @@ function buildParams(creds: SubsonicCredentials): URLSearchParams {
   });
 }
 
-function apiUrl(creds: SubsonicCredentials, endpoint: string, extra?: Record<string, string>): string {
-  const params = buildParams(creds);
+function apiUrl(creds: SubsonicCredentials, endpoint: string, extra?: Record<string, string>, stable = false): string {
+  const params = buildParams(creds, stable);
   if (extra) {
     for (const [k, v] of Object.entries(extra)) {
       params.set(k, v);
@@ -126,7 +135,7 @@ export function streamUrl(creds: SubsonicCredentials, songId: string): string {
 }
 
 export function coverArtUrl(creds: SubsonicCredentials, coverArtId: string, size = "300"): string {
-  return apiUrl(creds, "getCoverArt", { id: coverArtId, size });
+  return apiUrl(creds, "getCoverArt", { id: coverArtId, size }, true);
 }
 
 // BPM/Key analysis data
