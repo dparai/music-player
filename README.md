@@ -125,7 +125,7 @@ Design notes and the plan for server-rendered transitions: [docs/AUTOMIX-V2.md](
 | Styling | CSS Modules | Scoped styles, no conflicts |
 | Audio | Web Audio API | Beat-synced mixing, bass swap, limiter, silence detection |
 | PWA | vite-plugin-pwa + Workbox | Install to homescreen, offline UI |
-| Music Server | Navidrome (Subsonic API) | Self-hosted, battle-tested |
+| Music Server | Navidrome (Subsonic API) | Self-hosted, |
 | Reverse Proxy | Caddy | Auto HTTPS, zero config |
 | Cloud | Oracle Cloud Always Free ARM | Free (2 OCPUs, 12 GB RAM, 200 GB disk); Brook uses ~13 GB disk, ~1–2.5 GB RAM |
 | Sync | rclone + Google Drive (daily cron) | Drop files in Drive, they appear in Brook the next day |
@@ -222,4 +222,4 @@ Installed apps update themselves on their next launch.
 
 Brook is the musician of the Straw Hat Pirates in One Piece. He's a skeleton who ate the Revive-Revive Fruit, came back to life, and now plays music that moves souls. His catchphrase "Yohohoho!" is the login screen greeting.
 
-*Soul King Brook would approve of beat-matched crossfades.*
+*I can't believe I'm out of breath! Oh wait… I don't have lungs! Yo ho ho ho !*
