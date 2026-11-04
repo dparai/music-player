@@ -43,3 +43,34 @@ def navidrome_ids(db_path: str = NAVIDROME_DB, music_dir: str = MUSIC_DIR) -> di
             path = os.path.join(root or music_dir, path)
         out[os.path.normpath(path)] = song_id
     return out
+
+
+def navidrome_titles(on_disk: set[str], db_path: str = NAVIDROME_DB, music_dir: str = MUSIC_DIR) -> list[tuple[str, float]] | None:
+    """(title, duration in s) of every Navidrome song whose file is still on disk.
+
+    Only files that exist count: Navidrome drops a deleted song at its next scan
+    (up to 15 min later), and the data tied to the file should go first.
+    None if the database can't be read.
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            rows = con.execute(
+                "SELECT m.title, m.duration, m.path, l.path FROM media_file m LEFT JOIN library l ON l.id = m.library_id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = [(t, d, p, None) for t, d, p in con.execute("SELECT title, duration, path FROM media_file")]
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    out = []
+    for title, duration, path, root in rows:
+        if not os.path.isabs(path):
+            path = os.path.join(root or music_dir, path)
+        if os.path.normpath(path) in on_disk:
+            out.append((title or "", float(duration or 0)))
+    return out

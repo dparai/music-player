@@ -98,7 +98,12 @@ def main():
     )
 
     print(f"Found {len(files)} audio files")
-    results = dict(existing)
+    # Entries for songs that are gone leave with them. Not when no files were found at all
+    # (music folder unmounted): then keep everything rather than re-analyse the library.
+    on_disk = {str(p.relative_to(music_path)) for p in files}
+    results = {k: v for k, v in existing.items() if k in on_disk} if files else dict(existing)
+    if len(existing) != len(results):
+        print(f"Removed {len(existing) - len(results)} entries for deleted songs")
     new_count = 0
     start = time.time()
 

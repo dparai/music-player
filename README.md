@@ -158,6 +158,7 @@ server/
   analyze.py            Legacy BPM/key analysis.json generator
 docs/
   AUTOMIX-V2.md         Crossfade engine design notes
+  OPERATIONS.md         How the server runs: Caddy, Navidrome, the nightly job, what happens when a song is deleted
 ```
 
 ### AutoMix Server (on the VM)
