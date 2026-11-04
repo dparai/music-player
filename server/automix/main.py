@@ -15,7 +15,8 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analysis_v2 import ANALYSIS_VERSION, MAX_DEMUCS_ATTEMPTS, analyze_track as analyze_v2, demucs_available  # noqa: E402
 from auth import require_user  # noqa: E402
-from navidrome_ids import navidrome_ids  # noqa: E402
+from navidrome_ids import navidrome_ids, navidrome_titles  # noqa: E402
+from cleanup import prune_lyrics_cache  # noqa: E402
 from lrclib import lookup_any as lrclib_lookup  # noqa: E402
 
 # --- Config ---
@@ -73,6 +74,12 @@ def init_db():
                 fetched REAL NOT NULL
             );
         """)
+        # lyrics_cache remembers which song it was fetched for, so it can be dropped with the song.
+        for col, typ in (("title", "TEXT"), ("dur", "REAL")):
+            try:
+                conn.execute(f"ALTER TABLE lyrics_cache ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass  # already there
         # v2 columns. grid_source IS NULL marks rows from v1 analysis, which
         # the scanner re-analyses in the background (old data stays served
         # until each track's new row lands).
@@ -146,6 +153,12 @@ def _prune_and_link(on_disk: set[str]) -> tuple[set[str], set[str]]:
             conn.execute("DELETE FROM transitions WHERE from_track = ? OR to_track = ?", (make_track_id(path),) * 2)
             conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
         conn.commit()
+        songs = navidrome_titles(on_disk)
+        if songs:  # None or empty: Navidrome unreadable, so delete nothing
+            removed = prune_lyrics_cache(conn, songs)
+            conn.commit()
+            if removed:
+                print(f"Removed {removed} cached lyrics of deleted songs", flush=True)
         link_navidrome_ids(conn)
         can_retry = demucs_available()
         done = set()
@@ -330,8 +343,9 @@ def lyrics(artist: str = "", title: str = "", album: str = "", duration: float =
             _lyrics_down_until = now + LYRICS_COOLDOWN
             return {"status": status, "lrc": None, "synced": False}
         with _db_lock:
-            conn.execute("INSERT OR REPLACE INTO lyrics_cache (key, status, lrc, synced, fetched) VALUES (?,?,?,?,?)",
-                         (key, status, res["lrc"] if res else None, int(bool(res and res["synced"])), now))
+            conn.execute("INSERT OR REPLACE INTO lyrics_cache (key, status, lrc, synced, fetched, title, dur) VALUES (?,?,?,?,?,?,?)",
+                         (key, status, res["lrc"] if res else None, int(bool(res and res["synced"])), now,
+                          title.strip(), float(round(duration))))
             conn.commit()
         return {"status": status, "lrc": res["lrc"] if res else None, "synced": bool(res and res["synced"])}
     finally:
