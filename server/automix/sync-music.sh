@@ -8,8 +8,18 @@ LOCK="/tmp/music-sync.lock"
 exec 200>"$LOCK"
 flock -n 200 || exit 0
 echo "$(date): Starting sync" >> "$LOG"
-rclone copy "gdrive:My Music" /srv/music --transfers 4 --checkers 8 --log-file "$LOG" --log-level INFO
+# sync mirrors Drive deletions to the server. --max-delete 5 stops a run that would
+# delete more than 5 files (renamed, empty or unreachable Drive folder).
+rclone sync "gdrive:My Music" /srv/music --max-delete 5 --transfers 4 --checkers 8 --log-file "$LOG" --log-level INFO
 echo "$(date): Sync complete" >> "$LOG"
+# Cover art cache: delete files nobody has read for 90 days, so the covers of deleted songs age out.
+# Navidrome keeps an index of this cache in memory, so restart it when anything was removed.
+COVER_CACHE="${COVER_CACHE:-/var/lib/navidrome/cache/images}"
+OLD_COVERS=$(find "$COVER_CACHE" -type f -atime +90 -print -delete 2>>"$LOG" | wc -l)
+if [ "$OLD_COVERS" -gt 0 ]; then
+  echo "$(date): Removed $OLD_COVERS cover files unread for 90 days, restarting Navidrome" >> "$LOG"
+  sudo -n systemctl restart navidrome >> "$LOG" 2>&1
+fi
 echo "$(date): Running BPM/key analysis" >> "$LOG"
 /opt/brook-analysis/venv/bin/python /opt/brook-analysis/analyze.py >> "$LOG" 2>&1
 echo "$(date): Analysis complete" >> "$LOG"
