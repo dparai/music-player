@@ -1,9 +1,24 @@
 .layout {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
+  background: var(--bg);
+  transition: --accent 1s ease, --tint 1s ease;
+}
+
+/* One ambient gradient behind everything, tinted by the current album. */
+.layout::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(120% 60% at 50% -10%, color-mix(in srgb, var(--accent) 34%, transparent), transparent 62%),
+    linear-gradient(180deg, var(--tint), var(--bg) 72%);
 }
 
 .main {
@@ -22,7 +37,74 @@
 }
 
 .loading {
-  text-align: center;
-  padding: 40px 16px;
-  color: var(--text-dim);
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.skeletonRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.skeletonArt {
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  background: var(--surface);
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.skeletonLines {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeletonLines span {
+  height: 10px;
+  border-radius: 6px;
+  background: var(--surface);
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.skeletonLines span:first-child { width: 60%; }
+.skeletonLines span:last-child { width: 35%; }
+
+@keyframes shimmer {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* Desktop: library and player side by side, no tab bar. */
+@media (min-width: 900px) {
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(380px, 460px);
+    gap: 16px;
+    padding: 16px;
+  }
+
+  .main {
+    display: contents;
+  }
+
+  .loading {
+    grid-column: 1 / -1;
+  }
+
+  .view {
+    display: flex !important;
+    border: 1px solid var(--stroke);
+    border-radius: 24px;
+    background: var(--surface);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+  }
+
+  .viewLib { order: 0; }
+  .viewNow { order: 1; }
 }

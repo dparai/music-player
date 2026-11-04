@@ -1,3 +1,4 @@
+import { DiscIcon, LibraryIcon } from "./icons";
 import styles from "./BottomNav.module.css";
 
 export type View = "nowplaying" | "library";
@@ -9,19 +10,21 @@ interface Props {
 
 export function BottomNav({ active, onChange }: Props) {
   return (
-    <nav className={styles.nav}>
+    <nav className={styles.nav} aria-label="Main">
       <button
         className={`${styles.item} ${active === "nowplaying" ? styles.active : ""}`}
         onClick={() => onChange("nowplaying")}
+        aria-current={active === "nowplaying" ? "page" : undefined}
       >
-        <span className={styles.icon}>&#127925;</span>
+        <DiscIcon size={24} />
         Now Playing
       </button>
       <button
         className={`${styles.item} ${active === "library" ? styles.active : ""}`}
         onClick={() => onChange("library")}
+        aria-current={active === "library" ? "page" : undefined}
       >
-        <span className={styles.icon}>&#9835;</span>
+        <LibraryIcon size={24} />
         Library
       </button>
     </nav>

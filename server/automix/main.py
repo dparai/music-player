@@ -15,7 +15,9 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analysis_v2 import ANALYSIS_VERSION, MAX_DEMUCS_ATTEMPTS, analyze_track as analyze_v2, demucs_available  # noqa: E402
 from auth import require_user  # noqa: E402
-from navidrome_ids import navidrome_ids  # noqa: E402
+from navidrome_ids import navidrome_ids, navidrome_titles  # noqa: E402
+from cleanup import prune_lyrics_cache  # noqa: E402
+from lrclib import lookup_any as lrclib_lookup  # noqa: E402
 
 # --- Config ---
 MUSIC_DIR = Path("/srv/music")
@@ -64,7 +66,20 @@ def init_db():
                 FOREIGN KEY (from_track) REFERENCES tracks(id),
                 FOREIGN KEY (to_track) REFERENCES tracks(id)
             );
+            CREATE TABLE IF NOT EXISTS lyrics_cache (
+                key TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                lrc TEXT,
+                synced INTEGER,
+                fetched REAL NOT NULL
+            );
         """)
+        # lyrics_cache remembers which song it was fetched for, so it can be dropped with the song.
+        for col, typ in (("title", "TEXT"), ("dur", "REAL")):
+            try:
+                conn.execute(f"ALTER TABLE lyrics_cache ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass  # already there
         # v2 columns. grid_source IS NULL marks rows from v1 analysis, which
         # the scanner re-analyses in the background (old data stays served
         # until each track's new row lands).
@@ -138,6 +153,12 @@ def _prune_and_link(on_disk: set[str]) -> tuple[set[str], set[str]]:
             conn.execute("DELETE FROM transitions WHERE from_track = ? OR to_track = ?", (make_track_id(path),) * 2)
             conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
         conn.commit()
+        songs = navidrome_titles(on_disk)
+        if songs:  # None or empty: Navidrome unreadable, so delete nothing
+            removed = prune_lyrics_cache(conn, songs)
+            conn.commit()
+            if removed:
+                print(f"Removed {removed} cached lyrics of deleted songs", flush=True)
         link_navidrome_ids(conn)
         can_retry = demucs_available()
         done = set()
@@ -296,6 +317,39 @@ def get_track(track_id: str):
     for k in ("beats", "downbeats", "bar_energy", "bar_bass", "bar_vocal"):
         result[k] = json.loads(result[k]) if result.get(k) else []
     return result
+
+# Lyrics for the PWA. The server asks LRCLIB (with retries) and remembers the
+# answer, so one slow or failed lookup in the browser does not repeat.
+LYRICS_TTL = {"ok": 365 * 86400, "none": 14 * 86400}
+LYRICS_COOLDOWN = 60  # after LRCLIB fails, answer "unavailable" for this long without asking again
+_lyrics_down_until = 0.0
+
+@app.get("/automix/lyrics", dependencies=[Depends(require_user)])
+def lyrics(artist: str = "", title: str = "", album: str = "", duration: float = 0.0):
+    """{'status': 'ok'|'none'|'unavailable', 'lrc': text|None, 'synced': bool}"""
+    global _lyrics_down_until
+    key = hashlib.sha1("|".join([artist.strip().lower(), title.strip().lower(),
+                                 album.strip().lower(), str(round(duration))]).encode()).hexdigest()
+    now = time.time()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT status, lrc, synced, fetched FROM lyrics_cache WHERE key = ?", (key,)).fetchone()
+        if row and now - row["fetched"] < LYRICS_TTL.get(row["status"], 0):
+            return {"status": row["status"], "lrc": row["lrc"], "synced": bool(row["synced"])}
+        if now < _lyrics_down_until:
+            return {"status": "unavailable", "lrc": None, "synced": False}
+        status, res = lrclib_lookup(artist, title, album, duration)
+        if status == "unavailable":
+            _lyrics_down_until = now + LYRICS_COOLDOWN
+            return {"status": status, "lrc": None, "synced": False}
+        with _db_lock:
+            conn.execute("INSERT OR REPLACE INTO lyrics_cache (key, status, lrc, synced, fetched, title, dur) VALUES (?,?,?,?,?,?,?)",
+                         (key, status, res["lrc"] if res else None, int(bool(res and res["synced"])), now,
+                          title.strip(), float(round(duration))))
+            conn.commit()
+        return {"status": status, "lrc": res["lrc"] if res else None, "synced": bool(res and res["synced"])}
+    finally:
+        conn.close()
 
 @app.post("/automix/rescan", dependencies=[Depends(require_user)])
 def rescan():

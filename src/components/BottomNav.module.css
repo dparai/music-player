@@ -1,18 +1,23 @@
 .nav {
   display: flex;
-  background: var(--bg-card);
-  border-top: 1px solid var(--border);
   flex-shrink: 0;
+  padding-bottom: var(--safe-bottom);
+  background: var(--surface-strong);
+  border-top: 1px solid var(--stroke);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .item {
   flex: 1;
+  min-height: 56px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
-  padding: 8px 0 10px;
-  font-size: 11px;
+  justify-content: center;
+  gap: 3px;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--text-dim);
   transition: color 0.15s;
 }
@@ -21,11 +26,11 @@
   color: var(--text);
 }
 
-.active {
+.active,
+.active:hover {
   color: var(--accent);
 }
 
-.icon {
-  font-size: 20px;
-  line-height: 1;
+@media (min-width: 900px) {
+  .nav { display: none; }
 }

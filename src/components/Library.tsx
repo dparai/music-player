@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import type { SubsonicSong, SubsonicCredentials } from "@/lib/subsonic";
 import { coverArtUrl } from "@/lib/subsonic";
+import { SearchIcon, MoreIcon, LogoutIcon, NoteIcon, NextIcon } from "./icons";
 import styles from "./Library.module.css";
 
 interface Props {
@@ -97,7 +98,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
 
   function handleMore(e: React.MouseEvent, song: SubsonicSong) {
     e.stopPropagation();
-    const rect = (e.target as HTMLElement).getBoundingClientRect();
+    const rect = e.currentTarget.getBoundingClientRect();
     const menuW = 170;
     const menuH = 90;
     const x = Math.min(rect.right, window.innerWidth - menuW - 8);
@@ -122,24 +123,29 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
     <div className={styles.wrapper}>
       <div className={styles.header}>
         <h2 className={styles.title}>Library</h2>
-        <button className={styles.logoutBtn} onClick={() => {
+        <button className={styles.logoutBtn} aria-label="Log out" onClick={() => {
           // Logout handled by parent, but we expose via a custom event
           window.dispatchEvent(new CustomEvent("brook-logout"));
         }}>
-          Log out
+          <LogoutIcon size={20} />
         </button>
       </div>
 
       <div className={styles.searchRow}>
-        <input
-          className={styles.search}
-          type="text"
-          placeholder="Search songs, artists, albums..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
+        <label className={styles.searchBox}>
+          <SearchIcon size={18} />
+          <input
+            className={styles.search}
+            type="search"
+            aria-label="Search songs, artists, albums"
+            placeholder="Search songs, artists, albums"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
         <select
           className={styles.sort}
+          aria-label="Sort by"
           value={sortBy}
           onChange={(e) => setSortBy(e.target.value as SortKey)}
         >
@@ -150,7 +156,14 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
         </select>
       </div>
 
-      <p className={styles.count}>{filtered.length} songs</p>
+      <p className={styles.count}>{filtered.length} {filtered.length === 1 ? "song" : "songs"}</p>
+
+      {filtered.length === 0 && (
+        <div className={styles.empty}>
+          <NoteIcon size={36} />
+          <p>{query ? `No songs match "${query}"` : "Your library is empty"}</p>
+        </div>
+      )}
 
       <div className={styles.list} ref={containerRef}>
         <div style={{ height: filtered.length * ITEM_HEIGHT, position: "relative" }}>
@@ -167,6 +180,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
                 <button
                   className={`${styles.row} ${song.id === currentSongId ? styles.active : ""}`}
                   onClick={() => onPlay(song)}
+                  aria-current={song.id === currentSongId ? "true" : undefined}
                 >
                   {song.coverArt ? (
                     <img
@@ -176,7 +190,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
                       loading="lazy"
                     />
                   ) : (
-                    <div className={styles.coverPlaceholder}>&#9835;</div>
+                    <div className={styles.coverPlaceholder}><NoteIcon size={20} /></div>
                   )}
                   <div className={styles.info}>
                     <span className={styles.songTitle}>{song.title}</span>
@@ -187,9 +201,9 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
                 <button
                   className={styles.moreBtn}
                   onClick={(e) => handleMore(e, song)}
-                  aria-label="More options"
+                  aria-label={`More options for ${song.title}`}
                 >
-                  &#8942;
+                  <MoreIcon size={20} />
                 </button>
               </div>
             );
@@ -204,7 +218,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
           onClick={(e) => e.stopPropagation()}
         >
           <button className={styles.ctxOption} onClick={() => handlePlayNext(contextMenu.song)}>
-            &#9654; Play Next
+            <NextIcon size={16} /> Play next
           </button>
         </div>
       )}

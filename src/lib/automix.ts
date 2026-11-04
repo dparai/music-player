@@ -34,6 +34,23 @@ async function automixFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+export interface ServerLyrics {
+  status: "ok" | "none" | "unavailable";
+  lrc: string | null;
+  synced: boolean;
+}
+
+// The server asks LRCLIB with retries and remembers the answer (server/automix/main.py).
+export function getServerLyrics(song: SubsonicSong): Promise<ServerLyrics> {
+  const params = new URLSearchParams({
+    artist: song.artist ?? "",
+    title: song.title,
+    album: song.album ?? "",
+    duration: String(Math.round(song.duration)),
+  });
+  return automixFetch<ServerLyrics>(`/lyrics?${params}`);
+}
+
 export interface AutoMixTrack {
   id: string;
   filename: string;
