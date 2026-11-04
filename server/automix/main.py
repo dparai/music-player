@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analysis_v2 import ANALYSIS_VERSION, MAX_DEMUCS_ATTEMPTS, analyze_track as analyze_v2, demucs_available  # noqa: E402
 from auth import require_user  # noqa: E402
 from navidrome_ids import navidrome_ids  # noqa: E402
-from lrclib import lookup as lrclib_lookup  # noqa: E402
+from lrclib import lookup_any as lrclib_lookup  # noqa: E402
 
 # --- Config ---
 MUSIC_DIR = Path("/srv/music")

@@ -1058,6 +1058,7 @@ export function NowPlaying({
               status={lyricsState.status}
               lyrics={lyricsState.data}
               time={currentTime}
+              getTime={() => getActiveAudio()?.currentTime ?? currentTime}
               open={lyricsOpen}
               onRetry={() => setLyricsTry((n) => n + 1)}
               onSeek={(s) => seekToRatio(s / duration)}

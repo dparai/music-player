@@ -56,13 +56,16 @@
 .coverCollapse {
   display: grid;
   grid-template-rows: 1fr;
-  margin-top: auto;
-  flex-shrink: 0;
-  transition: grid-template-rows 0.5s var(--ease), opacity 0.3s ease;
+  /* Takes whatever height is left and the cover shrinks to fit it, so the
+     player never needs to scroll, even in a short desktop window. */
+  flex: 1 1 0;
+  min-height: 0;
+  transition: grid-template-rows 0.5s var(--ease), flex-grow 0.5s var(--ease), opacity 0.3s ease;
 }
 
 .collapsed {
   grid-template-rows: 0fr;
+  flex-grow: 0;
   opacity: 0;
   pointer-events: none;
 }
@@ -70,10 +73,13 @@
 .coverInner {
   min-height: 0;
   overflow: hidden;
+  container-type: size;
+  display: flex;
+  align-items: center;
 }
 
 .coverWrap {
-  width: min(100%, 380px, 48dvh);
+  width: min(100%, 380px, 100cqh);
   aspect-ratio: 1;
   margin: 0 auto;
 }

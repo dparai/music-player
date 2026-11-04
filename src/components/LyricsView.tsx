@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Lyrics } from "@/lib/lyrics";
 import { activeLine } from "@/lib/lyrics";
 import styles from "./LyricsView.module.css";
@@ -7,21 +7,53 @@ interface Props {
   status: "loading" | "ready" | "none" | "error";
   lyrics: Lyrics | null;
   time: number;
+  getTime?: () => number; // live playback position; the `time` prop only changes about 4 times a second
   open: boolean;
   onRetry: () => void;
   onSeek: (seconds: number) => void;
 }
 
-const LEAD = 0.25; // highlight a touch early: time updates arrive about 4 times a second
+const LEAD = 0.3; // default: highlight early, so the line is already lit as the singer starts it
+const STEP = 0.1;
+const OFFSET_KEY = "brook.lyricsLead";
+
+function loadLead(): number {
+  try {
+    const v = Number(localStorage.getItem(OFFSET_KEY));
+    return localStorage.getItem(OFFSET_KEY) !== null && isFinite(v) ? v : LEAD;
+  } catch { return LEAD; }
+}
 const PAUSE_AFTER_TOUCH_MS = 3500;
 
-export function LyricsView({ status, lyrics, time, open, onRetry, onSeek }: Props) {
+export function LyricsView({ status, lyrics, time, getTime, open, onRetry, onSeek }: Props) {
   const box = useRef<HTMLDivElement>(null);
   const userUntil = useRef(0);
   const synced = !!lyrics?.synced;
-  const idx = synced ? activeLine(lyrics!.lines, time + LEAD) : -1;
+  const [lead, setLead] = useState(loadLead);
+  const nudge = (d: number) => setLead((v) => {
+    const n = Math.round((v + d) * 10) / 10;
+    try { localStorage.setItem(OFFSET_KEY, String(n)); } catch { /* private mode */ }
+    return n;
+  });
+  const slowIdx = synced ? activeLine(lyrics!.lines, time + lead) : -1;
+  const [liveIdx, setLiveIdx] = useState(-1);
+  const idx = getTime && open && synced ? liveIdx : slowIdx;
 
+  // Read the real playback position every frame, so a line lights up when it
+  // is sung instead of up to a quarter second later.
   useEffect(() => {
+    if (!getTime || !open || !lyrics?.synced) return;
+    let raf = 0;
+    const tick = () => {
+      setLiveIdx(activeLine(lyrics.lines, getTime() + lead));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [getTime, open, lyrics, lead]);
+
+  const center = useRef<(smooth: boolean) => void>(() => {});
+  center.current = (smooth) => {
     const el = box.current;
     if (!open || !el || idx < 0 || Date.now() < userUntil.current) return;
     const line = el.children[idx] as HTMLElement | undefined;
@@ -29,9 +61,21 @@ export function LyricsView({ status, lyrics, time, open, onRetry, onSeek }: Prop
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     el.scrollTo({
       top: line.offsetTop - el.clientHeight / 2 + line.clientHeight / 2,
-      behavior: reduce ? "auto" : "smooth",
+      behavior: smooth && !reduce ? "smooth" : "auto",
     });
-  }, [idx, open, lyrics]);
+  };
+
+  useEffect(() => { center.current(true); }, [idx, open, lyrics]);
+
+  // The box changes size while the lyrics panel opens (and when a phone shows
+  // this tab again), so re-center then too, or the line lands off-middle.
+  useEffect(() => {
+    const el = box.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => center.current(false));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [lyrics, status]);
 
   // Reopening should land on the current line, not wherever it was left.
   useEffect(() => { if (open) userUntil.current = 0; }, [open]);
@@ -52,6 +96,7 @@ export function LyricsView({ status, lyrics, time, open, onRetry, onSeek }: Prop
   const pause = () => { userUntil.current = Date.now() + PAUSE_AFTER_TOUCH_MS; };
 
   return (
+    <div className={styles.wrap}>
     <div
       ref={box}
       className={styles.box}
@@ -74,6 +119,14 @@ export function LyricsView({ status, lyrics, time, open, onRetry, onSeek }: Prop
           <p key={i} className={cls}>{l.text || " "}</p>
         );
       })}
+    </div>
+    {synced && (
+      <div className={styles.sync} aria-label="Lyrics timing">
+        <button onClick={() => nudge(STEP)} aria-label="Show lyrics earlier">Earlier</button>
+        <span>{lead >= 0 ? "+" : ""}{lead.toFixed(1)}s</span>
+        <button onClick={() => nudge(-STEP)} aria-label="Show lyrics later">Later</button>
+      </div>
+    )}
     </div>
   );
 }

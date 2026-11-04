@@ -90,3 +90,15 @@ def lookup(artist: str, title: str, album: str, duration: float,
         except Unavailable:
             continue
     return "unavailable", None
+
+
+def lookup_any(artist: str, title: str, album: str, duration: float, **kw) -> tuple[str, dict | None]:
+    """LRCLIB first; when it has nothing or is down, try the backup source.
+    A backup miss while LRCLIB is down stays 'unavailable', so it is retried
+    soon instead of being remembered as "no lyrics"."""
+    status, res = lookup(artist, title, album, duration, **kw)
+    if status == "ok" or not ENABLED or not title:
+        return status, res
+    import netease
+    found = netease.lookup(artist, title, duration)
+    return ("ok", found) if found else (status, None)
