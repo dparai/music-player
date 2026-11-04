@@ -9,9 +9,11 @@ import {
   saveCredentials, loadCredentials, clearCredentials,
   saveLastPlayed, loadLastPlayed,
   saveView, loadView,
+  saveSongsCache, loadSongsCache,
 } from "@/lib/storage";
 import { Login } from "@/components/Login";
 import { Library } from "@/components/Library";
+import { memo } from "react";
 import { NowPlaying } from "@/components/NowPlaying";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
@@ -27,6 +29,9 @@ function shuffleArray<T>(arr: T[]): T[] {
   }
   return copy;
 }
+
+// Playback progress updates App about 4 times a second; the list must not redraw each time.
+const MemoLibrary = memo(Library);
 
 export function App() {
   const [creds, setCreds] = useState<SubsonicCredentials | null>(loadCredentials);
@@ -126,16 +131,23 @@ export function App() {
     setLoading(true);
     fetchAnalysis().then(setAnalysisData).catch(() => {});
     getAutoMixTracks().then(setAutoMixTracks).catch(() => {});
+    // Show the last list straight away; the network answer replaces it.
+    let picked = false;
+    const show = (s: SubsonicSong[]) => {
+      setSongs(s);
+      if (picked) return; // the current song was chosen from the first list
+      picked = true;
+      const lastId = loadLastPlayed();
+      if (lastId && s.find((song) => song.id === lastId)) {
+        setCurrentSongId(lastId);
+      } else if (s.length > 0) {
+        setCurrentSongId(s[0]!.id);
+      }
+    };
+    const cached = loadSongsCache(creds);
+    if (cached?.length) { show(cached); setLoading(false); }
     getAllSongs(creds)
-      .then((s) => {
-        setSongs(s);
-        const lastId = loadLastPlayed();
-        if (lastId && s.find((song) => song.id === lastId)) {
-          setCurrentSongId(lastId);
-        } else if (s.length > 0) {
-          setCurrentSongId(s[0]!.id);
-        }
-      })
+      .then((s) => { saveSongsCache(creds, s); show(s); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [creds]);
@@ -247,6 +259,14 @@ export function App() {
     setMiniProgress(prog);
   }, []);
 
+  // Callbacks whose identity never changes, so MemoLibrary can skip those redraws.
+  const handlePlayRef = useRef(handlePlay);
+  handlePlayRef.current = handlePlay;
+  const stablePlay = useCallback((song: SubsonicSong) => handlePlayRef.current(song), []);
+  const handlePlayNextRef = useRef(handlePlayNext);
+  handlePlayNextRef.current = handlePlayNext;
+  const stablePlayNext = useCallback((song: SubsonicSong) => handlePlayNextRef.current(song), []);
+
   function handleTogglePlay() {
     togglePlayRef.current?.();
   }
@@ -287,12 +307,12 @@ export function App() {
               />
             </div>
             <div className={`${styles.view} ${styles.viewLib}`} style={{ display: view === "library" ? "flex" : "none" }}>
-              <Library
+              <MemoLibrary
                 songs={songs}
                 creds={creds}
                 currentSongId={currentSong?.id ?? null}
-                onPlay={handlePlay}
-                onPlayNext={handlePlayNext}
+                onPlay={stablePlay}
+                onPlayNext={stablePlayNext}
               />
             </div>
           </>
