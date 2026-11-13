@@ -86,3 +86,21 @@ export const LyricsIcon = (p: IconProps) => (
 export const NoteIcon =(p: IconProps) => (
   <Svg {...p}><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></Svg>
 );
+
+export const CheckIcon = (p: IconProps) => (
+  <Svg {...p}><path d="M5 12.5l4.5 4.5L19 7.5" /></Svg>
+);
+
+export const ChevronIcon = (p: IconProps) => (
+  <Svg {...p}><path d="M6 15l6-6 6 6" /></Svg>
+);
+
+// Loading ring for a play button while a song is being prepared.
+export const SpinnerIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="9" opacity="0.25" />
+    <path d="M21 12a9 9 0 0 0-9-9">
+      <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite" />
+    </path>
+  </Svg>
+);

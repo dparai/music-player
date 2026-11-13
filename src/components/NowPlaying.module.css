@@ -424,14 +424,23 @@
   z-index: 2;
   flex-shrink: 0;
   display: flex;
-  flex-wrap: wrap;
+  /* One line always: a chip that cannot fit shortens with an ellipsis instead of wrapping. */
+  flex-wrap: nowrap;
   justify-content: center;
   gap: 8px;
   padding: 8px 16px 14px;
   list-style: none;
 }
 
+.chipFixed {
+  flex-shrink: 0;
+}
+
 .chip {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 5px 12px;
   border-radius: 99px;
   font-size: 12px;
@@ -482,4 +491,6 @@
   .toggle { width: 52px; }
   .ctrlSide { width: 48px; height: 48px; }
   .ctrlPlay { width: 68px; height: 68px; }
+  .chips { gap: 5px; padding-left: 10px; padding-right: 10px; }
+  .chip { padding: 5px 8px; font-size: 11px; }
 }

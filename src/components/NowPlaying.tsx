@@ -1,6 +1,9 @@
 import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import type { SubsonicSong, SubsonicCredentials, SongAnalysis } from "@/lib/subsonic";
 import { streamUrl, coverArtUrl } from "@/lib/subsonic";
+import { loadQuality, saveQuality, streamFormat, transcodeFor, type Quality } from "@/lib/quality";
+import { knownSeekable, whenSeekable } from "@/lib/streamReady";
+import { QualityMenu } from "./QualityMenu";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
   tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
@@ -8,7 +11,7 @@ import {
 } from "@/lib/dj";
 import type { AutoMixTrack, AutoMixTrackDetail } from "@/lib/automix";
 import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
-import { PlayIcon, PauseIcon, PrevIcon, NextIcon, ShuffleIcon, MixIcon, NoteIcon, LyricsIcon } from "./icons";
+import { PlayIcon, PauseIcon, PrevIcon, NextIcon, ShuffleIcon, MixIcon, NoteIcon, LyricsIcon, SpinnerIcon } from "./icons";
 import { LyricsView } from "./LyricsView";
 import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
 import styles from "./NowPlaying.module.css";
@@ -29,6 +32,8 @@ interface Props {
   nextAnalysis: SongAnalysis | null;
   nextSong: SubsonicSong | null;
   onPlayingChange?: (playing: boolean, progress: number) => void;
+  // True while a picked song waits for the server to prepare its stream.
+  onPreparingChange?: (preparing: boolean) => void;
   togglePlayRef?: React.MutableRefObject<(() => void) | null>;
   autoMixTracks?: AutoMixTrack[];
 }
@@ -72,6 +77,8 @@ interface Preload {
 }
 
 const PRELOAD_LEAD = 30;    // seconds before the cue to start buffering the next song
+const STREAM_READY_WAIT_MS = 6000;  // longest a song waits for its transcode before playing anyway
+const STREAM_WARM_WAIT_MS = 20000;  // how long the next song's transcode is watched for
 const SCHEDULE_LEAD = 1.5;  // seconds before the cue to arm the precise start timer
 const MIN_CONFIDENCE = 0.4; // beat-grid confidence needed to beat-sync
 const MAX_INTRO_CUE = 30;   // don't skip more intro than this to reach the first downbeat
@@ -129,7 +136,7 @@ export function NowPlaying({
   shuffled, onShuffleToggle,
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
-  onPlayingChange, togglePlayRef,
+  onPlayingChange, onPreparingChange, togglePlayRef,
   autoMixTracks,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
@@ -144,6 +151,21 @@ export function NowPlaying({
   const waveformRef = useRef<HTMLDivElement>(null);
   const [mixZone, setMixZone] = useState<{ start: number; end: number } | null>(null);
   const [scrub, setScrub] = useState<number | null>(null); // seconds, while the thumb is being dragged
+  // Streaming quality. A change applies from the next song loaded, so the one playing is not interrupted.
+  const [quality, setQuality] = useState<Quality>(loadQuality);
+  const qualityRef = useRef(quality);
+  qualityRef.current = quality;
+  // A picked song is waiting for the server to finish its transcode; the play buttons show a spinner.
+  const [preparing, setPreparingState] = useState(false);
+  const preparingRef = useRef(false);
+  const onPreparingChangeRef = useRef(onPreparingChange);
+  onPreparingChangeRef.current = onPreparingChange;
+  function setPreparing(value: boolean) {
+    if (preparingRef.current === value) return;
+    preparingRef.current = value;
+    setPreparingState(value);
+    onPreparingChangeRef.current?.(value);
+  }
   const lastSongIdRef = useRef<string | null>(null);
   const skipNextLoadRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -382,8 +404,20 @@ export function NowPlaying({
     navigator.mediaSession.setActionHandler("nexttrack", () => onNextRef.current());
   }
 
-  function setStreamSrc(audio: HTMLAudioElement, songId: string) {
-    const url = streamUrl(creds, songId);
+  // The stream for a song at the chosen quality. `key` is null for the original
+  // file, which can always be seeked; a transcoded one only once the server has
+  // cached it (see lib/streamReady.ts).
+  function streamFor(s: SubsonicSong) {
+    const transcode = transcodeFor(s, qualityRef.current, streamFormat());
+    return {
+      key: transcode ? `${s.id}|${transcode.format}|${transcode.maxBitRate}` : null,
+      url: () => streamUrl(creds, s.id, transcode),
+    };
+  }
+
+  // `original`: stream the file as it is, whatever the quality setting.
+  function setStreamSrc(audio: HTMLAudioElement, s: SubsonicSong, original = false) {
+    const url = original ? streamUrl(creds, s.id) : streamFor(s).url();
     // A cross-origin stream routed through Web Audio is silent without CORS.
     try {
       if (new URL(url, window.location.href).origin !== window.location.origin) {
@@ -407,6 +441,7 @@ export function NowPlaying({
 
     if (song.id === lastSongIdRef.current) return;
     lastSongIdRef.current = song.id;
+    setPreparing(false); // whatever the last pick was waiting for no longer matters
 
     // "Next" pressed mid-mix lands on the incoming song: finish the mix now.
     if (fadeRef.current?.song.id === song.id) {
@@ -429,10 +464,25 @@ export function NowPlaying({
       audio.playbackRate = 1;
       // Start silent and fade in once audio is flowing (only when the fade can run).
       if (fadeIn && fadeable()) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
-      setStreamSrc(audio, song.id);
-      audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
-        .catch(() => { if (fadeIn) resetStrip(activeDeckRef.current, 1); });
+      const start = () => {
+        if (lastSongIdRef.current !== song.id) return; // a newer pick took over while the server prepared this one
+        setPreparing(false);
+        setStreamSrc(audio, song);
+        audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
+          .catch(() => { if (fadeIn) resetStrip(activeDeckRef.current, 1); });
+      };
       updateMediaSession(song);
+      const stream = streamFor(song);
+      if (stream.key && !knownSeekable(stream.key)) {
+        // First play at this quality: give the server a moment to finish the
+        // transcode, so the stream has a length and can be seeked. If it takes
+        // too long, play anyway.
+        if (!fadeIn) audio.pause(); // not faded out, so it would stay audible while we wait
+        setPreparing(true);
+        void whenSeekable(stream.key, stream.url, STREAM_READY_WAIT_MS).then(start);
+      } else {
+        start();
+      }
     };
 
     // A manual skip while a song is playing (not mid-mix): fade it out first
@@ -446,6 +496,16 @@ export function NowPlaying({
     }
     load(false);
   }, [song, creds, getActiveAudio]);
+
+  // Have the server transcode the next song ahead of time, so it starts at once
+  // and can be cued for a mix. Costs one tiny request, not a download.
+  const nextSongId = nextSong?.id;
+  useEffect(() => {
+    const next = nextSongRef.current;
+    if (!next) return;
+    const stream = streamFor(next);
+    if (stream.key) void whenSeekable(stream.key, stream.url, STREAM_WARM_WAIT_MS);
+  }, [nextSongId, quality, creds]);
 
   // Buffer the next song on the idle deck, cued to its first downbeat.
   function preload(next: SubsonicSong) {
@@ -467,7 +527,10 @@ export function NowPlaying({
     audio.preload = "auto";
     resetStrip(deck, 0);
     setTrim(deck, next, track);
-    setStreamSrc(audio, next.id);
+    // The cue below is a seek. A transcode the server has not finished cannot
+    // be seeked, so in that rare case this one song streams as the original.
+    const stream = streamFor(next);
+    setStreamSrc(audio, next, stream.key !== null && !knownSeekable(stream.key));
     if (anchor !== null) {
       // Skip if a newer preload replaced this one before metadata arrived.
       const cue = () => { if (preloadRef.current?.songId === next.id) audio.currentTime = anchor; };
@@ -822,6 +885,7 @@ export function NowPlaying({
   const togglePlay = useCallback(() => {
     const audio = getActiveAudio();
     if (!audio) return;
+    if (preparingRef.current) return; // the song starts by itself once the server is ready
     if (audio.paused || pauseTimerRef.current) playRef.current();
     else pauseRef.current();
   }, [getActiveAudio]);
@@ -853,7 +917,8 @@ export function NowPlaying({
 
   function handleLoadedMetadata() {
     const audio = getActiveAudio();
-    if (audio) setDuration(audio.duration);
+    // A transcode still in progress reports no length; show the library's.
+    if (audio) setDuration(isFinite(audio.duration) ? audio.duration : song?.duration ?? 0);
   }
 
   function ratioFromPointer(e: React.PointerEvent): number {
@@ -866,6 +931,7 @@ export function NowPlaying({
   function seekToRatio(ratio: number) {
     const audio = getActiveAudio();
     if (!audio || !(duration > 0)) return;
+    if (!isFinite(audio.duration)) return; // a transcode still in progress: a seek would hang
     if (fadeRef.current) fadeRef.current.sync = null; // a seek breaks the beat alignment
     const target = ratio * duration;
     if (!fadeRef.current && !audio.paused && !pauseTimerRef.current && rampActiveFader(0, FADE_SEEK_OUT_S)) {
@@ -997,12 +1063,11 @@ export function NowPlaying({
         inside: currentTime >= mixZone.start && currentTime < mixZone.end,
       }
     : null;
-  const key = serverTrack?.key ?? analysis?.key;
+  // Kept to three short chips plus the quality picker so the row fits one line on a phone.
   const chips = [
     song.suffix?.toUpperCase(),
     song.bitRate ? `${song.bitRate} kbps` : null,
     effectiveBpm ? `${Math.round(effectiveBpm)} BPM` : null,
-    key ?? null,
   ].filter(Boolean) as string[];
 
   function onSeekKey(e: React.KeyboardEvent) {
@@ -1121,8 +1186,13 @@ export function NowPlaying({
             <span>Crossfade</span>
           </button>
           <button className={styles.ctrlSide} onClick={onPrev} aria-label="Previous"><PrevIcon size={30} /></button>
-          <button className={styles.ctrlPlay} onClick={togglePlay} aria-label={playing ? "Pause" : "Play"}>
-            {playing ? <PauseIcon size={32} /> : <PlayIcon size={32} />}
+          <button
+            className={styles.ctrlPlay}
+            onClick={togglePlay}
+            aria-label={preparing ? "Loading song" : playing ? "Pause" : "Play"}
+            aria-busy={preparing}
+          >
+            {preparing ? <SpinnerIcon size={32} /> : playing ? <PauseIcon size={32} /> : <PlayIcon size={32} />}
           </button>
           <button className={styles.ctrlSide} onClick={onNext} aria-label="Next"><NextIcon size={30} /></button>
           <button
@@ -1137,11 +1207,12 @@ export function NowPlaying({
 
       </div>
 
-      {chips.length > 0 && (
-        <ul className={styles.chips}>
-          {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
-        </ul>
-      )}
+      <ul className={styles.chips}>
+        {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
+        <li className={styles.chipFixed}>
+          <QualityMenu value={quality} onChange={(q) => { setQuality(q); saveQuality(q); }} />
+        </li>
+      </ul>
     </div>
   );
 }
