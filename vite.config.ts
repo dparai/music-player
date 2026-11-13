@@ -1,7 +1,13 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 import path from "path";
+
+// Dev-server proxy target: set BROOK_SERVER in .env.local (gitignored), e.g.
+// BROOK_SERVER=https://your-server.example
+const BACKEND =
+  loadEnv(process.env.NODE_ENV ?? "development", process.cwd(), "").BROOK_SERVER ||
+  "https://your-server.example";
 
 export default defineConfig({
   plugins: [
@@ -75,17 +81,17 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/rest": {
-        target: "https://your-server.example",
+        target: BACKEND,
         changeOrigin: true,
         secure: true,
       },
       "/api": {
-        target: "https://your-server.example",
+        target: BACKEND,
         changeOrigin: true,
         secure: true,
       },
       "/automix": {
-        target: "https://your-server.example",
+        target: BACKEND,
         changeOrigin: true,
         secure: true,
       },

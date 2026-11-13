@@ -1,8 +1,7 @@
 # Brook: how it runs on the server
 
 Everything that lives outside this repo's source files but that Brook depends on.
-Host: Oracle Cloud Always Free ARM VM (2 cores, 12 GB RAM). Real address: **your-server.example**.
-(`your-server.example` is listed in Caddy but has no DNS record.)
+Host: Oracle Cloud Always Free ARM VM (2 cores, 12 GB RAM). Real address: `<your-domain>` (set as `BROOK_SERVER` in `.env.local` for `npm run dev`).
 
 ## Layout
 
@@ -13,13 +12,13 @@ Host: Oracle Cloud Always Free ARM VM (2 cores, 12 GB RAM). Real address: **your
 | AutoMix (analysis API) | `127.0.0.1:8000`, proxied as `/automix/*`; code in `/opt/automix/app`, database `/opt/automix/automix.db` |
 | Old BPM/key file | `/opt/brook-analysis/analysis.json`, served as `/api/analysis.json` |
 | Music | `/srv/music` (a mirror of the Google Drive folder `My Music`) |
-| Nightly job | `/home/ubuntu/sync-music.sh`, cron `0 0 * * *`; log `/home/ubuntu/music-sync.log` |
+| Nightly job | `~/sync-music.sh`, cron `0 0 * * *`; log `~/music-sync.log` |
 | Dynamic DNS | `~/duckdns/duck.sh`, cron every 5 minutes |
 
 ## Caddy (the Brook site block in `/etc/caddy/Caddyfile`)
 
 ```
-your-server.example, your-server.example {
+<your-domain> {
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
@@ -90,7 +89,7 @@ Effect: the 277 KB app file is about 92 KB over the wire. Check a change with
 App: `npm run build`, back up `/var/www/brook` to `/opt/automix/backup-pwa-<timestamp>`, copy `dist/.` in, `chown -R www-data:www-data`.
 Before deploying, build the branch and compare the bundle name (`assets/index-<hash>.js`) with the one the live site serves: the same source gives the same name, so a different name means the live site holds changes this branch does not.
 
-Server: copy `server/automix/*.py` to `/opt/automix/app`, `server/analyze.py` to `/opt/brook-analysis`, `server/automix/sync-music.sh` to `/home/ubuntu`, then `sudo systemctl restart automix`.
+Server: copy `server/automix/*.py` to `/opt/automix/app`, `server/analyze.py` to `/opt/brook-analysis`, `server/automix/sync-music.sh` to the server home directory, then `sudo systemctl restart automix`.
 Backups of earlier states are in `/opt/automix/backup-*`.
 
 ## Known issues
