@@ -84,6 +84,15 @@
   margin: 0 auto;
 }
 
+/* Shared with the mini player, so the cover and play button travel between the
+   two when the view changes (see changeView in App.tsx). Not while the lyrics
+   have collapsed the cover: there is nothing to travel to. */
+@media (prefers-reduced-motion: no-preference) {
+  .coverWrap { view-transition-name: brook-art; }
+  .collapsed .coverWrap { view-transition-name: none; }
+  .ctrlPlay { view-transition-name: brook-play; }
+}
+
 .songRow {
   display: flex;
   align-items: flex-start;

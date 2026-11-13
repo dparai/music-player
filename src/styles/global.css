@@ -95,3 +95,45 @@ input, select {
     scroll-behavior: auto !important;
   }
 }
+
+/* Now Playing <-> Library (changeView in App.tsx). The views cross-fade, the
+   old one leaving faster than the new one arrives, while the cover and the
+   play button travel between the mini player and the full player. */
+::view-transition-old(root) {
+  animation-duration: 0.18s;
+  animation-timing-function: ease-in;
+}
+
+::view-transition-new(root) {
+  animation-duration: 0.34s;
+  animation-timing-function: ease-out;
+}
+
+::view-transition-group(brook-art),
+::view-transition-group(brook-play) {
+  animation-duration: 0.44s;
+  animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* The two covers are the same picture at different sizes: fill the moving box
+   instead of letterboxing inside it. */
+::view-transition-old(brook-art),
+::view-transition-new(brook-art),
+::view-transition-old(brook-play),
+::view-transition-new(brook-play) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  animation-duration: 0.3s;
+}
+
+::view-transition-group(brook-nav) {
+  animation-duration: 0.2s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 0.12s;
+  }
+}
