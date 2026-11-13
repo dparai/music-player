@@ -85,3 +85,10 @@
 @media (min-width: 900px) {
   .bar { display: none; }
 }
+
+/* Shared with the full player: see .coverWrap and .ctrlPlay in NowPlaying.module.css. */
+@media (prefers-reduced-motion: no-preference) {
+  .art,
+  .artPlaceholder { view-transition-name: brook-art; }
+  .playBtn { view-transition-name: brook-play; }
+}

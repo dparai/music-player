@@ -14,6 +14,7 @@ import {
 import { Login } from "@/components/Login";
 import { Library } from "@/components/Library";
 import { memo } from "react";
+import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
@@ -187,8 +188,7 @@ export function App() {
   }
 
   function handlePlay(song: SubsonicSong) {
-    setCurrentSongId(song.id);
-    setView("nowplaying");
+    changeView("nowplaying", () => setCurrentSongId(song.id));
   }
 
   const handleNext = useCallback(() => {
@@ -268,6 +268,19 @@ export function App() {
   handlePlayNextRef.current = handlePlayNext;
   const stablePlayNext = useCallback((song: SubsonicSong) => handlePlayNextRef.current(song), []);
 
+  // Switch between Now Playing and Library with a view transition, so the
+  // cover and play button travel between the mini player and the full player
+  // (the shared names are in the CSS; timing is in styles/global.css). Desktop
+  // shows both views at once, and a browser without the API just swaps.
+  // `also`: another state change to make in the same step (a song pick).
+  const changeView = useCallback((next: View, also?: () => void) => {
+    const apply = () => { also?.(); setView(next); };
+    const canMorph = typeof document.startViewTransition === "function"
+      && !window.matchMedia("(min-width: 900px)").matches;
+    if (!canMorph) { apply(); return; }
+    document.startViewTransition(() => flushSync(apply));
+  }, []);
+
   function handleTogglePlay() {
     togglePlayRef.current?.();
   }
@@ -329,11 +342,11 @@ export function App() {
           loading={preparing}
           progress={miniProgress}
           onToggle={handleTogglePlay}
-          onClick={() => setView("nowplaying")}
+          onClick={() => changeView("nowplaying")}
         />
       )}
 
-      <BottomNav active={view} onChange={setView} />
+      <BottomNav active={view} onChange={changeView} />
     </div>
   );
 }

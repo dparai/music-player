@@ -34,3 +34,6 @@
 @media (min-width: 900px) {
   .nav { display: none; }
 }
+
+/* Its own layer in a view change, so the tab bar holds still while the views swap. */
+.nav { view-transition-name: brook-nav; }
