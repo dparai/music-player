@@ -40,6 +40,7 @@ export function App() {
   const [view, setView] = useState<View>(() => (loadView() as View) ?? "nowplaying");
   const [miniPlaying, setMiniPlaying] = useState(false);
   const [miniProgress, setMiniProgress] = useState(0);
+  const [preparing, setPreparing] = useState(false); // a song is waiting on the server before it plays
   const togglePlayRef = useRef<(() => void) | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
   const [autoMixTracks, setAutoMixTracks] = useState<AutoMixTrack[]>([]);
@@ -302,6 +303,7 @@ export function App() {
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
                 onPlayingChange={handlePlayingChange}
+                onPreparingChange={setPreparing}
                 togglePlayRef={togglePlayRef}
                 autoMixTracks={autoMixTracks}
               />
@@ -324,6 +326,7 @@ export function App() {
           song={currentSong}
           creds={creds}
           playing={miniPlaying}
+          loading={preparing}
           progress={miniProgress}
           onToggle={handleTogglePlay}
           onClick={() => setView("nowplaying")}

@@ -1,18 +1,19 @@
 import type { SubsonicSong, SubsonicCredentials } from "@/lib/subsonic";
 import { coverArtUrl } from "@/lib/subsonic";
-import { PlayIcon, PauseIcon, NoteIcon } from "./icons";
+import { PlayIcon, PauseIcon, NoteIcon, SpinnerIcon } from "./icons";
 import styles from "./MiniPlayer.module.css";
 
 interface Props {
   song: SubsonicSong;
   creds: SubsonicCredentials;
   playing: boolean;
+  loading: boolean; // the server is preparing the song at the chosen quality
   progress: number;
   onToggle: () => void;
   onClick: () => void;
 }
 
-export function MiniPlayer({ song, creds, playing, progress, onToggle, onClick }: Props) {
+export function MiniPlayer({ song, creds, playing, loading, progress, onToggle, onClick }: Props) {
   return (
     <div
       className={styles.bar}
@@ -39,9 +40,10 @@ export function MiniPlayer({ song, creds, playing, progress, onToggle, onClick }
       <button
         className={styles.playBtn}
         onClick={(e) => { e.stopPropagation(); onToggle(); }}
-        aria-label={playing ? "Pause" : "Play"}
+        aria-label={loading ? "Loading song" : playing ? "Pause" : "Play"}
+        aria-busy={loading}
       >
-        {playing ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
+        {loading ? <SpinnerIcon size={22} /> : playing ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
       </button>
       <div className={styles.progress} style={{ transform: `scaleX(${progress})` }} />
     </div>

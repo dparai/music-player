@@ -1,6 +1,7 @@
 import md5 from "md5";
 import { stableToken } from "./stableToken";
 import { buildNameIndex, matchByName, type NameIndex } from "./match";
+import type { Transcode } from "./quality";
 
 interface SubsonicCredentials {
   server: string;
@@ -151,8 +152,17 @@ export async function getPlainLyrics(creds: SubsonicCredentials, artist: string,
   return data.lyrics?.value ?? "";
 }
 
-export function streamUrl(creds: SubsonicCredentials, songId: string): string {
-  return apiUrl(creds, "stream", { id: songId });
+// `transcode`: have the server re-encode to a lower bitrate; omitted, the
+// original file is streamed.
+export function streamUrl(creds: SubsonicCredentials, songId: string, transcode?: Transcode | null): string {
+  if (!transcode) return apiUrl(creds, "stream", { id: songId });
+  return apiUrl(creds, "stream", {
+    id: songId,
+    format: transcode.format,
+    maxBitRate: String(transcode.maxBitRate),
+    // A transcoded stream has no known size; the estimate lets the browser show a length.
+    estimateContentLength: "true",
+  });
 }
 
 export function coverArtUrl(creds: SubsonicCredentials, coverArtId: string, size = "300"): string {
