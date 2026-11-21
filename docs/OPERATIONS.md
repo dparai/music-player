@@ -66,6 +66,22 @@ Effect: the 277 KB app file is about 92 KB over the wire. Check a change with
 `/var/lib/navidrome/navidrome.toml` sets `MusicFolder = '/srv/music'`, `ScanSchedule = '@every 15m'` and
 `ImageCacheSize = "1.5GB"` (the default 100 MB was full and kept throwing covers away).
 
+The Opus transcode (High / Normal / Data saver on phones that play Ogg Opus) is the `opus audio` row of the
+`transcoding` table in `/var/lib/navidrome/navidrome.db`. Since 2026-11-21 its command is
+
+```
+ffmpeg -i %s -ss %t -map 0:a:0 -b:a %bk -v 0 -af aresample=resampler=soxr:precision=28:osf=flt:osr=48000 -ac 2 -c:a libopus -f opus -
+```
+
+- Opus is always 48 kHz, so a 44.1 kHz song is resampled. ffmpeg's default resampler left a spur only 44 dB below a
+  19 kHz test tone; soxr at precision 28 leaves it 66.7 dB below, and `osf=flt` keeps the 16-bit sources in float
+  until the encoder instead of rounding them to 16 bits first.
+- `-ac 2`: libopus refuses 320 kbps for a mono file (its limit is 256 kbps per stream), so mono songs failed at High;
+  a 5.1 file is mixed down to stereo.
+- Back up before editing (`sqlite3` is not installed; use Python's `sqlite3.Connection.backup`). A transcode already in
+  Navidrome's cache keeps the old command's output until it is evicted (the key does not include the command).
+- The MP3 row (Safari before 18.4) is unchanged: LAME takes 44.1 and 48 kHz as they are.
+
 ## The nightly job (`server/automix/sync-music.sh`)
 
 1. `rclone sync "gdrive:My Music" /srv/music --max-delete 5`: Drive deletions are mirrored; a run that would delete more than 5 files stops, so a renamed, empty or unreachable Drive folder cannot wipe the library.

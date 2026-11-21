@@ -4,6 +4,14 @@ import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import { loadQuality, saveQuality, streamFormat, transcodeFor, type Quality } from "@/lib/quality";
 import { knownSeekable, whenSeekable } from "@/lib/streamReady";
 import { QualityMenu } from "./QualityMenu";
+import { SoundMenu } from "./SoundMenu";
+import {
+  EQ_BANDS, EQ_Q, autoPreampDb, bandKind, isFlat, loadSound, saveSound, type SoundSettings,
+} from "@/lib/sound";
+import {
+  DEFAULT_START_LATENCY_S, GAPLESS_ARM_S, GAPLESS_FADE_S, GAPLESS_PRELOAD_S,
+  canGapless, equalPowerCurves, gaplessStartDelayS, updateLatency,
+} from "@/lib/gapless";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
   tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
@@ -174,6 +182,16 @@ export function NowPlaying({
   const skipNextLoadRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const masterRef = useRef<DynamicsCompressorNode | null>(null);
+  // Equaliser between the decks and the master limiter: preamp, then ten bands.
+  // Bypassed entirely while the curve is flat.
+  const eqRef = useRef<{ input: GainNode; filters: BiquadFilterNode[]; chained: boolean } | null>(null);
+  const [sound, setSound] = useState<SoundSettings>(loadSound);
+  const soundRef = useRef(sound);
+  soundRef.current = sound;
+  const songRef = useRef(song);
+  songRef.current = song;
+  // How long the browser takes from play() to sound, learned from each gapless handoff.
+  const startLatencyRef = useRef(DEFAULT_START_LATENCY_S);
   const decksRef = useRef<Partial<Record<Deck, DeckNodes>>>({});
   const trimDbRef = useRef<Partial<Record<Deck, number>>>({});
   const fadeRef = useRef<Fade | null>(null);
@@ -263,6 +281,18 @@ export function NowPlaying({
       master.connect(ctx.destination);
       audioCtxRef.current = ctx;
       masterRef.current = master;
+      const eqInput = ctx.createGain();
+      const filters = EQ_BANDS.map((hz, i) => {
+        const f = ctx.createBiquadFilter();
+        f.type = bandKind(i);
+        f.frequency.value = hz;
+        f.Q.value = EQ_Q;
+        f.gain.value = 0;
+        return f;
+      });
+      eqRef.current = { input: eqInput, filters, chained: false };
+      eqInput.connect(master);
+      applyEq();
       // The OS suspends/interrupts the context on lock or a call; a deck wired
       // into it is silent until it runs again.
       ctx.onstatechange = () => {
@@ -287,15 +317,60 @@ export function NowPlaying({
       shelf.type = "lowshelf";
       shelf.frequency.value = 200;
       shelf.gain.value = 0;
-      preGain.gain.value = dbToGain(trimDbRef.current[deck] ?? 0);
+      preGain.gain.value = trimGain(deck);
       const fader = ctx.createGain();
       // During a legacy fade both decks are audible and element volume does the fading.
       fader.gain.value = deck === activeDeckRef.current || fadeRef.current?.legacy ? 1 : 0;
-      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(masterRef.current!);
+      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(eqRef.current!.input);
       decksRef.current[deck] = { source, preGain, analyser, shelf, fader };
     }
     return true;
   }
+
+  // Push the equaliser settings into the graph. A flat curve bypasses the ten
+  // filters (no processing, no battery); otherwise the preamp cuts by the
+  // curve's peak so boosts cannot clip.
+  function applyEq() {
+    const eq = eqRef.current;
+    const ctx = audioCtxRef.current;
+    const master = masterRef.current;
+    if (!eq || !ctx || !master) return;
+    const gains = soundRef.current.eq;
+    const chained = !isFlat(gains);
+    if (chained !== eq.chained) {
+      eq.input.disconnect();
+      eq.filters.forEach((f) => f.disconnect());
+      if (chained) {
+        let prev: AudioNode = eq.input;
+        for (const f of eq.filters) { prev.connect(f); prev = f; }
+        prev.connect(master);
+      } else {
+        eq.input.connect(master);
+      }
+      eq.chained = chained;
+    }
+    const now = ctx.currentTime;
+    // setTargetAtTime: a dragged slider changes smoothly instead of crackling.
+    gains.forEach((g, i) => eq.filters[i]!.gain.setTargetAtTime(g, now, 0.015));
+    const pre = chained ? autoPreampDb(gains, ctx.sampleRate) : 0;
+    eq.input.gain.setTargetAtTime(dbToGain(pre), now, 0.02);
+  }
+
+  // Loudness trim as a gain: off when Normalize volume is off.
+  function trimGain(deck: Deck): number {
+    return soundRef.current.normalize ? dbToGain(trimDbRef.current[deck] ?? 0) : 1;
+  }
+
+  const firstSoundRun = useRef(true);
+  useEffect(() => {
+    saveSound(sound);
+    if (firstSoundRun.current) { firstSoundRun.current = false; return; }
+    applyEq();
+    for (const deck of ["A", "B"] as const) {
+      const nodes = decksRef.current[deck];
+      if (nodes) setParam(nodes.preGain.gain, trimGain(deck));
+    }
+  }, [sound]);
 
   // Any tap or key press unlocks audio; wire the graph as soon as one happens.
   useEffect(() => {
@@ -366,7 +441,7 @@ export function NowPlaying({
     const db = loudnessTrimDb(track?.lufs, s.replayGain);
     trimDbRef.current[deck] = db; // applied when the graph is wired, if it isn't yet
     const nodes = decksRef.current[deck];
-    if (nodes) setParam(nodes.preGain.gain, dbToGain(db));
+    if (nodes) setParam(nodes.preGain.gain, trimGain(deck));
   }
 
   function resetStrip(deck: Deck, fader: number) {
@@ -691,6 +766,128 @@ export function NowPlaying({
     };
   }, [djMode, getActiveAudio]);
 
+  // Gapless playback (Crossfade off). The next song is buffered on the idle
+  // deck well before the end; its play() is then called a little early, so its
+  // first sound lands as this one finishes, joined by a 30 ms equal-power
+  // overlap. A locked phone skips all this: the `ended` handoff does it there.
+  function preloadPlain(next: SubsonicSong) {
+    const deck: Deck = activeDeckRef.current === "A" ? "B" : "A";
+    const audio = audioFor(deck);
+    if (!audio) return;
+    ensureAudioGraph();
+    audio.pause();
+    audio.preload = "auto";
+    audio.preservesPitch = true;
+    audio.playbackRate = 1;
+    resetStrip(deck, 0);
+    setTrim(deck, next, liveRef.current.serverNextTrack);
+    setStreamSrc(audio, next); // played from 0, so an unready transcode is fine
+    preloadRef.current = { songId: next.id, deck, anchor: null };
+    diag("gapless preload", { id: next.id, deck });
+  }
+
+  // A transcode the server has not finished reports an estimated length, so the
+  // end cannot be timed: leave those to the `ended` handoff.
+  function lengthIsExact(s: SubsonicSong | null): boolean {
+    if (!s) return false;
+    const key = streamFor(s).key;
+    return key === null || knownSeekable(key);
+  }
+
+  function startGapless() {
+    const out = getActiveAudio();
+    const inc = getInactiveAudio();
+    const next = nextSongRef.current;
+    const ctx = audioCtxRef.current;
+    const giveUp = (why: string) => { diag("gapless skipped", { why }); crossfadeStartedRef.current = false; };
+    if (!out || !inc || !next || !ctx) return giveUp("no deck");
+    if (out.paused) return giveUp("paused");
+    if (preloadRef.current?.songId !== next.id) return giveUp("next changed");
+    const live = ensureAudioGraph() && ctx.state === "running";
+    const remaining = out.duration - out.currentTime;
+    if (!canGapless({
+      enabled: soundRef.current.gapless,
+      hidden: document.hidden,
+      hasNext: true,
+      graphLive: live,
+      nextReady: inc.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA,
+    })) return giveUp(`not ready rs=${inc.readyState}`);
+    // A seek or stall moved the playhead since the timer was set.
+    if (!(remaining > 0) || remaining > GAPLESS_ARM_S) return giveUp(`playhead moved remaining=${remaining.toFixed(2)}`);
+
+    const outDeck = activeDeckRef.current;
+    const inDeck: Deck = outDeck === "A" ? "B" : "A";
+    const o = decksRef.current[outDeck];
+    const i = decksRef.current[inDeck];
+    if (!o || !i) return giveUp("no strip");
+
+    const curves = equalPowerCurves(16);
+    const now = ctx.currentTime;
+    const t0 = now + Math.max(0, remaining / (out.playbackRate || 1) - GAPLESS_FADE_S);
+    o.fader.gain.cancelScheduledValues(0);
+    o.fader.gain.setValueAtTime(1, now);
+    o.fader.gain.setValueCurveAtTime(curves.out, t0, GAPLESS_FADE_S);
+    i.fader.gain.cancelScheduledValues(0);
+    i.fader.gain.setValueAtTime(0, now);
+    i.fader.gain.setValueCurveAtTime(curves.in, t0, GAPLESS_FADE_S);
+
+    inc.currentTime = 0;
+    const called = performance.now();
+    inc.addEventListener("playing", () => {
+      startLatencyRef.current = updateLatency(startLatencyRef.current, (performance.now() - called) / 1000);
+    }, { once: true });
+    inc.play().catch((e) => {
+      // Refused: undo the overlap and let the `ended` handoff start the song.
+      diag("gapless play refused", { err: String(e) });
+      if (fadeRef.current?.song.id !== next.id) return;
+      if (fadeTimerRef.current) { clearInterval(fadeTimerRef.current); fadeTimerRef.current = null; }
+      fadeRef.current = null;
+      preloadRef.current = null;
+      resetStrip(outDeck, 1);
+      resetStrip(inDeck, 0);
+      crossfadeStartedRef.current = false;
+    });
+    fadeRef.current = { song: next, outDeck, inDeck, end: t0 + GAPLESS_FADE_S, rate: 1, bar: 1, sync: null, legacy: null };
+    diag("gapless start", { id: next.id, remaining: +remaining.toFixed(3), latency: +startLatencyRef.current.toFixed(3) });
+
+    if (fadeTimerRef.current) clearInterval(fadeTimerRef.current);
+    fadeTimerRef.current = window.setInterval(tickFade, 50);
+  }
+
+  useEffect(() => {
+    if (djMode) return; // the mix engine hands over by itself
+
+    const check = () => {
+      if (document.hidden || !soundRef.current.gapless) return;
+      const audio = getActiveAudio();
+      if (!audio || audio.paused || !isFinite(audio.duration) || !(audio.duration > 0)) return;
+      const next = nextSongRef.current;
+      if (!next || crossfadeStartedRef.current || fadeRef.current) return;
+      if (pauseTimerRef.current || skipTimerRef.current || seekRef.current) return;
+      if (!lengthIsExact(songRef.current)) return;
+
+      const remaining = audio.duration - audio.currentTime;
+      if (remaining > GAPLESS_PRELOAD_S) return;
+      if (preloadRef.current?.songId !== next.id) preloadPlain(next);
+      if (remaining <= GAPLESS_ARM_S && remaining > 0 && preloadRef.current?.songId === next.id) {
+        crossfadeStartedRef.current = true;
+        // The 200 ms poll is far too coarse for this; time the start exactly.
+        const delay = gaplessStartDelayS(remaining, startLatencyRef.current, audio.playbackRate);
+        startTimerRef.current = window.setTimeout(() => { startTimerRef.current = null; startGapless(); }, delay * 1000);
+      }
+    };
+
+    const interval = setInterval(check, 200);
+    return () => {
+      clearInterval(interval);
+      if (startTimerRef.current) {
+        clearTimeout(startTimerRef.current);
+        startTimerRef.current = null;
+        crossfadeStartedRef.current = false;
+      }
+    };
+  }, [djMode, getActiveAudio]);
+
   // `target`: the outgoing time this start was timed to (null: start now, e.g.
   // silence detected). `onDownbeat`: target is a downbeat, so beat-sync.
   function startCrossfade(target: number | null, onDownbeat: boolean) {
@@ -990,6 +1187,7 @@ export function NowPlaying({
         audioCtxRef.current.close().catch(() => {});
         audioCtxRef.current = null;
         masterRef.current = null;
+        eqRef.current = null;
         decksRef.current = {};
       }, 0);
     };
@@ -1330,6 +1528,9 @@ export function NowPlaying({
 
       <ul className={styles.chips}>
         {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
+        <li className={styles.chipFixed}>
+          <SoundMenu value={sound} onChange={setSound} />
+        </li>
         <li className={styles.chipFixed}>
           <QualityMenu value={quality} onChange={(q) => {
             if (q === "original" && onChooseOriginal && !onChooseOriginal()) return;
