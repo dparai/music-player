@@ -1,10 +1,10 @@
 import { useState, useMemo, useCallback, useRef, useEffect, useSyncExternalStore } from "react";
 import type { SubsonicSong, SubsonicCredentials } from "@/lib/subsonic";
 import { coverArtUrl } from "@/lib/subsonic";
-import { SearchIcon, MoreIcon, LogoutIcon, NoteIcon, NextIcon, DownloadIcon, TrashIcon, CheckIcon } from "./icons";
+import { SearchIcon, MoreIcon, LogoutIcon, NoteIcon, NextIcon, TrashIcon, CheckIcon } from "./icons";
 import {
-  subscribeDownloads, downloadsVersion, isDownloaded, downloadState, downloadSongs, cancelQueued,
-  removeDownload, removeAllDownloads, clearFailed, downloadsSupported, downloadedCount,
+  subscribeDownloads, downloadsVersion, isDownloaded, downloadState, cancelQueued,
+  removeDownload, removeAllDownloads, downloadsSupported, downloadedCount,
 } from "@/lib/downloads";
 import styles from "./Library.module.css";
 
@@ -26,11 +26,6 @@ function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-function formatSize(bytes: number): string {
-  const mb = bytes / 1_000_000;
-  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
 }
 
 export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNext }: Props) {
@@ -125,25 +120,10 @@ export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNex
     setContextMenu(null);
   }
 
-  function handleDownload(song: SubsonicSong) {
+  function handleRemoveDownload(song: SubsonicSong) {
     setContextMenu(null);
-    if (isDownloaded(song.id)) {
-      void removeDownload(song.id);
-      showToast(`Removed from device: ${song.title}`);
-    } else {
-      clearFailed(song.id);
-      downloadSongs(creds, [song]);
-      showToast(`Downloading: ${song.title}`);
-    }
-  }
-
-  function handleDownloadAll() {
-    const todo = filtered.filter((s) => !isDownloaded(s.id));
-    if (todo.length === 0) { showToast("Everything shown is already on this device"); return; }
-    const size = todo.reduce((n, s) => n + (s.size || 0), 0);
-    if (!window.confirm(`Download ${todo.length} ${todo.length === 1 ? "song" : "songs"} (${formatSize(size)}) as original files? Use Wi-Fi.`)) return;
-    downloadSongs(creds, todo);
-    showToast(`Downloading ${todo.length} songs`);
+    void removeDownload(song.id);
+    showToast(`Removed from device: ${song.title}`);
   }
 
   function handleRemoveAll() {
@@ -211,7 +191,6 @@ export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNex
                 Downloaded{downloadedCount() ? ` ${downloadedCount()}` : ""}
               </button>
             )}
-            {online && <button className={styles.dlChip} onClick={handleDownloadAll}>Download all</button>}
             {downloadedCount() > 0 && <button className={styles.dlChip} onClick={handleRemoveAll}>Remove all</button>}
           </div>
         )}
@@ -289,15 +268,11 @@ export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNex
           <button className={styles.ctxOption} onClick={() => handlePlayNext(contextMenu.song)}>
             <NextIcon size={16} /> Play next
           </button>
-          {downloadsSupported && (isDownloaded(contextMenu.song.id) ? (
-            <button className={styles.ctxOption} onClick={() => handleDownload(contextMenu.song)}>
+          {downloadsSupported && isDownloaded(contextMenu.song.id) && (
+            <button className={styles.ctxOption} onClick={() => handleRemoveDownload(contextMenu.song)}>
               <TrashIcon size={16} /> Remove download
             </button>
-          ) : online && (
-            <button className={styles.ctxOption} onClick={() => handleDownload(contextMenu.song)}>
-              <DownloadIcon size={16} /> Download
-            </button>
-          ))}
+          )}
         </div>
       )}
 

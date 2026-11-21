@@ -38,6 +38,8 @@ interface Props {
   onPreparingChange?: (preparing: boolean) => void;
   togglePlayRef?: React.MutableRefObject<(() => void) | null>;
   autoMixTracks?: AutoMixTrack[];
+  // Choosing Original in the quality menu saves every song on the device. False: the user said no, keep the old quality.
+  onChooseOriginal?: () => boolean;
 }
 
 type Deck = "A" | "B";
@@ -139,7 +141,7 @@ export function NowPlaying({
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, onPreparingChange, togglePlayRef,
-  autoMixTracks,
+  autoMixTracks, onChooseOriginal,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -1329,7 +1331,10 @@ export function NowPlaying({
       <ul className={styles.chips}>
         {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
         <li className={styles.chipFixed}>
-          <QualityMenu value={quality} onChange={(q) => { setQuality(q); saveQuality(q); }} />
+          <QualityMenu value={quality} onChange={(q) => {
+            if (q === "original" && onChooseOriginal && !onChooseOriginal()) return;
+            setQuality(q); saveQuality(q);
+          }} />
         </li>
       </ul>
     </div>

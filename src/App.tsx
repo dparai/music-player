@@ -17,7 +17,7 @@ import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
 import { DiagPanel } from "@/components/DiagPanel";
-import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion } from "@/lib/downloads";
+import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
@@ -190,6 +190,19 @@ export function App() {
     creds && currentSong?.coverArt ? coverArtUrl(creds, currentSong.coverArt, "64") : null,
   );
 
+  // "Original" in the quality menu: save every song on the device. False if the user says no.
+  function handleChooseOriginal(): boolean {
+    if (!creds || !downloadsSupported) return true;
+    const todo = allSongs.filter((s) => !isDownloaded(s.id));
+    if (todo.length === 0) return true;
+    if (!online) { window.alert("Connect to the internet to download your songs."); return false; }
+    const bytes = todo.reduce((n, s) => n + (s.size || 0), 0);
+    const size = bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+    if (!window.confirm(`Download ${todo.length} ${todo.length === 1 ? "song" : "songs"} (${size}) to this device as original files? Use Wi-Fi.`)) return false;
+    downloadSongs(creds, todo);
+    return true;
+  }
+
   function handleLogin(c: SubsonicCredentials) {
     saveCredentials(c);
     setCreds(c);
@@ -338,6 +351,7 @@ export function App() {
                 onPreparingChange={setPreparing}
                 togglePlayRef={togglePlayRef}
                 autoMixTracks={autoMixTracks}
+                onChooseOriginal={handleChooseOriginal}
               />
             </div>
             <div className={`${styles.view} ${styles.viewLib}`} style={{ display: view === "library" ? "flex" : "none" }}>
