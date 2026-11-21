@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
 import { getAllSongs, fetchAnalysis, lookupAnalysis, coverArtUrl } from "@/lib/subsonic";
 import { useAlbumAccent } from "@/lib/albumAccent";
@@ -17,6 +17,7 @@ import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
 import { DiagPanel } from "@/components/DiagPanel";
+import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
@@ -37,7 +38,23 @@ const MemoLibrary = memo(Library);
 
 export function App() {
   const [creds, setCreds] = useState<SubsonicCredentials | null>(loadCredentials);
-  const [songs, setSongs] = useState<SubsonicSong[]>([]);
+  const [allSongs, setSongs] = useState<SubsonicSong[]>([]);
+  // Saved songs play with no internet; everything else needs it. Offline, the
+  // library, the play order and shuffle only know the saved ones.
+  const saved = useSyncExternalStore(subscribeDownloads, downloadsVersion);
+  const online = useSyncExternalStore(
+    (cb) => {
+      window.addEventListener("online", cb);
+      window.addEventListener("offline", cb);
+      return () => { window.removeEventListener("online", cb); window.removeEventListener("offline", cb); };
+    },
+    () => navigator.onLine,
+  );
+  const songs = useMemo(
+    () => (online ? allSongs : allSongs.filter((s) => isDownloaded(s.id))),
+    [allSongs, online, saved],
+  );
+  useEffect(() => { void loadDownloads(); }, []);
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<View>(() => (loadView() as View) ?? "nowplaying");
   const [miniPlaying, setMiniPlaying] = useState(false);
@@ -326,6 +343,7 @@ export function App() {
             <div className={`${styles.view} ${styles.viewLib}`} style={{ display: view === "library" ? "flex" : "none" }}>
               <MemoLibrary
                 songs={songs}
+                online={online}
                 creds={creds}
                 currentSongId={currentSong?.id ?? null}
                 onPlay={stablePlay}

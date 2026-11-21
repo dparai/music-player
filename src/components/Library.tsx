@@ -1,12 +1,17 @@
-import { useState, useMemo, useCallback, useRef, useEffect } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect, useSyncExternalStore } from "react";
 import type { SubsonicSong, SubsonicCredentials } from "@/lib/subsonic";
 import { coverArtUrl } from "@/lib/subsonic";
-import { SearchIcon, MoreIcon, LogoutIcon, NoteIcon, NextIcon } from "./icons";
+import { SearchIcon, MoreIcon, LogoutIcon, NoteIcon, NextIcon, DownloadIcon, TrashIcon, CheckIcon } from "./icons";
+import {
+  subscribeDownloads, downloadsVersion, isDownloaded, downloadState, downloadSongs, cancelQueued,
+  removeDownload, removeAllDownloads, clearFailed, downloadsSupported, downloadedCount,
+} from "@/lib/downloads";
 import styles from "./Library.module.css";
 
 interface Props {
   songs: SubsonicSong[];
   creds: SubsonicCredentials;
+  online: boolean;
   currentSongId: string | null;
   onPlay: (song: SubsonicSong) => void;
   onPlayNext: (song: SubsonicSong) => void;
@@ -23,7 +28,14 @@ function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Props) {
+function formatSize(bytes: number): string {
+  const mb = bytes / 1_000_000;
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNext }: Props) {
+  useSyncExternalStore(subscribeDownloads, downloadsVersion); // redraw when a download starts, ends or is removed
+  const [onlySaved, setOnlySaved] = useState(false);
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<SortKey>("title");
   const [scrollTop, setScrollTop] = useState(0);
@@ -34,6 +46,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
 
   const filtered = useMemo(() => {
     let list = songs;
+    if (onlySaved) list = list.filter((s) => isDownloaded(s.id));
     if (query) {
       const q = query.toLowerCase();
       list = list.filter(
@@ -49,7 +62,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
       if (typeof av === "string" && typeof bv === "string") return av.localeCompare(bv);
       return av < bv ? -1 : av > bv ? 1 : 0;
     });
-  }, [songs, query, sortBy]);
+  }, [songs, query, sortBy, onlySaved, downloadsVersion()]);
 
   // Group by first letter when sorted by title
   const letterGroups = useMemo(() => {
@@ -100,7 +113,7 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
     e.stopPropagation();
     const rect = e.currentTarget.getBoundingClientRect();
     const menuW = 170;
-    const menuH = 90;
+    const menuH = 130;
     const x = Math.min(rect.right, window.innerWidth - menuW - 8);
     const y = rect.bottom + menuH > window.innerHeight ? rect.top - menuH - 4 : rect.bottom + 4;
     setContextMenu({ song, x, y });
@@ -110,6 +123,33 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
     onPlayNext(song);
     showToast(`Play Next: ${song.title}`);
     setContextMenu(null);
+  }
+
+  function handleDownload(song: SubsonicSong) {
+    setContextMenu(null);
+    if (isDownloaded(song.id)) {
+      void removeDownload(song.id);
+      showToast(`Removed from device: ${song.title}`);
+    } else {
+      clearFailed(song.id);
+      downloadSongs(creds, [song]);
+      showToast(`Downloading: ${song.title}`);
+    }
+  }
+
+  function handleDownloadAll() {
+    const todo = filtered.filter((s) => !isDownloaded(s.id));
+    if (todo.length === 0) { showToast("Everything shown is already on this device"); return; }
+    const size = todo.reduce((n, s) => n + (s.size || 0), 0);
+    if (!window.confirm(`Download ${todo.length} ${todo.length === 1 ? "song" : "songs"} (${formatSize(size)}) as original files? Use Wi-Fi.`)) return;
+    downloadSongs(creds, todo);
+    showToast(`Downloading ${todo.length} songs`);
+  }
+
+  function handleRemoveAll() {
+    if (!window.confirm(`Remove all ${downloadedCount()} downloaded songs from this device?`)) return;
+    cancelQueued();
+    void removeAllDownloads();
   }
 
   // Find which letter badge should appear before a visible item
@@ -156,7 +196,26 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
         </select>
       </div>
 
-      <p className={styles.count}>{filtered.length} {filtered.length === 1 ? "song" : "songs"}</p>
+      {!online && <p className={styles.offlineNote}>Offline. Showing songs saved on this device.</p>}
+
+      <div className={styles.countRow}>
+        <p className={styles.count}>{filtered.length} {filtered.length === 1 ? "song" : "songs"}</p>
+        {downloadsSupported && (
+          <div className={styles.dlActions}>
+            {online && (
+              <button
+                className={`${styles.dlChip} ${onlySaved ? styles.dlChipOn : ""}`}
+                aria-pressed={onlySaved}
+                onClick={() => setOnlySaved((v) => !v)}
+              >
+                Downloaded{downloadedCount() ? ` ${downloadedCount()}` : ""}
+              </button>
+            )}
+            {online && <button className={styles.dlChip} onClick={handleDownloadAll}>Download all</button>}
+            {downloadedCount() > 0 && <button className={styles.dlChip} onClick={handleRemoveAll}>Remove all</button>}
+          </div>
+        )}
+      </div>
 
       {filtered.length === 0 && (
         <div className={styles.empty}>
@@ -194,7 +253,17 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
                   )}
                   <div className={styles.info}>
                     <span className={styles.songTitle}>{song.title}</span>
-                    <span className={styles.meta}>{song.artist ?? "Unknown"}</span>
+                    <span className={styles.meta}>
+                      {isDownloaded(song.id) && <span className={styles.saved} title="Saved on this device"><CheckIcon size={12} /> </span>}
+                      {(() => {
+                        const st = downloadState(song.id);
+                        if (!st) return null;
+                        if (st.status === "queued") return <span className={styles.dlStatus}>Waiting · </span>;
+                        if (st.status === "downloading") return <span className={styles.dlStatus}>{st.pct}% · </span>;
+                        return <span className={styles.dlFail}>{st.reason} · </span>;
+                      })()}
+                      {song.artist ?? "Unknown"}
+                    </span>
                   </div>
                   <span className={styles.duration}>{formatDuration(song.duration)}</span>
                 </button>
@@ -220,6 +289,15 @@ export function Library({ songs, creds, currentSongId, onPlay, onPlayNext }: Pro
           <button className={styles.ctxOption} onClick={() => handlePlayNext(contextMenu.song)}>
             <NextIcon size={16} /> Play next
           </button>
+          {downloadsSupported && (isDownloaded(contextMenu.song.id) ? (
+            <button className={styles.ctxOption} onClick={() => handleDownload(contextMenu.song)}>
+              <TrashIcon size={16} /> Remove download
+            </button>
+          ) : online && (
+            <button className={styles.ctxOption} onClick={() => handleDownload(contextMenu.song)}>
+              <DownloadIcon size={16} /> Download
+            </button>
+          ))}
         </div>
       )}
 

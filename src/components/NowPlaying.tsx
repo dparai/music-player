@@ -15,6 +15,7 @@ import { PlayIcon, PauseIcon, PrevIcon, NextIcon, ShuffleIcon, MixIcon, NoteIcon
 import { LyricsView } from "./LyricsView";
 import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
 import { diag } from "@/lib/diag";
+import { isDownloaded, offlineUrl } from "@/lib/downloads";
 import styles from "./NowPlaying.module.css";
 import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
@@ -415,6 +416,8 @@ export function NowPlaying({
   // file, which can always be seeked; a transcoded one only once the server has
   // cached it (see lib/streamReady.ts).
   function streamFor(s: SubsonicSong) {
+    // Saved on the device: a plain URL the service worker answers, no network.
+    if (isDownloaded(s.id)) return { key: null, url: () => offlineUrl(s.id) };
     const transcode = transcodeFor(s, qualityRef.current, streamFormat());
     return {
       key: transcode ? `${s.id}|${transcode.format}|${transcode.maxBitRate}` : null,
@@ -424,7 +427,7 @@ export function NowPlaying({
 
   // `original`: stream the file as it is, whatever the quality setting.
   function setStreamSrc(audio: HTMLAudioElement, s: SubsonicSong, original = false) {
-    const url = original ? streamUrl(creds, s.id) : streamFor(s).url();
+    const url = original && !isDownloaded(s.id) ? streamUrl(creds, s.id) : streamFor(s).url();
     // A cross-origin stream routed through Web Audio is silent without CORS.
     try {
       if (new URL(url, window.location.href).origin !== window.location.origin) {
@@ -1107,7 +1110,7 @@ export function NowPlaying({
   // Lyrics are fetched on first open, then on every song change while the panel is open.
   const [lyricsOpen, setLyricsOpen] = useState(false);
   const [lyricsSeen, setLyricsSeen] = useState(false);
-  const [lyricsState, setLyricsState] = useState<{ status: "loading" | "ready" | "none" | "error"; data: Lyrics | null }>(
+  const [lyricsState, setLyricsState] = useState<{ status: "loading" | "ready" | "none" | "error" | "offline"; data: Lyrics | null }>(
     { status: "none", data: null },
   );
   const [lyricsTry, setLyricsTry] = useState(0);
@@ -1117,12 +1120,19 @@ export function NowPlaying({
   useEffect(() => {
     if (!lyricsOpen || !song) return;
     let alive = true;
+    // Lyrics are not saved on the device: with no internet, say so.
+    if (!navigator.onLine) {
+      setLyricsState({ status: "offline", data: null });
+      const back = () => setLyricsTry((n) => n + 1);
+      window.addEventListener("online", back, { once: true });
+      return () => { alive = false; window.removeEventListener("online", back); };
+    }
     setLyricsState({ status: "loading", data: null });
     fetchLyrics(creds, song).then((r) => {
       if (!alive) return;
       setLyricsState(
         r.lyrics ? { status: "ready", data: r.lyrics }
-          : { status: r.error ? "error" : "none", data: null },
+          : { status: r.error ? (navigator.onLine ? "error" : "offline") : "none", data: null },
       );
     });
     return () => { alive = false; };

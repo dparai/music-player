@@ -6,9 +6,9 @@ export type Quality = "original" | "high" | "normal" | "saver";
 
 export const QUALITIES: { id: Quality; label: string; kbps: number | null }[] = [
   { id: "original", label: "Original", kbps: null },
-  { id: "high", label: "High", kbps: 256 },
-  { id: "normal", label: "Normal", kbps: 128 },
-  { id: "saver", label: "Data saver", kbps: 64 },
+  { id: "high", label: "High", kbps: 320 },
+  { id: "normal", label: "Normal", kbps: 256 },
+  { id: "saver", label: "Data saver", kbps: 128 },
 ];
 
 export type StreamFormat = "opus" | "mp3";

@@ -4,7 +4,7 @@ import { activeLine } from "@/lib/lyrics";
 import styles from "./LyricsView.module.css";
 
 interface Props {
-  status: "loading" | "ready" | "none" | "error";
+  status: "loading" | "ready" | "none" | "error" | "offline";
   lyrics: Lyrics | null;
   time: number;
   getTime?: () => number; // live playback position; the `time` prop only changes about 4 times a second
@@ -85,6 +85,7 @@ export function LyricsView({ status, lyrics, time, getTime, open, onRetry, onSee
       <div className={styles.note} role="status">
         <p>
           {status === "loading" ? "Looking for lyrics…"
+            : status === "offline" ? "Connect to the internet to see lyrics."
             : status === "error" ? "Couldn't reach the lyrics service."
             : "No lyrics for this song."}
         </p>
