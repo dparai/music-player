@@ -16,6 +16,7 @@ import { Library } from "@/components/Library";
 import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
+import { DiagPanel } from "@/components/DiagPanel";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
@@ -289,6 +290,7 @@ export function App() {
 
   return (
     <div className={styles.layout} style={accentStyle}>
+      {window.location.hash === "#debug" && <DiagPanel />}
       <main className={styles.main}>
         {loading ? (
           <div className={styles.loading} role="status" aria-label="Loading your library">

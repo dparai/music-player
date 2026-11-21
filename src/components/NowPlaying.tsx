@@ -14,6 +14,7 @@ import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import { PlayIcon, PauseIcon, PrevIcon, NextIcon, ShuffleIcon, MixIcon, NoteIcon, LyricsIcon, SpinnerIcon } from "./icons";
 import { LyricsView } from "./LyricsView";
 import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
+import { diag } from "@/lib/diag";
 import styles from "./NowPlaying.module.css";
 import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
@@ -477,11 +478,11 @@ export function NowPlaying({
       const start = () => {
         if (lastSongIdRef.current !== song.id) return; // a newer pick took over while the server prepared this one
         setPreparing(false);
-        setStreamSrc(audio, song, hidden && unready);
+        setStreamSrc(audio, song); // never the raw original for an unready transcode: it stalls on mobile data
         retryPlayRef.current = false;
         audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
           .catch((e) => {
-            console.warn("[brook] play() refused", e);
+            diag("play refused", { id: song.id, err: String(e) });
             retryPlayRef.current = true;
             if (fadeIn) resetStrip(activeDeckRef.current, 1);
           });
@@ -518,7 +519,7 @@ export function NowPlaying({
     const next = nextSongRef.current;
     if (!next) return;
     const stream = streamFor(next);
-    if (stream.key) void whenSeekable(stream.key, stream.url, STREAM_WARM_WAIT_MS);
+    if (stream.key) void whenSeekable(stream.key, stream.url, STREAM_WARM_WAIT_MS).then((ok) => diag("prewarm next", { id: next.id, ready: ok, hidden: document.hidden }));
   }, [nextSongId, quality, creds]);
 
   // Buffer the next song on the idle deck, cued to its first downbeat.
@@ -991,6 +992,40 @@ export function NowPlaying({
 
   // Play was refused (locked screen, no gesture): retry once the page is visible again.
   const retryPlayRef = useRef(false);
+  // A song is being swapped for the next on the same element: the brief pause
+  // between them must not reach the OS as "paused".
+  const handoffRef = useRef(false);
+
+  // Record what the audio elements and the page do, for the #debug panel.
+  useEffect(() => {
+    const els = [audioARef.current, audioBRef.current];
+    const names = ["error", "stalled", "waiting", "playing", "pause", "ended", "emptied", "abort", "loadstart", "canplay"];
+    const info = (a: HTMLAudioElement, i: number) => ({
+      deck: i === 0 ? "A" : "B",
+      id: a.src.match(/[?&]id=([^&]+)/)?.[1],
+      t: +a.currentTime.toFixed(1),
+      d: isFinite(a.duration) ? +a.duration.toFixed(1) : null,
+      rs: a.readyState,
+      ns: a.networkState,
+      fmt: a.src.match(/[?&]format=([^&]+)/)?.[1] ?? "original",
+    });
+    const cleanups: (() => void)[] = [];
+    els.forEach((a, i) => {
+      if (!a) return;
+      for (const n of names) {
+        const h = () => diag(`audio ${n}`, n === "error" ? { ...info(a, i), code: a.error?.code, msg: a.error?.message } : info(a, i));
+        a.addEventListener(n, h);
+        cleanups.push(() => a.removeEventListener(n, h));
+      }
+    });
+    const vis = () => diag("page " + document.visibilityState, { ctx: audioCtxRef.current?.state ?? null });
+    document.addEventListener("visibilitychange", vis);
+    diag("player mounted", { ua: navigator.userAgent, hidden: document.hidden });
+    return () => {
+      cleanups.forEach((c) => c());
+      document.removeEventListener("visibilitychange", vis);
+    };
+  }, []);
 
   // Resume playback after the OS suspended the audio graph or refused a play().
   useEffect(() => {
@@ -1014,7 +1049,9 @@ export function NowPlaying({
 
   // Lock-screen controls and the OS audio session follow the real play state.
   useEffect(() => {
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+    if (!("mediaSession" in navigator)) return;
+    if (!playing && handoffRef.current) return; // a song change, not a real pause
+    navigator.mediaSession.playbackState = playing ? "playing" : "paused";
   }, [playing]);
 
   function handleEnded() {
@@ -1041,11 +1078,16 @@ export function NowPlaying({
     setTrim(activeDeckRef.current, next, liveRef.current.serverNextTrack);
     audio.preservesPitch = true;
     audio.playbackRate = 1;
+    // Always the chosen quality. An unready transcode still plays (it just has
+    // no length yet); the raw original is up to 2.7 Mbps and stalls on mobile data.
     const key = streamFor(next).key;
-    setStreamSrc(audio, next, key !== null && !knownSeekable(key));
+    setStreamSrc(audio, next);
+    diag("handoff", { id: next.id, hidden: document.hidden, ctx: audioCtxRef.current?.state ?? null, ready: key === null || knownSeekable(key) });
     retryPlayRef.current = false;
-    audio.play().then(() => setPlaying(true)).catch((e) => {
-      console.warn("[brook] next song play() refused", e);
+    handoffRef.current = true;
+    audio.play().then(() => { handoffRef.current = false; setPlaying(true); diag("handoff play ok", { id: next.id }); }).catch((e) => {
+      handoffRef.current = false;
+      diag("handoff play refused", { id: next.id, err: String(e) });
       retryPlayRef.current = true;
     });
     onAdvanceRef.current(next);
