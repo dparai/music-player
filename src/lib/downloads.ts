@@ -14,7 +14,7 @@ const have = new Set<string>();
 const active = new Map<string, DownloadState>();
 const listeners = new Set<() => void>();
 let version = 0;
-let loaded = false;
+let loadPromise: Promise<void> | null = null;
 
 function changed() {
   version++;
@@ -45,9 +45,13 @@ export function downloadedCount(): number {
 export const downloadsSupported = typeof caches !== "undefined";
 
 // Reads which songs are already on the device. Call once at start.
-export async function loadDownloads(): Promise<void> {
-  if (!downloadsSupported || loaded) return;
-  loaded = true;
+export function loadDownloads(): Promise<void> {
+  if (!downloadsSupported) return Promise.resolve();
+  loadPromise ??= readDownloads();
+  return loadPromise;
+}
+
+async function readDownloads(): Promise<void> {
   try {
     const cache = await caches.open(CACHE);
     for (const req of await cache.keys()) {
@@ -65,6 +69,17 @@ export async function removeDownload(id: string): Promise<void> {
   } catch { /* already gone */ }
   have.delete(id);
   changed();
+}
+
+// A song deleted on the server is deleted from the device too. Pass the
+// server's complete, freshly fetched list: never a cached or partial one, or
+// saved songs would be wiped. An empty list is refused for the same reason.
+export async function pruneDownloads(serverIds: Set<string>): Promise<number> {
+  if (!downloadsSupported || serverIds.size === 0) return 0;
+  await loadDownloads();
+  const gone = [...have].filter((id) => !serverIds.has(id));
+  for (const id of gone) await removeDownload(id);
+  return gone.length;
 }
 
 export async function removeAllDownloads(): Promise<void> {

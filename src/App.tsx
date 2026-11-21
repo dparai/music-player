@@ -17,7 +17,7 @@ import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
 import { DiagPanel } from "@/components/DiagPanel";
-import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported } from "@/lib/downloads";
+import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported, pruneDownloads } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
@@ -167,7 +167,7 @@ export function App() {
     const cached = loadSongsCache(creds);
     if (cached?.length) { show(cached); setLoading(false); }
     getAllSongs(creds)
-      .then((s) => { saveSongsCache(creds, s); show(s); })
+      .then((s) => { saveSongsCache(creds, s); show(s); void pruneDownloads(new Set(s.map((x) => x.id))); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [creds]);
