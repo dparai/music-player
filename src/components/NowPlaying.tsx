@@ -259,6 +259,12 @@ export function NowPlaying({
       master.connect(ctx.destination);
       audioCtxRef.current = ctx;
       masterRef.current = master;
+      // The OS suspends/interrupts the context on lock or a call; a deck wired
+      // into it is silent until it runs again.
+      ctx.onstatechange = () => {
+        const a = getActiveAudio();
+        if (a && !a.paused) resumeCtx();
+      };
     }
     const ctx = audioCtxRef.current;
     if (decksRef.current.A && decksRef.current.B) return true;
@@ -464,22 +470,30 @@ export function NowPlaying({
       audio.playbackRate = 1;
       // Start silent and fade in once audio is flowing (only when the fade can run).
       if (fadeIn && fadeable()) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
+      // Hidden (locked) page: timers are throttled and play() needs to happen now.
+      const hidden = document.hidden;
+      const stream = streamFor(song);
+      const unready = stream.key !== null && !knownSeekable(stream.key);
       const start = () => {
         if (lastSongIdRef.current !== song.id) return; // a newer pick took over while the server prepared this one
         setPreparing(false);
-        setStreamSrc(audio, song);
+        setStreamSrc(audio, song, hidden && unready);
+        retryPlayRef.current = false;
         audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
-          .catch(() => { if (fadeIn) resetStrip(activeDeckRef.current, 1); });
+          .catch((e) => {
+            console.warn("[brook] play() refused", e);
+            retryPlayRef.current = true;
+            if (fadeIn) resetStrip(activeDeckRef.current, 1);
+          });
       };
       updateMediaSession(song);
-      const stream = streamFor(song);
-      if (stream.key && !knownSeekable(stream.key)) {
+      if (unready && !hidden) {
         // First play at this quality: give the server a moment to finish the
         // transcode, so the stream has a length and can be seeked. If it takes
         // too long, play anyway.
         if (!fadeIn) audio.pause(); // not faded out, so it would stay audible while we wait
         setPreparing(true);
-        void whenSeekable(stream.key, stream.url, STREAM_READY_WAIT_MS).then(start);
+        void whenSeekable(stream.key!, stream.url, STREAM_READY_WAIT_MS).then(start);
       } else {
         start();
       }
@@ -488,7 +502,7 @@ export function NowPlaying({
     // A manual skip while a song is playing (not mid-mix): fade it out first
     // instead of cutting it dead.
     const playing = getActiveAudio();
-    if (playing && !playing.paused && !fadeRef.current && rampActiveFader(0, FADE_SKIP_OUT_S)) {
+    if (!document.hidden && playing && !playing.paused && !fadeRef.current && rampActiveFader(0, FADE_SKIP_OUT_S)) {
       clearTimers();
       crossfadeStartedRef.current = true; // no mix may start while we fade out
       skipTimerRef.current = window.setTimeout(() => { skipTimerRef.current = null; load(true); }, FADE_SKIP_OUT_S * 1000 + 20);
@@ -610,6 +624,8 @@ export function NowPlaying({
     if (!djMode) return;
 
     const check = () => {
+      // A locked phone can't run a mix: the idle deck's play() would be refused.
+      if (document.hidden) return;
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
       const next = nextSongRef.current;
@@ -677,7 +693,7 @@ export function NowPlaying({
     const next = nextSongRef.current;
     if (!outgoing || !incoming || !next) { crossfadeStartedRef.current = false; return; }
 
-    if (outgoing.paused) { crossfadeStartedRef.current = false; return; } // re-arm on resume
+    if (outgoing.paused || document.hidden) { crossfadeStartedRef.current = false; return; } // re-arm on resume
     let anchor = onDownbeat ? target : null;
     if (target !== null && Math.abs(outgoing.currentTime - target) > 0.15) {
       // A seek or stall moved the playhead: re-arm if we are early, else start unsynced.
@@ -973,6 +989,34 @@ export function NowPlaying({
     };
   }, []);
 
+  // Play was refused (locked screen, no gesture): retry once the page is visible again.
+  const retryPlayRef = useRef(false);
+
+  // Resume playback after the OS suspended the audio graph or refused a play().
+  useEffect(() => {
+    const retry = () => {
+      if (document.hidden) return;
+      resumeCtx();
+      if (!retryPlayRef.current) return;
+      const a = getActiveAudio();
+      if (a && a.paused && a.src) {
+        retryPlayRef.current = false;
+        a.play().catch(() => { retryPlayRef.current = true; });
+      }
+    };
+    document.addEventListener("visibilitychange", retry);
+    window.addEventListener("pageshow", retry);
+    return () => {
+      document.removeEventListener("visibilitychange", retry);
+      window.removeEventListener("pageshow", retry);
+    };
+  }, [getActiveAudio]);
+
+  // Lock-screen controls and the OS audio session follow the real play state.
+  useEffect(() => {
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+  }, [playing]);
+
   function handleEnded() {
     if (fadeRef.current) {
       // The outgoing track ran out before the curves did.
@@ -981,7 +1025,30 @@ export function NowPlaying({
     }
     // Also in DJ mode: if no mix could start (no next song yet), don't stall.
     cancelCrossfade();
-    onNextRef.current();
+    const next = nextSongRef.current;
+    const audio = getActiveAudio();
+    if (!next || !audio) { onNextRef.current(); return; }
+
+    // Start the next song right here, inside the `ended` event, on the same
+    // element. Waiting for React to re-render and the load effect to run puts
+    // play() outside the event, and a locked phone refuses it (no user
+    // gesture), so playback stops for good. Never wait for a transcode here.
+    skipNextLoadRef.current = next.id;
+    lastSongIdRef.current = next.id;
+    setPreparing(false);
+    cancelPendingFades();
+    resumeCtx();
+    setTrim(activeDeckRef.current, next, liveRef.current.serverNextTrack);
+    audio.preservesPitch = true;
+    audio.playbackRate = 1;
+    const key = streamFor(next).key;
+    setStreamSrc(audio, next, key !== null && !knownSeekable(key));
+    retryPlayRef.current = false;
+    audio.play().then(() => setPlaying(true)).catch((e) => {
+      console.warn("[brook] next song play() refused", e);
+      retryPlayRef.current = true;
+    });
+    onAdvanceRef.current(next);
   }
 
   const coverSrc = useMemo(
