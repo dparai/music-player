@@ -4,4 +4,5 @@
     <string name="title_activity_main">Brook</string>
     <string name="package_name">com.dpk.brook</string>
     <string name="custom_url_scheme">com.dpk.brook</string>
+    <string name="download_channel">Downloading songs</string>
 </resources>

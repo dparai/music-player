@@ -11,6 +11,11 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.offline.Download
+import androidx.media3.exoplayer.offline.DownloadManager
+import androidx.media3.exoplayer.offline.DownloadRequest
+import androidx.media3.exoplayer.offline.DownloadService
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.getcapacitor.JSArray
@@ -25,6 +30,7 @@ import com.google.common.util.concurrent.ListenableFuture
  * The web UI's handle on the player. It does not play anything itself: it is a
  * MediaController connected to [PlaybackService], like the lock screen is.
  */
+@UnstableApi
 @CapacitorPlugin(name = "BrookPlayer")
 class BrookPlayerPlugin : Plugin() {
     private val main = Handler(Looper.getMainLooper())
@@ -65,11 +71,112 @@ class BrookPlayerPlugin : Plugin() {
     }
 
     override fun load() {
-        main.post { connect() }
+        main.post {
+            connect()
+            BrookMedia.init(context)
+            BrookMedia.downloadManager.addListener(downloadListener)
+            emitDownloads()
+        }
+    }
+
+    // --- Downloads ---------------------------------------------------------------------------------
+
+    private val downloadListener = object : DownloadManager.Listener {
+        override fun onDownloadChanged(downloadManager: DownloadManager, download: Download, finalException: Exception?) = emitDownloads()
+        override fun onDownloadRemoved(downloadManager: DownloadManager, download: Download) = emitDownloads()
+        override fun onIdle(downloadManager: DownloadManager) = emitDownloads()
+    }
+
+    private val progressTick = object : Runnable {
+        override fun run() {
+            emitDownloads()
+            if (BrookMedia.downloadManager.currentDownloads.isNotEmpty()) main.postDelayed(this, 1000)
+        }
+    }
+
+    // Songs saved on the phone ("done") and the ones still on their way, as the web UI shows them.
+    private fun downloadsObject(): JSObject {
+        val done = JSArray()
+        val active = JSObject()
+        val cursor = BrookMedia.downloadManager.downloadIndex.getDownloads()
+        try {
+            while (cursor.moveToNext()) {
+                val d = cursor.download
+                val o = JSObject()
+                when (d.state) {
+                    Download.STATE_COMPLETED -> { done.put(d.request.id); continue }
+                    Download.STATE_DOWNLOADING -> { o.put("status", "downloading"); o.put("pct", Math.max(0, d.percentDownloaded.toInt())) }
+                    Download.STATE_FAILED -> { o.put("status", "failed"); o.put("reason", "Download failed") }
+                    Download.STATE_REMOVING -> continue
+                    else -> o.put("status", "queued") // queued, stopped, restarting
+                }
+                active.put(d.request.id, o)
+            }
+        } finally {
+            cursor.close()
+        }
+        val out = JSObject()
+        out.put("done", done)
+        out.put("active", active)
+        return out
+    }
+
+    private fun emitDownloads() {
+        notifyListeners("downloads", downloadsObject())
+        if (BrookMedia.downloadManager.currentDownloads.isNotEmpty()) {
+            main.removeCallbacks(progressTick)
+            main.postDelayed(progressTick, 1000)
+        }
+    }
+
+    @PluginMethod
+    fun getDownloads(call: PluginCall) {
+        main.post { call.resolve(downloadsObject()) }
+    }
+
+    @PluginMethod
+    fun download(call: PluginCall) {
+        val arr = call.getArray("items")
+        main.post {
+            for (i in 0 until (arr?.length() ?: 0)) {
+                val o = arr!!.getJSONObject(i)
+                val id = o.getString("id")
+                val req = DownloadRequest.Builder(id, Uri.parse(o.getString("url")))
+                    .setCustomCacheKey(o.getString("cacheKey"))
+                    .build()
+                DownloadService.sendAddDownload(context, BrookDownloadService::class.java, req, /* foreground = */ true)
+            }
+            call.resolve()
+        }
+    }
+
+    @PluginMethod
+    fun removeDownloads(call: PluginCall) {
+        val ids = call.getArray("ids")
+        main.post {
+            for (i in 0 until (ids?.length() ?: 0)) BrookMedia.downloadManager.removeDownload(ids!!.getString(i))
+            call.resolve()
+        }
+    }
+
+    @PluginMethod
+    fun removeAllDownloads(call: PluginCall) {
+        main.post { BrookMedia.downloadManager.removeAllDownloads(); call.resolve() }
+    }
+
+    // Stop what is queued or running; songs already saved stay.
+    @PluginMethod
+    fun cancelDownloads(call: PluginCall) {
+        main.post {
+            for (d in BrookMedia.downloadManager.currentDownloads) BrookMedia.downloadManager.removeDownload(d.request.id)
+            call.resolve()
+        }
     }
 
     override fun handleOnDestroy() {
         main.post {
+            main.removeCallbacks(progressTick)
+            BrookMedia.downloadManager.removeListener(downloadListener)
             controller?.removeListener(listener)
             future?.let { MediaController.releaseFuture(it) }
             controller = null

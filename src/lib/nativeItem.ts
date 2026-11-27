@@ -13,8 +13,10 @@ export function toNativeItem(
   creds: SubsonicCredentials,
   quality: Quality,
   format: StreamFormat,
+  // Saved on the phone: play the saved original (same cache key as the download), never a transcode.
+  downloaded = false,
 ): NativeItem {
-  const transcode = transcodeFor(song, quality, format);
+  const transcode = downloaded ? null : transcodeFor(song, quality, format);
   return {
     id: song.id,
     title: song.title,
@@ -22,7 +24,7 @@ export function toNativeItem(
     album: song.album ?? "",
     url: absolute(streamUrl(creds, song.id, transcode)),
     cacheKey: transcode ? `tc:${song.id}|${transcode.format}|${transcode.maxBitRate}` : `orig:${song.id}`,
-    prefetch: transcode !== null,
+    prefetch: transcode !== null && !downloaded,
     artUrl: song.coverArt ? absolute(coverArtUrl(creds, song.coverArt, "512")) : null,
     durationMs: Math.round((song.duration || 0) * 1000),
   };

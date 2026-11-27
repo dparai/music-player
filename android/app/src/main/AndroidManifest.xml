@@ -34,6 +34,12 @@
             </intent-filter>
         </service>
 
+        <!-- Saves songs on the phone; the notification keeps Android from stopping the download. -->
+        <service
+            android:name=".BrookDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Headset / Bluetooth buttons when the app is not running. -->
         <receiver
             android:name="androidx.media3.session.MediaButtonReceiver"
@@ -59,6 +65,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 </manifest>

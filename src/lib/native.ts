@@ -45,6 +45,17 @@ export interface NativeError {
   id: string | null;
 }
 
+export interface NativeDownloads {
+  done: string[]; // song ids saved on the phone
+  active: Record<string, { status: "queued" | "downloading" | "failed"; pct?: number; reason?: string }>;
+}
+
+export interface NativeDownloadItem {
+  id: string;
+  url: string;      // the original file
+  cacheKey: string; // "orig:<id>", the key playback reads
+}
+
 export interface BrookPlayerPlugin {
   // Replace the whole queue and start at `startIndex`.
   setQueue(o: { items: NativeItem[]; startIndex: number; positionMs?: number; play: boolean }): Promise<void>;
@@ -57,9 +68,15 @@ export interface BrookPlayerPlugin {
   next(): Promise<void>;
   previous(): Promise<void>;
   getState(): Promise<NativeState>;
+  getDownloads(): Promise<NativeDownloads>;
+  download(o: { items: NativeDownloadItem[] }): Promise<void>;
+  removeDownloads(o: { ids: string[] }): Promise<void>;
+  removeAllDownloads(): Promise<void>;
+  cancelDownloads(): Promise<void>;
   addListener(event: "state", fn: (s: NativeState) => void): Promise<PluginListenerHandle>;
   addListener(event: "trackChanged", fn: (t: NativeTrackChange) => void): Promise<PluginListenerHandle>;
   addListener(event: "error", fn: (e: NativeError) => void): Promise<PluginListenerHandle>;
+  addListener(event: "downloads", fn: (d: NativeDownloads) => void): Promise<PluginListenerHandle>;
 }
 
 export function isNativeApp(): boolean {

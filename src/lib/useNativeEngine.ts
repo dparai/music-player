@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SubsonicCredentials, SubsonicSong } from "./subsonic";
 import type { Quality } from "./quality";
 import { streamFormat } from "./quality";
@@ -6,6 +6,7 @@ import { BrookPlayer, type NativeState } from "./native";
 import { toNativeItem } from "./nativeItem";
 import { nativeQueue, sameQueue } from "./nativeQueue";
 import { diag } from "./diag";
+import { downloadsVersion, isDownloaded, subscribeDownloads } from "./downloads";
 
 interface Options {
   enabled: boolean;
@@ -40,7 +41,7 @@ export function useNativeEngine(o: Options) {
 
   const itemsFor = useCallback((songs: SubsonicSong[]) => {
     const { creds, quality } = opts.current;
-    return songs.map((s) => toNativeItem(s, creds, quality, streamFormat()));
+    return songs.map((s) => toNativeItem(s, creds, quality, streamFormat(), isDownloaded(s.id)));
   }, []);
 
   const applyState = useCallback((s: NativeState) => {
@@ -104,7 +105,9 @@ export function useNativeEngine(o: Options) {
   }, [o.enabled, ready, o.song?.id, itemsFor]);
 
   // The songs after the current one changed (Play Next, shuffle, new quality): resend them.
-  const afterKey = o.after.map((s) => s.id).join(",") + "|" + o.quality + "|" + (o.song?.id ?? "");
+  // A song finishing its download changes how it should be played (from the saved file), so it is part of the key.
+  const savedVersion = useSyncExternalStore(subscribeDownloads, downloadsVersion);
+  const afterKey = o.after.map((s) => s.id).join(",") + "|" + o.quality + "|" + (o.song?.id ?? "") + "|" + savedVersion;
   useEffect(() => {
     if (!o.enabled || !ready || !o.song || nativeId.current !== o.song.id) return;
     const { songs, startIndex } = nativeQueue(o.song, opts.current.before, opts.current.after);
