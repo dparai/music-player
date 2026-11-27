@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore } from "react";
 import type { SubsonicCredentials, SubsonicSong, SongAnalysis } from "@/lib/subsonic";
 import { getAllSongs, fetchAnalysis, lookupAnalysis, coverArtUrl } from "@/lib/subsonic";
 import { useAlbumAccent } from "@/lib/albumAccent";
@@ -16,6 +16,8 @@ import { Library } from "@/components/Library";
 import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
+import { DiagGate } from "@/components/DiagPanel";
+import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported, pruneDownloads } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
 import { BottomNav, type View } from "@/components/BottomNav";
 import styles from "./App.module.css";
@@ -36,7 +38,23 @@ const MemoLibrary = memo(Library);
 
 export function App() {
   const [creds, setCreds] = useState<SubsonicCredentials | null>(loadCredentials);
-  const [songs, setSongs] = useState<SubsonicSong[]>([]);
+  const [allSongs, setSongs] = useState<SubsonicSong[]>([]);
+  // Saved songs play with no internet; everything else needs it. Offline, the
+  // library, the play order and shuffle only know the saved ones.
+  const saved = useSyncExternalStore(subscribeDownloads, downloadsVersion);
+  const online = useSyncExternalStore(
+    (cb) => {
+      window.addEventListener("online", cb);
+      window.addEventListener("offline", cb);
+      return () => { window.removeEventListener("online", cb); window.removeEventListener("offline", cb); };
+    },
+    () => navigator.onLine,
+  );
+  const songs = useMemo(
+    () => (online ? allSongs : allSongs.filter((s) => isDownloaded(s.id))),
+    [allSongs, online, saved],
+  );
+  useEffect(() => { void loadDownloads(); }, []);
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<View>(() => (loadView() as View) ?? "nowplaying");
   const [miniPlaying, setMiniPlaying] = useState(false);
@@ -149,7 +167,7 @@ export function App() {
     const cached = loadSongsCache(creds);
     if (cached?.length) { show(cached); setLoading(false); }
     getAllSongs(creds)
-      .then((s) => { saveSongsCache(creds, s); show(s); })
+      .then((s) => { saveSongsCache(creds, s); show(s); void pruneDownloads(new Set(s.map((x) => x.id))); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [creds]);
@@ -171,6 +189,19 @@ export function App() {
   const accentStyle = useAlbumAccent(
     creds && currentSong?.coverArt ? coverArtUrl(creds, currentSong.coverArt, "64") : null,
   );
+
+  // "Original" in the quality menu: save every song on the device. False if the user says no.
+  function handleChooseOriginal(): boolean {
+    if (!creds || !downloadsSupported) return true;
+    const todo = allSongs.filter((s) => !isDownloaded(s.id));
+    if (todo.length === 0) return true;
+    if (!online) { window.alert("Connect to the internet to download your songs."); return false; }
+    const bytes = todo.reduce((n, s) => n + (s.size || 0), 0);
+    const size = bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+    if (!window.confirm(`Download ${todo.length} ${todo.length === 1 ? "song" : "songs"} (${size}) to this device as original files? Use Wi-Fi.`)) return false;
+    downloadSongs(creds, todo);
+    return true;
+  }
 
   function handleLogin(c: SubsonicCredentials) {
     saveCredentials(c);
@@ -289,6 +320,7 @@ export function App() {
 
   return (
     <div className={styles.layout} style={accentStyle}>
+      <DiagGate />
       <main className={styles.main}>
         {loading ? (
           <div className={styles.loading} role="status" aria-label="Loading your library">
@@ -319,11 +351,13 @@ export function App() {
                 onPreparingChange={setPreparing}
                 togglePlayRef={togglePlayRef}
                 autoMixTracks={autoMixTracks}
+                onChooseOriginal={handleChooseOriginal}
               />
             </div>
             <div className={`${styles.view} ${styles.viewLib}`} style={{ display: view === "library" ? "flex" : "none" }}>
               <MemoLibrary
                 songs={songs}
+                online={online}
                 creds={creds}
                 currentSongId={currentSong?.id ?? null}
                 onPlay={stablePlay}

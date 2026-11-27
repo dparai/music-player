@@ -82,7 +82,7 @@ export function QualityMenu({ value, onChange }: Props) {
                 <span className={styles.optionText}>
                   <span className={styles.optionLabel}>{q.label}</span>
                   <span className={styles.optionHint}>
-                    {q.kbps ? `${q.kbps} kbps, ${perMinute(q.kbps)}` : "The file as it is, most data"}
+                    {q.kbps ? `${q.kbps} kbps, ${perMinute(q.kbps)}` : "Saves every song on this device. Plays offline."}
                   </span>
                 </span>
                 <span className={styles.check}>{on && <CheckIcon size={18} />}</span>

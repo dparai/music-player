@@ -4,6 +4,14 @@ import { streamUrl, coverArtUrl } from "@/lib/subsonic";
 import { loadQuality, saveQuality, streamFormat, transcodeFor, type Quality } from "@/lib/quality";
 import { knownSeekable, whenSeekable } from "@/lib/streamReady";
 import { QualityMenu } from "./QualityMenu";
+import { SoundMenu } from "./SoundMenu";
+import {
+  EQ_BANDS, EQ_Q, autoPreampDb, bandKind, isFlat, loadSound, saveSound, type SoundSettings,
+} from "@/lib/sound";
+import {
+  DEFAULT_START_LATENCY_S, GAPLESS_ARM_S, GAPLESS_FADE_S, GAPLESS_PRELOAD_S,
+  canGapless, equalPowerCurves, gaplessStartDelayS, updateLatency,
+} from "@/lib/gapless";
 import {
   CROSSFADE_DURATION, EARLY_FADE_WINDOW, SILENCE_THRESHOLD,
   tempoMatch, fadeDurationFor, buildCrossfadeCurves, loudnessTrimDb, planTransition,
@@ -14,6 +22,8 @@ import { findAutoMixTrack, getAutoMixTrack } from "@/lib/automix";
 import { PlayIcon, PauseIcon, PrevIcon, NextIcon, ShuffleIcon, MixIcon, NoteIcon, LyricsIcon, SpinnerIcon } from "./icons";
 import { LyricsView } from "./LyricsView";
 import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
+import { diag } from "@/lib/diag";
+import { isDownloaded, offlineUrl } from "@/lib/downloads";
 import styles from "./NowPlaying.module.css";
 import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
@@ -36,6 +46,8 @@ interface Props {
   onPreparingChange?: (preparing: boolean) => void;
   togglePlayRef?: React.MutableRefObject<(() => void) | null>;
   autoMixTracks?: AutoMixTrack[];
+  // Choosing Original in the quality menu saves every song on the device. False: the user said no, keep the old quality.
+  onChooseOriginal?: () => boolean;
 }
 
 type Deck = "A" | "B";
@@ -137,7 +149,7 @@ export function NowPlaying({
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, onPreparingChange, togglePlayRef,
-  autoMixTracks,
+  autoMixTracks, onChooseOriginal,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -170,6 +182,16 @@ export function NowPlaying({
   const skipNextLoadRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const masterRef = useRef<DynamicsCompressorNode | null>(null);
+  // Equaliser between the decks and the master limiter: preamp, then ten bands.
+  // Bypassed entirely while the curve is flat.
+  const eqRef = useRef<{ input: GainNode; filters: BiquadFilterNode[]; chained: boolean } | null>(null);
+  const [sound, setSound] = useState<SoundSettings>(loadSound);
+  const soundRef = useRef(sound);
+  soundRef.current = sound;
+  const songRef = useRef(song);
+  songRef.current = song;
+  // How long the browser takes from play() to sound, learned from each gapless handoff.
+  const startLatencyRef = useRef(DEFAULT_START_LATENCY_S);
   const decksRef = useRef<Partial<Record<Deck, DeckNodes>>>({});
   const trimDbRef = useRef<Partial<Record<Deck, number>>>({});
   const fadeRef = useRef<Fade | null>(null);
@@ -259,6 +281,24 @@ export function NowPlaying({
       master.connect(ctx.destination);
       audioCtxRef.current = ctx;
       masterRef.current = master;
+      const eqInput = ctx.createGain();
+      const filters = EQ_BANDS.map((hz, i) => {
+        const f = ctx.createBiquadFilter();
+        f.type = bandKind(i);
+        f.frequency.value = hz;
+        f.Q.value = EQ_Q;
+        f.gain.value = 0;
+        return f;
+      });
+      eqRef.current = { input: eqInput, filters, chained: false };
+      eqInput.connect(master);
+      applyEq();
+      // The OS suspends/interrupts the context on lock or a call; a deck wired
+      // into it is silent until it runs again.
+      ctx.onstatechange = () => {
+        const a = getActiveAudio();
+        if (a && !a.paused) resumeCtx();
+      };
     }
     const ctx = audioCtxRef.current;
     if (decksRef.current.A && decksRef.current.B) return true;
@@ -277,15 +317,60 @@ export function NowPlaying({
       shelf.type = "lowshelf";
       shelf.frequency.value = 200;
       shelf.gain.value = 0;
-      preGain.gain.value = dbToGain(trimDbRef.current[deck] ?? 0);
+      preGain.gain.value = trimGain(deck);
       const fader = ctx.createGain();
       // During a legacy fade both decks are audible and element volume does the fading.
       fader.gain.value = deck === activeDeckRef.current || fadeRef.current?.legacy ? 1 : 0;
-      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(masterRef.current!);
+      source.connect(preGain).connect(analyser).connect(shelf).connect(fader).connect(eqRef.current!.input);
       decksRef.current[deck] = { source, preGain, analyser, shelf, fader };
     }
     return true;
   }
+
+  // Push the equaliser settings into the graph. A flat curve bypasses the ten
+  // filters (no processing, no battery); otherwise the preamp cuts by the
+  // curve's peak so boosts cannot clip.
+  function applyEq() {
+    const eq = eqRef.current;
+    const ctx = audioCtxRef.current;
+    const master = masterRef.current;
+    if (!eq || !ctx || !master) return;
+    const gains = soundRef.current.eq;
+    const chained = !isFlat(gains);
+    if (chained !== eq.chained) {
+      eq.input.disconnect();
+      eq.filters.forEach((f) => f.disconnect());
+      if (chained) {
+        let prev: AudioNode = eq.input;
+        for (const f of eq.filters) { prev.connect(f); prev = f; }
+        prev.connect(master);
+      } else {
+        eq.input.connect(master);
+      }
+      eq.chained = chained;
+    }
+    const now = ctx.currentTime;
+    // setTargetAtTime: a dragged slider changes smoothly instead of crackling.
+    gains.forEach((g, i) => eq.filters[i]!.gain.setTargetAtTime(g, now, 0.015));
+    const pre = chained ? autoPreampDb(gains, ctx.sampleRate) : 0;
+    eq.input.gain.setTargetAtTime(dbToGain(pre), now, 0.02);
+  }
+
+  // Loudness trim as a gain: off when Normalize volume is off.
+  function trimGain(deck: Deck): number {
+    return soundRef.current.normalize ? dbToGain(trimDbRef.current[deck] ?? 0) : 1;
+  }
+
+  const firstSoundRun = useRef(true);
+  useEffect(() => {
+    saveSound(sound);
+    if (firstSoundRun.current) { firstSoundRun.current = false; return; }
+    applyEq();
+    for (const deck of ["A", "B"] as const) {
+      const nodes = decksRef.current[deck];
+      if (nodes) setParam(nodes.preGain.gain, trimGain(deck));
+    }
+  }, [sound]);
 
   // Any tap or key press unlocks audio; wire the graph as soon as one happens.
   useEffect(() => {
@@ -356,7 +441,7 @@ export function NowPlaying({
     const db = loudnessTrimDb(track?.lufs, s.replayGain);
     trimDbRef.current[deck] = db; // applied when the graph is wired, if it isn't yet
     const nodes = decksRef.current[deck];
-    if (nodes) setParam(nodes.preGain.gain, dbToGain(db));
+    if (nodes) setParam(nodes.preGain.gain, trimGain(deck));
   }
 
   function resetStrip(deck: Deck, fader: number) {
@@ -408,6 +493,8 @@ export function NowPlaying({
   // file, which can always be seeked; a transcoded one only once the server has
   // cached it (see lib/streamReady.ts).
   function streamFor(s: SubsonicSong) {
+    // Saved on the device: a plain URL the service worker answers, no network.
+    if (isDownloaded(s.id)) return { key: null, url: () => offlineUrl(s.id) };
     const transcode = transcodeFor(s, qualityRef.current, streamFormat());
     return {
       key: transcode ? `${s.id}|${transcode.format}|${transcode.maxBitRate}` : null,
@@ -417,7 +504,7 @@ export function NowPlaying({
 
   // `original`: stream the file as it is, whatever the quality setting.
   function setStreamSrc(audio: HTMLAudioElement, s: SubsonicSong, original = false) {
-    const url = original ? streamUrl(creds, s.id) : streamFor(s).url();
+    const url = original && !isDownloaded(s.id) ? streamUrl(creds, s.id) : streamFor(s).url();
     // A cross-origin stream routed through Web Audio is silent without CORS.
     try {
       if (new URL(url, window.location.href).origin !== window.location.origin) {
@@ -464,22 +551,30 @@ export function NowPlaying({
       audio.playbackRate = 1;
       // Start silent and fade in once audio is flowing (only when the fade can run).
       if (fadeIn && fadeable()) setParam(decksRef.current[activeDeckRef.current]!.fader.gain, 0);
+      // Hidden (locked) page: timers are throttled and play() needs to happen now.
+      const hidden = document.hidden;
+      const stream = streamFor(song);
+      const unready = stream.key !== null && !knownSeekable(stream.key);
       const start = () => {
         if (lastSongIdRef.current !== song.id) return; // a newer pick took over while the server prepared this one
         setPreparing(false);
-        setStreamSrc(audio, song);
+        setStreamSrc(audio, song); // never the raw original for an unready transcode: it stalls on mobile data
+        retryPlayRef.current = false;
         audio.play().then(() => { setPlaying(true); if (fadeIn) rampUp(FADE_SKIP_IN_S); })
-          .catch(() => { if (fadeIn) resetStrip(activeDeckRef.current, 1); });
+          .catch((e) => {
+            diag("play refused", { id: song.id, err: String(e) });
+            retryPlayRef.current = true;
+            if (fadeIn) resetStrip(activeDeckRef.current, 1);
+          });
       };
       updateMediaSession(song);
-      const stream = streamFor(song);
-      if (stream.key && !knownSeekable(stream.key)) {
+      if (unready && !hidden) {
         // First play at this quality: give the server a moment to finish the
         // transcode, so the stream has a length and can be seeked. If it takes
         // too long, play anyway.
         if (!fadeIn) audio.pause(); // not faded out, so it would stay audible while we wait
         setPreparing(true);
-        void whenSeekable(stream.key, stream.url, STREAM_READY_WAIT_MS).then(start);
+        void whenSeekable(stream.key!, stream.url, STREAM_READY_WAIT_MS).then(start);
       } else {
         start();
       }
@@ -488,7 +583,7 @@ export function NowPlaying({
     // A manual skip while a song is playing (not mid-mix): fade it out first
     // instead of cutting it dead.
     const playing = getActiveAudio();
-    if (playing && !playing.paused && !fadeRef.current && rampActiveFader(0, FADE_SKIP_OUT_S)) {
+    if (!document.hidden && playing && !playing.paused && !fadeRef.current && rampActiveFader(0, FADE_SKIP_OUT_S)) {
       clearTimers();
       crossfadeStartedRef.current = true; // no mix may start while we fade out
       skipTimerRef.current = window.setTimeout(() => { skipTimerRef.current = null; load(true); }, FADE_SKIP_OUT_S * 1000 + 20);
@@ -504,7 +599,7 @@ export function NowPlaying({
     const next = nextSongRef.current;
     if (!next) return;
     const stream = streamFor(next);
-    if (stream.key) void whenSeekable(stream.key, stream.url, STREAM_WARM_WAIT_MS);
+    if (stream.key) void whenSeekable(stream.key, stream.url, STREAM_WARM_WAIT_MS).then((ok) => diag("prewarm next", { id: next.id, ready: ok, hidden: document.hidden }));
   }, [nextSongId, quality, creds]);
 
   // Buffer the next song on the idle deck, cued to its first downbeat.
@@ -610,6 +705,8 @@ export function NowPlaying({
     if (!djMode) return;
 
     const check = () => {
+      // A locked phone can't run a mix: the idle deck's play() would be refused.
+      if (document.hidden) return;
       const audio = getActiveAudio();
       if (!audio || audio.paused || !isFinite(audio.duration)) return;
       const next = nextSongRef.current;
@@ -669,6 +766,128 @@ export function NowPlaying({
     };
   }, [djMode, getActiveAudio]);
 
+  // Gapless playback (Crossfade off). The next song is buffered on the idle
+  // deck well before the end; its play() is then called a little early, so its
+  // first sound lands as this one finishes, joined by a 30 ms equal-power
+  // overlap. A locked phone skips all this: the `ended` handoff does it there.
+  function preloadPlain(next: SubsonicSong) {
+    const deck: Deck = activeDeckRef.current === "A" ? "B" : "A";
+    const audio = audioFor(deck);
+    if (!audio) return;
+    ensureAudioGraph();
+    audio.pause();
+    audio.preload = "auto";
+    audio.preservesPitch = true;
+    audio.playbackRate = 1;
+    resetStrip(deck, 0);
+    setTrim(deck, next, liveRef.current.serverNextTrack);
+    setStreamSrc(audio, next); // played from 0, so an unready transcode is fine
+    preloadRef.current = { songId: next.id, deck, anchor: null };
+    diag("gapless preload", { id: next.id, deck });
+  }
+
+  // A transcode the server has not finished reports an estimated length, so the
+  // end cannot be timed: leave those to the `ended` handoff.
+  function lengthIsExact(s: SubsonicSong | null): boolean {
+    if (!s) return false;
+    const key = streamFor(s).key;
+    return key === null || knownSeekable(key);
+  }
+
+  function startGapless() {
+    const out = getActiveAudio();
+    const inc = getInactiveAudio();
+    const next = nextSongRef.current;
+    const ctx = audioCtxRef.current;
+    const giveUp = (why: string) => { diag("gapless skipped", { why }); crossfadeStartedRef.current = false; };
+    if (!out || !inc || !next || !ctx) return giveUp("no deck");
+    if (out.paused) return giveUp("paused");
+    if (preloadRef.current?.songId !== next.id) return giveUp("next changed");
+    const live = ensureAudioGraph() && ctx.state === "running";
+    const remaining = out.duration - out.currentTime;
+    if (!canGapless({
+      enabled: soundRef.current.gapless,
+      hidden: document.hidden,
+      hasNext: true,
+      graphLive: live,
+      nextReady: inc.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA,
+    })) return giveUp(`not ready rs=${inc.readyState}`);
+    // A seek or stall moved the playhead since the timer was set.
+    if (!(remaining > 0) || remaining > GAPLESS_ARM_S) return giveUp(`playhead moved remaining=${remaining.toFixed(2)}`);
+
+    const outDeck = activeDeckRef.current;
+    const inDeck: Deck = outDeck === "A" ? "B" : "A";
+    const o = decksRef.current[outDeck];
+    const i = decksRef.current[inDeck];
+    if (!o || !i) return giveUp("no strip");
+
+    const curves = equalPowerCurves(16);
+    const now = ctx.currentTime;
+    const t0 = now + Math.max(0, remaining / (out.playbackRate || 1) - GAPLESS_FADE_S);
+    o.fader.gain.cancelScheduledValues(0);
+    o.fader.gain.setValueAtTime(1, now);
+    o.fader.gain.setValueCurveAtTime(curves.out, t0, GAPLESS_FADE_S);
+    i.fader.gain.cancelScheduledValues(0);
+    i.fader.gain.setValueAtTime(0, now);
+    i.fader.gain.setValueCurveAtTime(curves.in, t0, GAPLESS_FADE_S);
+
+    inc.currentTime = 0;
+    const called = performance.now();
+    inc.addEventListener("playing", () => {
+      startLatencyRef.current = updateLatency(startLatencyRef.current, (performance.now() - called) / 1000);
+    }, { once: true });
+    inc.play().catch((e) => {
+      // Refused: undo the overlap and let the `ended` handoff start the song.
+      diag("gapless play refused", { err: String(e) });
+      if (fadeRef.current?.song.id !== next.id) return;
+      if (fadeTimerRef.current) { clearInterval(fadeTimerRef.current); fadeTimerRef.current = null; }
+      fadeRef.current = null;
+      preloadRef.current = null;
+      resetStrip(outDeck, 1);
+      resetStrip(inDeck, 0);
+      crossfadeStartedRef.current = false;
+    });
+    fadeRef.current = { song: next, outDeck, inDeck, end: t0 + GAPLESS_FADE_S, rate: 1, bar: 1, sync: null, legacy: null };
+    diag("gapless start", { id: next.id, remaining: +remaining.toFixed(3), latency: +startLatencyRef.current.toFixed(3) });
+
+    if (fadeTimerRef.current) clearInterval(fadeTimerRef.current);
+    fadeTimerRef.current = window.setInterval(tickFade, 50);
+  }
+
+  useEffect(() => {
+    if (djMode) return; // the mix engine hands over by itself
+
+    const check = () => {
+      if (document.hidden || !soundRef.current.gapless) return;
+      const audio = getActiveAudio();
+      if (!audio || audio.paused || !isFinite(audio.duration) || !(audio.duration > 0)) return;
+      const next = nextSongRef.current;
+      if (!next || crossfadeStartedRef.current || fadeRef.current) return;
+      if (pauseTimerRef.current || skipTimerRef.current || seekRef.current) return;
+      if (!lengthIsExact(songRef.current)) return;
+
+      const remaining = audio.duration - audio.currentTime;
+      if (remaining > GAPLESS_PRELOAD_S) return;
+      if (preloadRef.current?.songId !== next.id) preloadPlain(next);
+      if (remaining <= GAPLESS_ARM_S && remaining > 0 && preloadRef.current?.songId === next.id) {
+        crossfadeStartedRef.current = true;
+        // The 200 ms poll is far too coarse for this; time the start exactly.
+        const delay = gaplessStartDelayS(remaining, startLatencyRef.current, audio.playbackRate);
+        startTimerRef.current = window.setTimeout(() => { startTimerRef.current = null; startGapless(); }, delay * 1000);
+      }
+    };
+
+    const interval = setInterval(check, 200);
+    return () => {
+      clearInterval(interval);
+      if (startTimerRef.current) {
+        clearTimeout(startTimerRef.current);
+        startTimerRef.current = null;
+        crossfadeStartedRef.current = false;
+      }
+    };
+  }, [djMode, getActiveAudio]);
+
   // `target`: the outgoing time this start was timed to (null: start now, e.g.
   // silence detected). `onDownbeat`: target is a downbeat, so beat-sync.
   function startCrossfade(target: number | null, onDownbeat: boolean) {
@@ -677,7 +896,7 @@ export function NowPlaying({
     const next = nextSongRef.current;
     if (!outgoing || !incoming || !next) { crossfadeStartedRef.current = false; return; }
 
-    if (outgoing.paused) { crossfadeStartedRef.current = false; return; } // re-arm on resume
+    if (outgoing.paused || document.hidden) { crossfadeStartedRef.current = false; return; } // re-arm on resume
     let anchor = onDownbeat ? target : null;
     if (target !== null && Math.abs(outgoing.currentTime - target) > 0.15) {
       // A seek or stall moved the playhead: re-arm if we are early, else start unsynced.
@@ -968,10 +1187,75 @@ export function NowPlaying({
         audioCtxRef.current.close().catch(() => {});
         audioCtxRef.current = null;
         masterRef.current = null;
+        eqRef.current = null;
         decksRef.current = {};
       }, 0);
     };
   }, []);
+
+  // Play was refused (locked screen, no gesture): retry once the page is visible again.
+  const retryPlayRef = useRef(false);
+  // A song is being swapped for the next on the same element: the brief pause
+  // between them must not reach the OS as "paused".
+  const handoffRef = useRef(false);
+
+  // Record what the audio elements and the page do, for the #debug panel.
+  useEffect(() => {
+    const els = [audioARef.current, audioBRef.current];
+    const names = ["error", "stalled", "waiting", "playing", "pause", "ended", "emptied", "abort", "loadstart", "canplay"];
+    const info = (a: HTMLAudioElement, i: number) => ({
+      deck: i === 0 ? "A" : "B",
+      id: a.src.match(/[?&]id=([^&]+)/)?.[1],
+      t: +a.currentTime.toFixed(1),
+      d: isFinite(a.duration) ? +a.duration.toFixed(1) : null,
+      rs: a.readyState,
+      ns: a.networkState,
+      fmt: a.src.match(/[?&]format=([^&]+)/)?.[1] ?? "original",
+    });
+    const cleanups: (() => void)[] = [];
+    els.forEach((a, i) => {
+      if (!a) return;
+      for (const n of names) {
+        const h = () => diag(`audio ${n}`, n === "error" ? { ...info(a, i), code: a.error?.code, msg: a.error?.message } : info(a, i));
+        a.addEventListener(n, h);
+        cleanups.push(() => a.removeEventListener(n, h));
+      }
+    });
+    const vis = () => diag("page " + document.visibilityState, { ctx: audioCtxRef.current?.state ?? null });
+    document.addEventListener("visibilitychange", vis);
+    diag("player mounted", { ua: navigator.userAgent, hidden: document.hidden });
+    return () => {
+      cleanups.forEach((c) => c());
+      document.removeEventListener("visibilitychange", vis);
+    };
+  }, []);
+
+  // Resume playback after the OS suspended the audio graph or refused a play().
+  useEffect(() => {
+    const retry = () => {
+      if (document.hidden) return;
+      resumeCtx();
+      if (!retryPlayRef.current) return;
+      const a = getActiveAudio();
+      if (a && a.paused && a.src) {
+        retryPlayRef.current = false;
+        a.play().catch(() => { retryPlayRef.current = true; });
+      }
+    };
+    document.addEventListener("visibilitychange", retry);
+    window.addEventListener("pageshow", retry);
+    return () => {
+      document.removeEventListener("visibilitychange", retry);
+      window.removeEventListener("pageshow", retry);
+    };
+  }, [getActiveAudio]);
+
+  // Lock-screen controls and the OS audio session follow the real play state.
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return;
+    if (!playing && handoffRef.current) return; // a song change, not a real pause
+    navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+  }, [playing]);
 
   function handleEnded() {
     if (fadeRef.current) {
@@ -981,7 +1265,35 @@ export function NowPlaying({
     }
     // Also in DJ mode: if no mix could start (no next song yet), don't stall.
     cancelCrossfade();
-    onNextRef.current();
+    const next = nextSongRef.current;
+    const audio = getActiveAudio();
+    if (!next || !audio) { onNextRef.current(); return; }
+
+    // Start the next song right here, inside the `ended` event, on the same
+    // element. Waiting for React to re-render and the load effect to run puts
+    // play() outside the event, and a locked phone refuses it (no user
+    // gesture), so playback stops for good. Never wait for a transcode here.
+    skipNextLoadRef.current = next.id;
+    lastSongIdRef.current = next.id;
+    setPreparing(false);
+    cancelPendingFades();
+    resumeCtx();
+    setTrim(activeDeckRef.current, next, liveRef.current.serverNextTrack);
+    audio.preservesPitch = true;
+    audio.playbackRate = 1;
+    // Always the chosen quality. An unready transcode still plays (it just has
+    // no length yet); the raw original is up to 2.7 Mbps and stalls on mobile data.
+    const key = streamFor(next).key;
+    setStreamSrc(audio, next);
+    diag("handoff", { id: next.id, hidden: document.hidden, ctx: audioCtxRef.current?.state ?? null, ready: key === null || knownSeekable(key) });
+    retryPlayRef.current = false;
+    handoffRef.current = true;
+    audio.play().then(() => { handoffRef.current = false; setPlaying(true); diag("handoff play ok", { id: next.id }); }).catch((e) => {
+      handoffRef.current = false;
+      diag("handoff play refused", { id: next.id, err: String(e) });
+      retryPlayRef.current = true;
+    });
+    onAdvanceRef.current(next);
   }
 
   const coverSrc = useMemo(
@@ -998,7 +1310,7 @@ export function NowPlaying({
   // Lyrics are fetched on first open, then on every song change while the panel is open.
   const [lyricsOpen, setLyricsOpen] = useState(false);
   const [lyricsSeen, setLyricsSeen] = useState(false);
-  const [lyricsState, setLyricsState] = useState<{ status: "loading" | "ready" | "none" | "error"; data: Lyrics | null }>(
+  const [lyricsState, setLyricsState] = useState<{ status: "loading" | "ready" | "none" | "error" | "offline"; data: Lyrics | null }>(
     { status: "none", data: null },
   );
   const [lyricsTry, setLyricsTry] = useState(0);
@@ -1008,12 +1320,19 @@ export function NowPlaying({
   useEffect(() => {
     if (!lyricsOpen || !song) return;
     let alive = true;
+    // Lyrics are not saved on the device: with no internet, say so.
+    if (!navigator.onLine) {
+      setLyricsState({ status: "offline", data: null });
+      const back = () => setLyricsTry((n) => n + 1);
+      window.addEventListener("online", back, { once: true });
+      return () => { alive = false; window.removeEventListener("online", back); };
+    }
     setLyricsState({ status: "loading", data: null });
     fetchLyrics(creds, song).then((r) => {
       if (!alive) return;
       setLyricsState(
         r.lyrics ? { status: "ready", data: r.lyrics }
-          : { status: r.error ? "error" : "none", data: null },
+          : { status: r.error ? (navigator.onLine ? "error" : "offline") : "none", data: null },
       );
     });
     return () => { alive = false; };
@@ -1210,7 +1529,13 @@ export function NowPlaying({
       <ul className={styles.chips}>
         {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
         <li className={styles.chipFixed}>
-          <QualityMenu value={quality} onChange={(q) => { setQuality(q); saveQuality(q); }} />
+          <SoundMenu value={sound} onChange={setSound} />
+        </li>
+        <li className={styles.chipFixed}>
+          <QualityMenu value={quality} onChange={(q) => {
+            if (q === "original" && onChooseOriginal && !onChooseOriginal()) return;
+            setQuality(q); saveQuality(q);
+          }} />
         </li>
       </ul>
     </div>

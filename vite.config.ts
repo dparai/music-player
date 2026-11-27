@@ -32,6 +32,17 @@ export default defineConfig({
         globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
         runtimeCaching: [
           {
+            // Songs saved on the device (see src/lib/downloads.ts). Never expires:
+            // the user removes them. rangeRequests lets the player seek.
+            urlPattern: /\/offline\//,
+            handler: "CacheFirst",
+            options: {
+              cacheName: "brook-downloads",
+              rangeRequests: true,
+              cacheableResponse: { statuses: [200] },
+            },
+          },
+          {
             urlPattern: /\/rest\/getCoverArt/,
             handler: "CacheFirst",
             options: {
