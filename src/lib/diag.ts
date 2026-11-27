@@ -2,7 +2,7 @@
 // locked phone. Read it by opening the app with #debug at the end of the URL.
 
 const KEY = "brook_diag";
-const MAX = 250;
+const MAX = 500;
 
 export interface DiagEntry { t: number; e: string; d?: unknown }
 

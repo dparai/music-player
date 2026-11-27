@@ -1,8 +1,27 @@
 import { useEffect, useState } from "react";
 import { clearDiag, readDiag, type DiagEntry } from "../lib/diag";
 
-// Shown only when the URL ends in #debug.
-export function DiagPanel() {
+// Opens with #debug at the end of the URL (also when the hash changes in an
+// already-open page), or by tapping the "Library" title five times: an
+// installed app has no address bar.
+export const DEBUG_EVENT = "brook-debug";
+
+export function DiagGate() {
+  const [open, setOpen] = useState(() => window.location.hash === "#debug");
+  useEffect(() => {
+    const onHash = () => { if (window.location.hash === "#debug") setOpen(true); };
+    const onTap = () => setOpen(true);
+    window.addEventListener("hashchange", onHash);
+    window.addEventListener(DEBUG_EVENT, onTap);
+    return () => {
+      window.removeEventListener("hashchange", onHash);
+      window.removeEventListener(DEBUG_EVENT, onTap);
+    };
+  }, []);
+  return open ? <DiagPanel onClose={() => setOpen(false)} /> : null;
+}
+
+function DiagPanel({ onClose }: { onClose: () => void }) {
   const [log, setLog] = useState<DiagEntry[]>(readDiag);
   useEffect(() => {
     const id = setInterval(() => setLog(readDiag()), 1000);
@@ -21,6 +40,7 @@ export function DiagPanel() {
       <div style={{ display: "flex", gap: 8 }}>
         <button onClick={() => navigator.clipboard?.writeText(text).catch(() => {})}>Copy</button>
         <button onClick={() => { clearDiag(); setLog([]); }}>Clear</button>
+        <button onClick={onClose}>Close</button>
         <span>{log.length} events</span>
       </div>
       <pre style={{ margin: 0, overflow: "auto", flex: 1, whiteSpace: "pre-wrap" }}>{text}</pre>

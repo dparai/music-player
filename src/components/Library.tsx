@@ -6,6 +6,7 @@ import {
   subscribeDownloads, downloadsVersion, isDownloaded, downloadState, cancelQueued,
   removeDownload, removeAllDownloads, downloadsSupported, downloadedCount,
 } from "@/lib/downloads";
+import { DEBUG_EVENT } from "./DiagPanel";
 import styles from "./Library.module.css";
 
 interface Props {
@@ -26,6 +27,15 @@ function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// Five taps within three seconds on the title open the debug log.
+const titleTaps: number[] = [];
+function onTitleTap() {
+  const now = Date.now();
+  titleTaps.push(now);
+  while (titleTaps.length && now - titleTaps[0]! > 3000) titleTaps.shift();
+  if (titleTaps.length >= 5) { titleTaps.length = 0; window.dispatchEvent(new Event(DEBUG_EVENT)); }
 }
 
 export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNext }: Props) {
@@ -142,7 +152,7 @@ export function Library({ songs, creds, online, currentSongId, onPlay, onPlayNex
   return (
     <div className={styles.wrapper}>
       <div className={styles.header}>
-        <h2 className={styles.title}>Library</h2>
+        <h2 className={styles.title} onClick={onTitleTap}>Library</h2>
         <button className={styles.logoutBtn} aria-label="Log out" onClick={() => {
           // Logout handled by parent, but we expose via a custom event
           window.dispatchEvent(new CustomEvent("brook-logout"));
