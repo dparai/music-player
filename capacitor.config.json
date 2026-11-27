@@ -1,0 +1,12 @@
+{
+  "appId": "com.dpk.brook",
+  "appName": "Brook",
+  "webDir": "dist",
+  "server": {
+    "url": "https://dpkmusic.duckdns.org",
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}

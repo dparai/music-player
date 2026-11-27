@@ -18,6 +18,7 @@ import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
 import { AHEAD_COUNT } from "@/lib/ahead";
 import { upcomingSongs } from "@/lib/queue";
+import { NATIVE_QUEUE_AFTER } from "@/lib/nativeQueue";
 import { DiagGate } from "@/components/DiagPanel";
 import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported, pruneDownloads } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
@@ -133,6 +134,18 @@ export function App() {
 
   const nextSong = getNextSong();
   const nextAnalysis = nextSong ? lookupSong(analysisData, nextSong) : null;
+  // For the Android player, which has to know the queue itself: the song before this one and the
+  // songs after it (Play Next first). Always the plain order; the DJ pick is web-only.
+  const queueBefore = useMemo(() => {
+    if (currentIndex > 0) return [playOrder[currentIndex - 1]!];
+    return playOrder.length > 1 && currentIndex === 0 ? [playOrder[playOrder.length - 1]!] : [];
+  }, [playOrder, currentIndex]);
+  const queueAfter = useMemo(
+    () => upcomingSongs(playNextQueue, playOrder, currentSongId, NATIVE_QUEUE_AFTER),
+    [playNextQueue, playOrder, currentSongId],
+  );
+  const songsById = useMemo(() => new Map(songs.map((s) => [s.id, s])), [songs]);
+  const findSong = useCallback((id: string) => songsById.get(id), [songsById]);
   // The songs after this one, for fetching ahead. A DJ pick is only known one song out.
   const upcoming = useMemo(
     () => (djMode ? (nextSong ? [nextSong] : []) : upcomingSongs(playNextQueue, playOrder, currentSongId, AHEAD_COUNT)),
@@ -355,6 +368,9 @@ export function App() {
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
                 upcoming={upcoming}
+                queueBefore={queueBefore}
+                queueAfter={queueAfter}
+                findSong={findSong}
                 onPlayingChange={handlePlayingChange}
                 onPreparingChange={setPreparing}
                 togglePlayRef={togglePlayRef}
