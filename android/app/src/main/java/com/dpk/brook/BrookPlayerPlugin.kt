@@ -116,21 +116,6 @@ class BrookPlayerPlugin : Plugin() {
         }
     }
 
-    // --- Widget ------------------------------------------------------------------------------------
-
-    // Asks Android to put the Brook widget on the home screen; the user confirms in a system dialog.
-    @PluginMethod
-    fun pinWidget(call: PluginCall) {
-        main.post {
-            val manager = android.appwidget.AppWidgetManager.getInstance(context)
-            val ok = manager.isRequestPinAppWidgetSupported &&
-                manager.requestPinAppWidget(android.content.ComponentName(context, BrookWidget::class.java), null, null)
-            val o = JSObject()
-            o.put("requested", ok)
-            call.resolve(o)
-        }
-    }
-
     // --- Crossfade ---------------------------------------------------------------------------------
 
     @PluginMethod

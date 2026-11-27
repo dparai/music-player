@@ -5,12 +5,6 @@
     <string name="package_name">com.dpk.brook</string>
     <string name="custom_url_scheme">com.dpk.brook</string>
     <string name="download_channel">Downloading songs</string>
-    <string name="widget_description">Brook: what is playing, with play, previous and next</string>
-    <string name="widget_idle">Tap to open Brook</string>
-    <string name="widget_play">Play</string>
-    <string name="widget_pause">Pause</string>
-    <string name="widget_prev">Previous song</string>
-    <string name="widget_next">Next song</string>
     <string name="action_shuffle">Shuffle</string>
     <string name="action_repeat">Repeat</string>
 </resources>

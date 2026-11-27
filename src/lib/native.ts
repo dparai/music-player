@@ -100,8 +100,6 @@ export interface BrookPlayerPlugin {
   setTransitionPlans(o: { plans: NativePlanIn[] }): Promise<void>;
   // Tell the player whether the play order is shuffled (it shows this on the notification button).
   setModes(o: { shuffle: boolean }): Promise<{ shuffle: boolean; repeatOne: boolean }>;
-  // Ask Android to put the Brook widget on the home screen (the user confirms in a system dialog).
-  pinWidget(): Promise<{ requested: boolean }>;
   setSleepTimer(o: { minutes?: number; endOfSong?: boolean }): Promise<NativeSleep>;
   getSleepTimer(): Promise<NativeSleep>;
   getDownloads(): Promise<NativeDownloads>;

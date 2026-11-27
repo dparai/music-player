@@ -95,40 +95,6 @@ class PlaybackService : MediaSessionService() {
         p.addMediaItems(rest)
     }
 
-    // --- the home-screen widget follows the primary player ---------------------------------------------
-    private val widgetExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-    private var widgetArtUri: String? = null
-    private var widgetArt: android.graphics.Bitmap? = null
-    private val widgetRunner = Runnable {
-        val p = session?.player ?: return@Runnable
-        val meta = p.mediaMetadata
-        val title = meta.title?.toString()
-        val artist = meta.artist?.toString()
-        val playing = p.playWhenReady && p.playbackState != Player.STATE_ENDED && p.playbackState != Player.STATE_IDLE
-        val artUri = meta.artworkUri?.toString()
-        // The cover is fetched off the main thread, once per song; until it arrives the old one stays.
-        BrookWidget.update(this, title, artist, playing, if (artUri == widgetArtUri) widgetArt else null)
-        if (artUri != null && artUri != widgetArtUri) {
-            widgetExecutor.execute {
-                val bmp = try {
-                    java.net.URL(artUri).openStream().use { android.graphics.BitmapFactory.decodeStream(it) }
-                        ?.let { android.graphics.Bitmap.createScaledBitmap(it, 240, 240, true) }
-                } catch (e: Exception) { null }
-                main.post {
-                    widgetArtUri = artUri
-                    widgetArt = bmp
-                    if (session?.player?.mediaMetadata?.artworkUri?.toString() == artUri) {
-                        BrookWidget.update(this, title, artist, playing, bmp)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun refreshWidget() {
-        main.removeCallbacks(widgetRunner)
-        main.postDelayed(widgetRunner, 250)
-    }
 
     // The equaliser sits in the audio sink, so every song goes through it, gapless transitions included.
     private fun buildPlayer(eq: EqProcessor, handleFocus: Boolean): ExoPlayer {
@@ -171,14 +137,13 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-            if (isPrimary(player)) { Log.i(TAG, "playWhenReady=$playWhenReady reason=$reason"); refreshWidget() }
+            if (isPrimary(player)) Log.i(TAG, "playWhenReady=$playWhenReady reason=$reason")
         }
 
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
             // The loudness trim of the song that is now playing on this player.
             eq.setItemGainDb(item?.mediaMetadata?.extras?.getDouble("gainDb", 0.0) ?: 0.0)
             if (!isPrimary(player)) return
-            refreshWidget()
             Log.i(TAG, "transition id=${item?.mediaId} reason=$reason index=${player.currentMediaItemIndex}/${player.mediaItemCount}")
             retries = 0
             // A skip, a new queue or a song that ended by itself while a mix was loading: the mix no longer fits.
@@ -203,13 +168,10 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            if (isPrimary(player)) { store.save(player); refreshWidget() } // a pause or a stop remembers where it was
+            if (isPrimary(player)) store.save(player) // a pause or a stop remembers where it was
         }
 
 
-        override fun onMediaMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) {
-            if (isPrimary(player)) refreshWidget()
-        }
     }
 
     override fun onCreate() {
