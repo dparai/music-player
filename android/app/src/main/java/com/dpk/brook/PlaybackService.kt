@@ -10,8 +10,14 @@ import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Timeline
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import androidx.media3.session.MediaSessionService
 
 /**
@@ -19,14 +25,26 @@ import androidx.media3.session.MediaSessionService
  * screen off, and the lock screen, notification, headset and Bluetooth buttons all talk
  * to the MediaSession below, so none of it depends on the web page being awake.
  */
+@UnstableApi
 class PlaybackService : MediaSessionService() {
     private var session: MediaSession? = null
     private val main = Handler(Looper.getMainLooper())
     private var retries = 0
+    private val prefetcher = Prefetcher()
+    private lateinit var store: QueueStore
+    private val saveTick = object : Runnable {
+        override fun run() {
+            session?.player?.let { if (it.isPlaying) store.save(it) }
+            main.postDelayed(this, 15_000)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
+        BrookMedia.init(this)
+        store = QueueStore(this)
         val player = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(BrookMedia.playbackFactory))
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -56,9 +74,20 @@ class PlaybackService : MediaSessionService() {
                 Log.i(TAG, "playWhenReady=$playWhenReady reason=$reason")
             }
 
-            override fun onMediaItemTransition(item: androidx.media3.common.MediaItem?, reason: Int) {
+            override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 Log.i(TAG, "transition id=${item?.mediaId} reason=$reason index=${player.currentMediaItemIndex}/${player.mediaItemCount}")
                 retries = 0
+                schedulePrefetch(player)
+                store.save(player)
+            }
+
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                schedulePrefetch(player)
+                store.save(player)
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                store.save(player) // a pause or a stop remembers where it was
             }
         })
 
@@ -67,7 +96,43 @@ class PlaybackService : MediaSessionService() {
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        session = MediaSession.Builder(this, player).setSessionActivity(open).build()
+        session = MediaSession.Builder(this, player)
+            .setSessionActivity(open)
+            .setCallback(object : MediaSession.Callback {
+                // A headset / Bluetooth / lock-screen "play" with an empty player (the app was killed): bring the last queue back.
+                override fun onPlaybackResumption(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                    val saved = store.load()
+                    Log.i(TAG, "resumption: ${saved?.mediaItems?.size ?: 0} saved songs")
+                    return if (saved != null) Futures.immediateFuture(saved)
+                    else Futures.immediateFailedFuture(UnsupportedOperationException("no saved queue"))
+                }
+            })
+            .build()
+        main.postDelayed(saveTick, 15_000)
+    }
+
+    // The songs after the current one, fetched into the phone's cache (see Prefetcher). Debounced: one queue
+    // change arrives as several timeline events.
+    private fun schedulePrefetch(player: ExoPlayer) {
+        main.removeCallbacks(prefetchRunner)
+        main.postDelayed(prefetchRunner, 600)
+        prefetchPlayer = player
+    }
+
+    private var prefetchPlayer: ExoPlayer? = null
+    private val prefetchRunner = Runnable {
+        val p = prefetchPlayer ?: return@Runnable
+        val next = ArrayList<MediaItem>()
+        var i = p.currentMediaItemIndex + 1
+        while (i < p.mediaItemCount && next.size < PREFETCH_COUNT) {
+            val item = p.getMediaItemAt(i)
+            if (item.mediaMetadata.extras?.getBoolean("prefetch", false) == true) next.add(item)
+            i++
+        }
+        prefetcher.fetch(next)
     }
 
     // A network problem retries the same song for as long as the player is meant to be playing, with a
@@ -109,6 +174,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        prefetcher.cancel()
         session?.run {
             player.release()
             release()
@@ -120,5 +186,6 @@ class PlaybackService : MediaSessionService() {
     companion object {
         private const val TAG = "BrookPlayer"
         private const val MAX_RETRY_DELAY_MS = 20_000L
+        private const val PREFETCH_COUNT = 4
     }
 }

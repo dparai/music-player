@@ -11,6 +11,10 @@ export interface NativeItem {
   artist: string;
   album: string;
   url: string;
+  // The player's cache is keyed by this, not by the URL (which carries a login token).
+  cacheKey: string;
+  // Fetch it into the phone's cache ahead of time (false for big original files).
+  prefetch: boolean;
   artUrl: string | null;
   durationMs: number;
 }

@@ -14,12 +14,15 @@ export function toNativeItem(
   quality: Quality,
   format: StreamFormat,
 ): NativeItem {
+  const transcode = transcodeFor(song, quality, format);
   return {
     id: song.id,
     title: song.title,
     artist: song.artist ?? "",
     album: song.album ?? "",
-    url: absolute(streamUrl(creds, song.id, transcodeFor(song, quality, format))),
+    url: absolute(streamUrl(creds, song.id, transcode)),
+    cacheKey: transcode ? `tc:${song.id}|${transcode.format}|${transcode.maxBitRate}` : `orig:${song.id}`,
+    prefetch: transcode !== null,
     artUrl: song.coverArt ? absolute(coverArtUrl(creds, song.coverArt, "512")) : null,
     durationMs: Math.round((song.duration || 0) * 1000),
   };

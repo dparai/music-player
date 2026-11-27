@@ -130,11 +130,18 @@ class BrookPlayerPlugin : Plugin() {
         if (dur > 0) meta.setDurationMs(dur)
         val art = o.getString("artUrl")
         if (!art.isNullOrEmpty()) meta.setArtworkUri(Uri.parse(art))
-        return MediaItem.Builder()
+        // Whether the player should fetch this song ahead of time (the web UI says no for big originals).
+        val extras = android.os.Bundle()
+        extras.putBoolean("prefetch", o.optBoolean("prefetch", false))
+        meta.setExtras(extras)
+        val builder = MediaItem.Builder()
             .setMediaId(o.getString("id") ?: "")
             .setUri(o.getString("url"))
             .setMediaMetadata(meta.build())
-            .build()
+        // The cache is keyed by song, not by URL (the URL holds a login token).
+        val key = o.getString("cacheKey")
+        if (!key.isNullOrEmpty()) builder.setCustomCacheKey(key)
+        return builder.build()
     }
 
     private fun items(arr: JSArray?): List<MediaItem> {
