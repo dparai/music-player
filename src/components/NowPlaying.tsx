@@ -24,6 +24,7 @@ import { LyricsView } from "./LyricsView";
 import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
 import { diag } from "@/lib/diag";
 import { isDownloaded, offlineUrl } from "@/lib/downloads";
+import { AheadStore } from "@/lib/ahead";
 import styles from "./NowPlaying.module.css";
 import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
@@ -41,6 +42,8 @@ interface Props {
   onAdvance: (song: SubsonicSong) => void;
   nextAnalysis: SongAnalysis | null;
   nextSong: SubsonicSong | null;
+  // The songs after this one (up to a few): fetched into memory ahead of time.
+  upcoming?: SubsonicSong[];
   onPlayingChange?: (playing: boolean, progress: number) => void;
   // True while a picked song waits for the server to prepare its stream.
   onPreparingChange?: (preparing: boolean) => void;
@@ -131,6 +134,10 @@ function shapeOf(
   };
 }
 
+function aheadKey(id: string, t: { format: string; maxBitRate: number }): string {
+  return `${id}|${t.format}|${t.maxBitRate}`;
+}
+
 function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
 }
@@ -149,7 +156,7 @@ export function NowPlaying({
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, onPreparingChange, togglePlayRef,
-  autoMixTracks, onChooseOriginal,
+  autoMixTracks, onChooseOriginal, upcoming,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -177,6 +184,16 @@ export function NowPlaying({
     preparingRef.current = value;
     setPreparingState(value);
     onPreparingChangeRef.current?.(value);
+  }
+  // Songs fetched ahead and held in memory (see lib/ahead.ts).
+  const aheadRef = useRef<AheadStore>(null as unknown as AheadStore);
+  if (!aheadRef.current) {
+    aheadRef.current = new AheadStore({
+      fetchFn: (url, init) => fetch(url, init),
+      makeUrl: (blob) => URL.createObjectURL(blob),
+      revokeUrl: (url) => URL.revokeObjectURL(url),
+      onEvent: (e, d) => diag(e, d),
+    });
   }
   const lastSongIdRef = useRef<string | null>(null);
   const skipNextLoadRef = useRef<string | null>(null);
@@ -496,8 +513,12 @@ export function NowPlaying({
     // Saved on the device: a plain URL the service worker answers, no network.
     if (isDownloaded(s.id)) return { key: null, url: () => offlineUrl(s.id) };
     const transcode = transcodeFor(s, qualityRef.current, streamFormat());
+    const key = transcode ? aheadKey(s.id, transcode) : null;
+    // Already fetched into memory: no network needed (a locked phone cannot start a new load).
+    const held = key ? aheadRef.current.urlFor(key) : null;
+    if (held) return { key: null, url: () => held };
     return {
-      key: transcode ? `${s.id}|${transcode.format}|${transcode.maxBitRate}` : null,
+      key,
       url: () => streamUrl(creds, s.id, transcode),
     };
   }
@@ -591,6 +612,33 @@ export function NowPlaying({
     }
     load(false);
   }, [song, creds, getActiveAudio]);
+
+  // Fetch the next few songs into memory so a handoff on a locked phone needs no
+  // network. Only transcoded tiers: Original is saved on the device already, and a
+  // raw FLAC is too big to hold. The effect runs again when the queue, quality or
+  // login changes, and when the page comes back (a fetch begun while locked may have failed).
+  const upcomingKey = (upcoming ?? []).map((u) => u.id).join(",");
+  const syncAhead = useCallback(() => {
+    const fmt = streamFormat();
+    const q = qualityRef.current;
+    const items = (upcoming ?? []).flatMap((u) => {
+      if (isDownloaded(u.id)) return [];
+      const t = transcodeFor(u, q, fmt);
+      return t ? [{ key: aheadKey(u.id, t), url: () => streamUrl(creds, u.id, t) }] : [];
+    });
+    const cur = songRef.current;
+    const ct = cur && !isDownloaded(cur.id) ? transcodeFor(cur, q, fmt) : null;
+    void aheadRef.current.sync(cur && ct ? [aheadKey(cur.id, ct)] : [], items);
+  }, [upcomingKey, creds]);
+  const syncAheadRef = useRef(syncAhead);
+  syncAheadRef.current = syncAhead;
+  useEffect(() => { syncAhead(); }, [syncAhead, quality, song?.id]);
+  useEffect(() => {
+    const again = () => { if (!document.hidden) syncAheadRef.current(); };
+    document.addEventListener("visibilitychange", again);
+    return () => document.removeEventListener("visibilitychange", again);
+  }, []);
+  useEffect(() => () => { setTimeout(() => { if (!mountedRef.current) aheadRef.current.clear(); }, 0); }, []);
 
   // Have the server transcode the next song ahead of time, so it starts at once
   // and can be cued for a mix. Costs one tiny request, not a download.

@@ -16,6 +16,8 @@ import { Library } from "@/components/Library";
 import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
+import { AHEAD_COUNT } from "@/lib/ahead";
+import { upcomingSongs } from "@/lib/queue";
 import { DiagGate } from "@/components/DiagPanel";
 import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported, pruneDownloads } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
@@ -131,6 +133,11 @@ export function App() {
 
   const nextSong = getNextSong();
   const nextAnalysis = nextSong ? lookupSong(analysisData, nextSong) : null;
+  // The songs after this one, for fetching ahead. A DJ pick is only known one song out.
+  const upcoming = useMemo(
+    () => (djMode ? (nextSong ? [nextSong] : []) : upcomingSongs(playNextQueue, playOrder, currentSongId, AHEAD_COUNT)),
+    [djMode, nextSong, playNextQueue, playOrder, currentSongId],
+  );
 
   useEffect(() => {
     djNextSong.current = null;
@@ -347,6 +354,7 @@ export function App() {
                 onAdvance={handleAdvance}
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
+                upcoming={upcoming}
                 onPlayingChange={handlePlayingChange}
                 onPreparingChange={setPreparing}
                 togglePlayRef={togglePlayRef}
