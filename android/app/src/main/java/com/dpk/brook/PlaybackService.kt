@@ -37,6 +37,9 @@ class PlaybackService : MediaSessionService() {
             .setHandleAudioBecomingNoisy(true) // pause when headphones are unplugged
             .setWakeMode(C.WAKE_MODE_NETWORK)  // keep CPU and Wi-Fi awake while playing with the screen off
             .build()
+        // The web page refills the queue while it is alive; with the app swiped away nobody does, so the
+        // queue loops at its end (as the web player does) instead of falling silent.
+        player.repeatMode = Player.REPEAT_MODE_ALL
 
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
