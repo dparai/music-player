@@ -47,13 +47,17 @@ object BrookMedia {
         private set
 
     // Equaliser, preamp and song gain, in the player's audio path (shared by the player and the plugin).
-    val eq = EqProcessor()
+    // One per player: a processor is stateful and cannot serve two audio sinks at once.
+    val eqs = listOf(EqProcessor().apply { label = "A" }, EqProcessor().apply { label = "B" })
+    @Volatile var crossfader: Crossfader? = null
 
     @Volatile var sound = SoundSettings()
 
+    fun setMasterGain(g: Double) = eqs.forEach { it.setMasterGain(g) }
+
     fun applySound(s: SoundSettings) {
         sound = s
-        eq.update(s)
+        eqs.forEach { it.update(s) }
         SoundSettings.save(appContext, s)
     }
 
@@ -91,7 +95,7 @@ object BrookMedia {
             Executors.newFixedThreadPool(2),
         ).apply { maxParallelDownloads = 2 }
         sound = SoundSettings.load(app)
-        eq.update(sound)
+        eqs.forEach { it.update(sound) }
         ready = true
     }
 

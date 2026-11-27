@@ -30,6 +30,8 @@ import kotlin.math.sqrt
 class EqProcessor : BaseAudioProcessor() {
     @Volatile private var settings = SoundSettings()
     @Volatile private var itemGainDb = 0.0
+    @Volatile private var masterGain = 1.0 // 1.0 normally; the sleep timer fades it to 0
+    @Volatile var label = ""             // names this processor in the test meter
     @Volatile private var version = 0
     private var appliedVersion = -1
 
@@ -62,6 +64,12 @@ class EqProcessor : BaseAudioProcessor() {
 
     fun update(s: SoundSettings) {
         settings = s
+        version++
+    }
+
+    /** Overall level, 0..1, used for the sleep timer's fade-out. */
+    fun setMasterGain(g: Double) {
+        masterGain = g
         version++
     }
 
@@ -104,8 +112,8 @@ class EqProcessor : BaseAudioProcessor() {
             }
         }
         val song = if (s.normalize) itemGainDb else 0.0
-        targetGain = 10.0.pow((s.preampDb + song) / 20.0)
-        bypass = s.isFlat && abs(s.preampDb + song) < 1e-9
+        targetGain = 10.0.pow((s.preampDb + song) / 20.0) * masterGain
+        bypass = s.isFlat && abs(s.preampDb + song) < 1e-9 && masterGain == 1.0
         appliedVersion = v
     }
 
@@ -156,7 +164,7 @@ class EqProcessor : BaseAudioProcessor() {
             }
             if (meter && ++meterFrames >= rate) {
                 val n = (meterFrames * channels).toDouble()
-                Log.i("BrookEq", "in=%.2f dB out=%.2f dB gain=%.2f dB".format(10 * kotlin.math.log10(meterIn / n + 1e-12), 10 * kotlin.math.log10(meterOut / n + 1e-12), 20 * kotlin.math.log10(gain)))
+                Log.i("BrookEq", "$label in=%.2f dB out=%.2f dB gain=%.2f dB".format(10 * kotlin.math.log10(meterIn / n + 1e-12), 10 * kotlin.math.log10(meterOut / n + 1e-12), 20 * kotlin.math.log10(gain)))
                 meterIn = 0.0; meterOut = 0.0; meterFrames = 0
             }
         }

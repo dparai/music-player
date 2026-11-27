@@ -51,6 +51,7 @@ interface Props {
   queueBefore?: SubsonicSong[];
   queueAfter?: SubsonicSong[];
   findSong?: (id: string) => SubsonicSong | undefined;
+  online?: boolean;
   onPlayingChange?: (playing: boolean, progress: number) => void;
   // True while a picked song waits for the server to prepare its stream.
   onPreparingChange?: (preparing: boolean) => void;
@@ -167,7 +168,7 @@ export function NowPlaying({
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, onPreparingChange, togglePlayRef,
-  autoMixTracks, onChooseOriginal, upcoming, queueBefore, queueAfter, findSong,
+  autoMixTracks, onChooseOriginal, upcoming, queueBefore, queueAfter, findSong, online,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -1188,7 +1189,11 @@ export function NowPlaying({
     onAdvance: (s) => onAdvanceRef.current(s),
     setPlaying, setPreparing, setCurrentTime, setDuration,
     onProgress: (p, r) => onPlayingChangeRef.current?.(p, r),
-    sound,
+    sound, crossfade: djMode, tracks: autoMixTracks, online,
+    onCrossfade: (phase, smart) => {
+      setCrossfading(phase === "start");
+      if (phase === "start") setMixLabel(smart ? "SMART MIX" : "CROSSFADE");
+    },
     lufsOf: (s) => (autoMixTracks ? findAutoMixTrack(autoMixTracks, s)?.lufs : null),
   });
 
@@ -1566,7 +1571,12 @@ export function NowPlaying({
           </div>
           <div className={styles.timeRow}>
             <span>{formatTime(shownTime)}</span>
-            {crossfading && <span className={styles.mixChip}><i />{mixLabel}</span>}
+            {crossfading ? (
+              <span className={styles.mixChip}><i />{mixLabel}</span>
+            ) : NATIVE && djMode && online === false ? (
+              // Offline there is no beat data to mix with: the player falls back to a plain fade.
+              <span className={styles.mixChip} role="status">Smart mix needs internet</span>
+            ) : null}
             <span>{formatTime(duration)}</span>
           </div>
         </div>
@@ -1576,10 +1586,6 @@ export function NowPlaying({
             className={`${styles.toggle} ${djMode ? styles.toggleOn : ""}`}
             onClick={onDjModeToggle}
             aria-pressed={djMode}
-            // The app's player has no crossfade yet; the button keeps its place so the row does not shift.
-            style={NATIVE ? { visibility: "hidden" } : undefined}
-            aria-hidden={NATIVE || undefined}
-            tabIndex={NATIVE ? -1 : undefined}
           >
             <MixIcon size={22} />
             <span>Crossfade</span>

@@ -34,17 +34,17 @@ object SleepTimer {
 
     private val tick = object : Runnable {
         override fun run() {
-            val p = player ?: return
+            val p = BrookMedia.player ?: return
             val left = deadline - SystemClock.elapsedRealtime()
             if (left <= 0) {
                 p.pause()
-                p.volume = 1f
+                BrookMedia.setMasterGain(1.0)
                 clear()
                 return
             }
             if (left <= FADE_MS) {
                 fading = true
-                p.volume = (left.toFloat() / FADE_MS).coerceIn(0f, 1f)
+                BrookMedia.setMasterGain((left.toDouble() / FADE_MS).coerceIn(0.0, 1.0))
             }
             main.postDelayed(this, if (left > FADE_MS + STEP_MS) minOf(left - FADE_MS, 1000L) else STEP_MS)
         }
@@ -68,7 +68,7 @@ object SleepTimer {
     fun cancel() {
         main.removeCallbacks(tick)
         player?.let {
-            if (fading) it.volume = 1f
+            if (fading) BrookMedia.setMasterGain(1.0)
             if (endOfSong) { it.pauseAtEndOfMediaItems = false; it.removeListener(endListener) }
         }
         clear()

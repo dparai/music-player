@@ -19,6 +19,7 @@ import { NowPlaying } from "@/components/NowPlaying";
 import { AHEAD_COUNT } from "@/lib/ahead";
 import { upcomingSongs } from "@/lib/queue";
 import { NATIVE_QUEUE_AFTER } from "@/lib/nativeQueue";
+import { isNativeApp } from "@/lib/native";
 import { DiagGate } from "@/components/DiagPanel";
 import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported, pruneDownloads } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
@@ -66,7 +67,17 @@ export function App() {
   const togglePlayRef = useRef<(() => void) | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
   const [autoMixTracks, setAutoMixTracks] = useState<AutoMixTrack[]>([]);
-  const [djMode, setDjMode] = useState(false);
+  // The Crossfade switch. In the web player it also turns on DJ song picking; in the Android app the
+  // native player mixes between the songs in the normal order, so the picking stays off there.
+  // Remembered in the app (a phone user does not want to switch it on after every restart).
+  const [crossfadeOn, setCrossfadeOn] = useState(() => {
+    try { return isNativeApp() && localStorage.getItem("deepakmusic_crossfade") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    if (!isNativeApp()) return;
+    try { localStorage.setItem("deepakmusic_crossfade", crossfadeOn ? "1" : "0"); } catch { /* storage blocked */ }
+  }, [crossfadeOn]);
+  const djMode = crossfadeOn && !isNativeApp();
   const [shuffled, setShuffled] = useState(false);
   const [currentSongId, setCurrentSongId] = useState<string | null>(null);
   const [playNextQueue, setPlayNextQueue] = useState<SubsonicSong[]>([]);
@@ -234,7 +245,7 @@ export function App() {
     setSongs([]);
     setCurrentSongId(null);
     setPlayNextQueue([]);
-    setDjMode(false);
+    setCrossfadeOn(false);
     setShuffled(false);
   }
 
@@ -358,8 +369,9 @@ export function App() {
                 song={currentSong}
                 creds={creds}
                 analysis={currentAnalysis}
-                djMode={djMode}
-                onDjModeToggle={() => setDjMode((d) => !d)}
+                djMode={crossfadeOn}
+                onDjModeToggle={() => setCrossfadeOn((d) => !d)}
+                online={online}
                 shuffled={shuffled}
                 onShuffleToggle={handleShuffle}
                 onNext={handleNext}

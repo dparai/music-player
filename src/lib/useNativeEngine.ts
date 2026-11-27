@@ -6,6 +6,8 @@ import { BrookPlayer, type NativeState } from "./native";
 import { toNativeItem } from "./nativeItem";
 import { nativeQueue, sameQueue } from "./nativeQueue";
 import { diag } from "./diag";
+import { findAutoMixTrack, getAutoMixTrack, type AutoMixTrack } from "./automix";
+import { planPair, type NativePlan } from "./mixPlan";
 import { autoPreampDb, type SoundSettings } from "./sound";
 import { downloadsVersion, isDownloaded, subscribeDownloads } from "./downloads";
 
@@ -26,6 +28,11 @@ interface Options {
   setDuration: (s: number) => void;
   onProgress: (playing: boolean, ratio: number) => void;
   sound?: SoundSettings;
+  // Crossfade: on or off, the server's beat data (for the smart mix) and a callback for the mix starting/ending.
+  crossfade?: boolean;
+  tracks?: AutoMixTrack[];
+  online?: boolean;
+  onCrossfade?: (phase: "start" | "end" | "abort", smart: boolean) => void;
 }
 
 const POLL_MS = 500;
@@ -42,6 +49,10 @@ export function useNativeEngine(o: Options) {
   // False until we know what the native service is already playing (see below).
   const [ready, setReady] = useState(false);
   const firstRun = useRef(false);
+  // The queue number we last loaded. A report from the player older than it is about a queue that is
+  // already gone, and following it would undo what the user just chose.
+  const epoch = useRef(0);
+  const isStale = (e: number | undefined) => e !== undefined && e < epoch.current;
 
   const itemsFor = useCallback((songs: SubsonicSong[]) => {
     const { creds, quality } = opts.current;
@@ -76,6 +87,42 @@ export function useNativeEngine(o: Options) {
     void BrookPlayer.setSound({ gains: s.eq, preampDb: autoPreampDb(s.eq, 48000), normalize: s.normalize }).catch(() => {});
   }, [o.enabled, o.sound?.eq.join(","), o.sound?.normalize]);
 
+  // Crossfade on/off for the native player.
+  useEffect(() => {
+    if (!o.enabled) return;
+    void BrookPlayer.setCrossfade({ enabled: !!o.crossfade, fadeMs: 6000 }).catch(() => {});
+  }, [o.enabled, o.crossfade]);
+
+  // Smart mixes for the next few pairs of songs, made from the server's beat data (so only online) and
+  // handed to the native player, which carries them out later even with the screen off. Without a plan a
+  // pair gets a plain fade.
+  const planKey = o.song?.id + ">" + o.after.slice(0, 3).map((s) => s.id).join(",");
+  useEffect(() => {
+    if (!o.enabled || !ready) return;
+    let alive = true;
+    void (async () => {
+      const plans: NativePlan[] = [];
+      const song = opts.current.song;
+      const tracks = opts.current.tracks;
+      if (opts.current.crossfade && opts.current.online !== false && song && tracks) {
+        const chain = [song, ...opts.current.after.slice(0, 3)];
+        for (let i = 0; i < chain.length - 1 && alive; i++) {
+          const out = chain[i]!, inn = chain[i + 1]!;
+          const oT = findAutoMixTrack(tracks, out), iT = findAutoMixTrack(tracks, inn);
+          if (!oT || !iT) continue;
+          const [oD, iD] = await Promise.all([getAutoMixTrack(oT.id), getAutoMixTrack(iT.id)]);
+          const plan = planPair({
+            outId: out.id, inId: inn.id, outTrack: oT, outDetail: oD, inTrack: iT, inDetail: iD,
+            outBpm: oT.bpm || null, inBpm: iT.bpm || null, outDuration: out.duration,
+          });
+          if (plan) plans.push(plan);
+        }
+      }
+      if (alive) await BrookPlayer.setTransitionPlans({ plans }).catch(() => {});
+    })();
+    return () => { alive = false; };
+  }, [o.enabled, ready, o.crossfade, o.online, o.tracks, planKey]);
+
   // Start: adopt what the native service is already playing (the app was reopened
   // while it kept playing), otherwise load the restored song paused.
   useEffect(() => {
@@ -83,12 +130,14 @@ export function useNativeEngine(o: Options) {
     let alive = true;
     const handles: { remove: () => Promise<void> }[] = [];
     void (async () => {
-      handles.push(await BrookPlayer.addListener("state", (s) => alive && applyState(s)));
-      handles.push(await BrookPlayer.addListener("trackChanged", (t) => alive && follow(t.id)));
+      handles.push(await BrookPlayer.addListener("state", (s) => { if (alive && !isStale(s.epoch)) applyState(s); }));
+      handles.push(await BrookPlayer.addListener("trackChanged", (t) => { if (alive && !isStale(t.epoch)) follow(t.id); }));
       handles.push(await BrookPlayer.addListener("error", (e) => diag("native error", e)));
+      handles.push(await BrookPlayer.addListener("crossfade", (e) => alive && opts.current.onCrossfade?.(e.phase, e.smart)));
       try {
         const s = await BrookPlayer.getState();
         if (!alive) return;
+        if (s.epoch !== undefined) epoch.current = Math.max(epoch.current, s.epoch);
         if (s.id) { follow(s.id); applyState(s); }
       } catch (e) {
         diag("native getState failed", String(e));
@@ -112,7 +161,8 @@ export function useNativeEngine(o: Options) {
     nativeId.current = song.id;
     queueSent.current = items;
     // The first song after a launch is only prepared: the app must not start playing by itself.
-    void BrookPlayer.setQueue({ items, startIndex, play: !wasFirst });
+    epoch.current += 1;
+    void BrookPlayer.setQueue({ items, startIndex, play: !wasFirst, epoch: epoch.current });
   }, [o.enabled, ready, o.song?.id, itemsFor]);
 
   // The songs after the current one changed (Play Next, shuffle, new quality): resend them.
@@ -139,6 +189,8 @@ export function useNativeEngine(o: Options) {
       busy = true;
       try {
         const s = await BrookPlayer.getState();
+        if (isStale(s.epoch)) return; // made before our latest setQueue was applied
+        if (s.epoch !== undefined) epoch.current = Math.max(epoch.current, s.epoch);
         if (s.id && s.id !== nativeId.current) follow(s.id);
         applyState(s);
       } catch { /* the bridge is not ready yet */ } finally { busy = false; }

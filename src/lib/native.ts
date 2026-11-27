@@ -32,6 +32,7 @@ export interface NativeState {
   durationMs: number;
   queueSize: number;
   queue?: string[]; // ids, in order
+  epoch?: number;   // the setQueue this report belongs to (see setQueue)
 }
 
 export interface NativeTrackChange {
@@ -39,6 +40,7 @@ export interface NativeTrackChange {
   index: number;
   // "auto": the previous song ended; "seek": next/previous (app, lock screen, headset); "playlist": the queue changed.
   reason: "auto" | "seek" | "playlist" | "repeat";
+  epoch?: number;
 }
 
 export interface NativeError {
@@ -58,6 +60,21 @@ export interface NativeDownloadItem {
   cacheKey: string; // "orig:<id>", the key playback reads
 }
 
+export interface NativePlanIn {
+  fromId: string;
+  toId: string;
+  cueOutMs: number;
+  inStartMs: number;
+  fadeMs: number;
+  rate: number;
+}
+
+export interface NativeCrossfadeEvent {
+  phase: "start" | "end" | "abort";
+  smart: boolean; // a beat-matched mix from a plan, not a plain fade
+  fadeMs: number;
+}
+
 export interface NativeSleep {
   endsAt: number;     // epoch ms the music stops, or 0
   endOfSong: boolean; // stops when the current song ends
@@ -65,7 +82,8 @@ export interface NativeSleep {
 
 export interface BrookPlayerPlugin {
   // Replace the whole queue and start at `startIndex`.
-  setQueue(o: { items: NativeItem[]; startIndex: number; positionMs?: number; play: boolean }): Promise<void>;
+  // `epoch` counts the queues the web UI has loaded: reports older than it are stale.
+  setQueue(o: { items: NativeItem[]; startIndex: number; positionMs?: number; play: boolean; epoch: number }): Promise<void>;
   // Replace everything after the current item (the playing song is not touched). `currentId` is the
   // song the web UI thinks is playing; if the player has moved on meanwhile, the call is ignored.
   setUpcoming(o: { currentId: string; items: NativeItem[] }): Promise<void>;
@@ -77,6 +95,9 @@ export interface BrookPlayerPlugin {
   getState(): Promise<NativeState>;
   // The equaliser (10 band gains in dB), the preamp that keeps boosts from clipping, and volume normalizing.
   setSound(o: { gains: number[]; preampDb: number; normalize: boolean }): Promise<void>;
+  // Crossfade on/off and the plain-fade length; plans are the smart mixes for upcoming pairs (replaced as a set).
+  setCrossfade(o: { enabled: boolean; fadeMs: number }): Promise<void>;
+  setTransitionPlans(o: { plans: NativePlanIn[] }): Promise<void>;
   setSleepTimer(o: { minutes?: number; endOfSong?: boolean }): Promise<NativeSleep>;
   getSleepTimer(): Promise<NativeSleep>;
   getDownloads(): Promise<NativeDownloads>;
@@ -89,6 +110,7 @@ export interface BrookPlayerPlugin {
   addListener(event: "error", fn: (e: NativeError) => void): Promise<PluginListenerHandle>;
   addListener(event: "downloads", fn: (d: NativeDownloads) => void): Promise<PluginListenerHandle>;
   addListener(event: "sleep", fn: (s: NativeSleep) => void): Promise<PluginListenerHandle>;
+  addListener(event: "crossfade", fn: (e: NativeCrossfadeEvent) => void): Promise<PluginListenerHandle>;
 }
 
 export function isNativeApp(): boolean {

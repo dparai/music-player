@@ -37,6 +37,9 @@ class BrookPlayerPlugin : Plugin() {
     private var future: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     private val waiting = ArrayList<(MediaController) -> Unit>()
+    // Counts the queues the web UI has loaded. Every state and song-change report carries it, so the web UI can
+    // tell a report made before its latest setQueue from one made after, and ignore the stale ones.
+    private var epoch = 0
 
     private val listener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) = emitState()
@@ -48,6 +51,7 @@ class BrookPlayerPlugin : Plugin() {
             val o = JSObject()
             o.put("id", mediaItem?.mediaId)
             o.put("index", c.currentMediaItemIndex)
+            o.put("epoch", epoch)
             o.put(
                 "reason",
                 when (reason) {
@@ -76,6 +80,7 @@ class BrookPlayerPlugin : Plugin() {
             BrookMedia.init(context)
             BrookMedia.downloadManager.addListener(downloadListener)
             SleepTimer.onChange = { notifyListeners("sleep", sleepObject()) }
+            BrookMedia.crossfader?.listener = ::emitCrossfade
             emitDownloads()
         }
     }
@@ -90,7 +95,52 @@ class BrookPlayerPlugin : Plugin() {
         main.post { BrookMedia.applySound(s); call.resolve() }
     }
 
+    // --- Crossfade ---------------------------------------------------------------------------------
+
+    @PluginMethod
+    fun setCrossfade(call: PluginCall) {
+        val enabled = call.data.optBoolean("enabled", false)
+        val fadeMs = call.data.optLong("fadeMs", Crossfader.DEFAULT_FADE_MS).coerceIn(1_000L, 15_000L)
+        context.getSharedPreferences("crossfade", android.content.Context.MODE_PRIVATE).edit()
+            .putBoolean("enabled", enabled).putLong("fadeMs", fadeMs).apply()
+        withController(call) {
+            BrookMedia.crossfader?.let { it.enabled = enabled; it.fadeMs = fadeMs }
+            call.resolve()
+        }
+    }
+
+    // A mix worked out by the web UI for one pair of songs (from the server's beat data).
+    @PluginMethod
+    fun setTransitionPlans(call: PluginCall) {
+        val arr = call.getArray("plans")
+        withController(call) {
+            val cf = BrookMedia.crossfader
+            if (cf != null) {
+                cf.clearPlans()
+                for (i in 0 until (arr?.length() ?: 0)) {
+                    val o = arr!!.getJSONObject(i)
+                    cf.setPlan(
+                        Crossfader.Plan(
+                            o.getString("fromId"), o.getString("toId"),
+                            o.optLong("cueOutMs"), o.optLong("inStartMs"), o.optLong("fadeMs", Crossfader.DEFAULT_FADE_MS),
+                            o.optDouble("rate", 1.0).toFloat().coerceIn(0.85f, 1.15f),
+                        ),
+                    )
+                }
+            }
+            call.resolve()
+        }
+    }
+
     // --- Sleep timer -------------------------------------------------------------------------------
+
+    private fun emitCrossfade(phase: String, smart: Boolean, fadeMs: Long) {
+        val o = JSObject()
+        o.put("phase", phase)
+        o.put("smart", smart)
+        o.put("fadeMs", fadeMs)
+        notifyListeners("crossfade", o)
+    }
 
     private fun sleepObject(): JSObject {
         val o = JSObject()
@@ -233,6 +283,7 @@ class BrookPlayerPlugin : Plugin() {
                 val todo = ArrayList(waiting)
                 waiting.clear()
                 todo.forEach { it(c) }
+                BrookMedia.crossfader?.listener = ::emitCrossfade
                 emitState()
             } catch (e: Exception) {
                 Log.e(TAG, "cannot connect to the player service", e)
@@ -314,6 +365,7 @@ class BrookPlayerPlugin : Plugin() {
         o.put("positionMs", c.currentPosition.coerceAtLeast(0))
         o.put("durationMs", dur.coerceAtLeast(0))
         o.put("queueSize", c.mediaItemCount)
+        o.put("epoch", epoch)
         val ids = JSArray()
         for (i in 0 until c.mediaItemCount) ids.put(c.getMediaItemAt(i).mediaId)
         o.put("queue", ids)
@@ -331,8 +383,10 @@ class BrookPlayerPlugin : Plugin() {
         val start = call.getInt("startIndex", 0) ?: 0
         val pos = call.data.optLong("positionMs", 0L)
         val play = call.getBoolean("play", true) ?: true
+        val newEpoch = call.data.optInt("epoch", epoch + 1)
         if (list.isEmpty()) { call.resolve(); return }
         withController(call) { c ->
+            epoch = newEpoch
             c.setMediaItems(list, start.coerceIn(0, list.size - 1), pos)
             c.prepare()
             if (play) c.play() else c.pause()
