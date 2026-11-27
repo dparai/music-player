@@ -98,6 +98,10 @@ export interface BrookPlayerPlugin {
   // Crossfade on/off and the plain-fade length; plans are the smart mixes for upcoming pairs (replaced as a set).
   setCrossfade(o: { enabled: boolean; fadeMs: number }): Promise<void>;
   setTransitionPlans(o: { plans: NativePlanIn[] }): Promise<void>;
+  // Tell the player whether the play order is shuffled (it shows this on the notification button).
+  setModes(o: { shuffle: boolean }): Promise<{ shuffle: boolean; repeatOne: boolean }>;
+  // Ask Android to put the Brook widget on the home screen (the user confirms in a system dialog).
+  pinWidget(): Promise<{ requested: boolean }>;
   setSleepTimer(o: { minutes?: number; endOfSong?: boolean }): Promise<NativeSleep>;
   getSleepTimer(): Promise<NativeSleep>;
   getDownloads(): Promise<NativeDownloads>;
@@ -111,6 +115,7 @@ export interface BrookPlayerPlugin {
   addListener(event: "downloads", fn: (d: NativeDownloads) => void): Promise<PluginListenerHandle>;
   addListener(event: "sleep", fn: (s: NativeSleep) => void): Promise<PluginListenerHandle>;
   addListener(event: "crossfade", fn: (e: NativeCrossfadeEvent) => void): Promise<PluginListenerHandle>;
+  addListener(event: "modes", fn: (m: { shuffle: boolean; repeatOne: boolean }) => void): Promise<PluginListenerHandle>;
 }
 
 export function isNativeApp(): boolean {

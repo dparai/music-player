@@ -61,6 +61,13 @@ object BrookMedia {
         SoundSettings.save(appContext, s)
     }
 
+    // Shuffle and repeat-one, shown as buttons on the notification and lock-screen player. The web UI owns the
+    // play order, so it is told about a press (modesListener) and tells us its own state (setModes).
+    @Volatile var shuffle = false
+    @Volatile var repeatOne = false
+    @Volatile var modesChanged: (() -> Unit)? = null    // the service redraws its buttons
+    @Volatile var modesListener: (() -> Unit)? = null   // the plugin tells the web UI
+
     // The playing ExoPlayer (set by PlaybackService), for things that act on it from outside the service.
     @Volatile var player: androidx.media3.exoplayer.ExoPlayer? = null
 

@@ -20,7 +20,12 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import android.os.Bundle
+import androidx.media3.session.CommandButton
 import androidx.media3.session.MediaSession
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
 import androidx.media3.session.MediaSessionService
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -56,6 +61,74 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun isPrimary(p: Player) = session?.player === p
+
+    // --- shuffle / repeat buttons on the notification and lock-screen player -------------------------------
+    private fun modeButtons(): ImmutableList<CommandButton> = ImmutableList.of(
+        CommandButton.Builder(if (BrookMedia.shuffle) CommandButton.ICON_SHUFFLE_ON else CommandButton.ICON_SHUFFLE_OFF)
+            .setSessionCommand(SessionCommand(ACTION_SHUFFLE, Bundle.EMPTY))
+            .setDisplayName(getString(R.string.action_shuffle))
+            .build(),
+        CommandButton.Builder(if (BrookMedia.repeatOne) CommandButton.ICON_REPEAT_ONE else CommandButton.ICON_REPEAT_ALL)
+            .setSessionCommand(SessionCommand(ACTION_REPEAT, Bundle.EMPTY))
+            .setDisplayName(getString(R.string.action_repeat))
+            .build(),
+    )
+
+    private fun redrawModeButtons() {
+        session?.setCustomLayout(modeButtons())
+    }
+
+    private fun applyRepeat() {
+        players.forEach { it.repeatMode = if (BrookMedia.repeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_ALL }
+    }
+
+    // Shuffle pressed with no web page to do it: reorder what is left of the queue here. (With the page alive it
+    // follows the request and sends its own shuffled order, which replaces this one.)
+    private fun reshuffleRest() {
+        val p = session?.player ?: return
+        val at = p.currentMediaItemIndex
+        if (at + 1 >= p.mediaItemCount) return
+        val rest = ArrayList<MediaItem>()
+        for (i in at + 1 until p.mediaItemCount) rest.add(p.getMediaItemAt(i))
+        rest.shuffle()
+        p.removeMediaItems(at + 1, p.mediaItemCount)
+        p.addMediaItems(rest)
+    }
+
+    // --- the home-screen widget follows the primary player ---------------------------------------------
+    private val widgetExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var widgetArtUri: String? = null
+    private var widgetArt: android.graphics.Bitmap? = null
+    private val widgetRunner = Runnable {
+        val p = session?.player ?: return@Runnable
+        val meta = p.mediaMetadata
+        val title = meta.title?.toString()
+        val artist = meta.artist?.toString()
+        val playing = p.playWhenReady && p.playbackState != Player.STATE_ENDED && p.playbackState != Player.STATE_IDLE
+        val artUri = meta.artworkUri?.toString()
+        // The cover is fetched off the main thread, once per song; until it arrives the old one stays.
+        BrookWidget.update(this, title, artist, playing, if (artUri == widgetArtUri) widgetArt else null)
+        if (artUri != null && artUri != widgetArtUri) {
+            widgetExecutor.execute {
+                val bmp = try {
+                    java.net.URL(artUri).openStream().use { android.graphics.BitmapFactory.decodeStream(it) }
+                        ?.let { android.graphics.Bitmap.createScaledBitmap(it, 240, 240, true) }
+                } catch (e: Exception) { null }
+                main.post {
+                    widgetArtUri = artUri
+                    widgetArt = bmp
+                    if (session?.player?.mediaMetadata?.artworkUri?.toString() == artUri) {
+                        BrookWidget.update(this, title, artist, playing, bmp)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun refreshWidget() {
+        main.removeCallbacks(widgetRunner)
+        main.postDelayed(widgetRunner, 250)
+    }
 
     // The equaliser sits in the audio sink, so every song goes through it, gapless transitions included.
     private fun buildPlayer(eq: EqProcessor, handleFocus: Boolean): ExoPlayer {
@@ -98,13 +171,14 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-            if (isPrimary(player)) Log.i(TAG, "playWhenReady=$playWhenReady reason=$reason")
+            if (isPrimary(player)) { Log.i(TAG, "playWhenReady=$playWhenReady reason=$reason"); refreshWidget() }
         }
 
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
             // The loudness trim of the song that is now playing on this player.
             eq.setItemGainDb(item?.mediaMetadata?.extras?.getDouble("gainDb", 0.0) ?: 0.0)
             if (!isPrimary(player)) return
+            refreshWidget()
             Log.i(TAG, "transition id=${item?.mediaId} reason=$reason index=${player.currentMediaItemIndex}/${player.mediaItemCount}")
             retries = 0
             // A skip, a new queue or a song that ended by itself while a mix was loading: the mix no longer fits.
@@ -129,7 +203,12 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            if (isPrimary(player)) store.save(player) // a pause or a stop remembers where it was
+            if (isPrimary(player)) { store.save(player); refreshWidget() } // a pause or a stop remembers where it was
+        }
+
+
+        override fun onMediaMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) {
+            if (isPrimary(player)) refreshWidget()
         }
     }
 
@@ -144,6 +223,9 @@ class PlaybackService : MediaSessionService() {
         val b = buildPlayer(BrookMedia.eqs[1], handleFocus = false)
         players = listOf(a, b)
         BrookMedia.player = a
+        setMediaNotificationProvider(
+            androidx.media3.session.DefaultMediaNotificationProvider.Builder(this).build().also { it.setSmallIcon(R.drawable.ic_notification) },
+        )
 
         val open = PendingIntent.getActivity(
             this, 0,
@@ -153,6 +235,38 @@ class PlaybackService : MediaSessionService() {
         session = MediaSession.Builder(this, a)
             .setSessionActivity(open)
             .setCallback(object : MediaSession.Callback {
+                override fun onConnect(mediaSession: MediaSession, controller: MediaSession.ControllerInfo): MediaSession.ConnectionResult {
+                    val commands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                        .add(SessionCommand(ACTION_SHUFFLE, Bundle.EMPTY))
+                        .add(SessionCommand(ACTION_REPEAT, Bundle.EMPTY))
+                        .build()
+                    return MediaSession.ConnectionResult.AcceptedResultBuilder(mediaSession)
+                        .setAvailableSessionCommands(commands)
+                        .setCustomLayout(modeButtons())
+                        .build()
+                }
+
+                override fun onCustomCommand(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    customCommand: SessionCommand,
+                    args: Bundle,
+                ): ListenableFuture<SessionResult> {
+                    when (customCommand.customAction) {
+                        ACTION_SHUFFLE -> {
+                            BrookMedia.shuffle = !BrookMedia.shuffle
+                            reshuffleRest()
+                        }
+                        ACTION_REPEAT -> {
+                            BrookMedia.repeatOne = !BrookMedia.repeatOne
+                            applyRepeat()
+                        }
+                    }
+                    redrawModeButtons()
+                    BrookMedia.modesListener?.invoke()
+                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
+
                 // A headset / Bluetooth / lock-screen "play" with an empty player (the app was killed): bring the last queue back.
                 override fun onPlaybackResumption(
                     mediaSession: MediaSession,
@@ -174,6 +288,7 @@ class PlaybackService : MediaSessionService() {
         crossfader.enabled = prefs.getBoolean("enabled", false)
         crossfader.fadeMs = prefs.getLong("fadeMs", Crossfader.DEFAULT_FADE_MS)
         crossfader.debug = debuggable
+        BrookMedia.modesChanged = { redrawModeButtons() }
         BrookMedia.crossfader = crossfader
         crossfader.start()
 
@@ -242,6 +357,7 @@ class PlaybackService : MediaSessionService() {
         SleepTimer.cancel()
         crossfader.stop()
         BrookMedia.crossfader = null
+        BrookMedia.modesChanged = null
         BrookMedia.player = null
         session?.release()
         session = null
@@ -254,5 +370,7 @@ class PlaybackService : MediaSessionService() {
         private const val TAG = "BrookPlayer"
         private const val MAX_RETRY_DELAY_MS = 20_000L
         private const val PREFETCH_COUNT = 4
+        private const val ACTION_SHUFFLE = "brook.shuffle"
+        private const val ACTION_REPEAT = "brook.repeat"
     }
 }

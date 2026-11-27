@@ -80,6 +80,7 @@ class BrookPlayerPlugin : Plugin() {
             BrookMedia.init(context)
             BrookMedia.downloadManager.addListener(downloadListener)
             SleepTimer.onChange = { notifyListeners("sleep", sleepObject()) }
+            BrookMedia.modesListener = { notifyListeners("modes", modesObject()) }
             BrookMedia.crossfader?.listener = ::emitCrossfade
             emitDownloads()
         }
@@ -93,6 +94,41 @@ class BrookPlayerPlugin : Plugin() {
         val gains = DoubleArray(SoundSettings.BANDS) { i -> (g?.optDouble(i, 0.0) ?: 0.0).coerceIn(-12.0, 12.0) }
         val s = SoundSettings(gains, call.data.optDouble("preampDb", 0.0).coerceIn(-24.0, 12.0), call.data.optBoolean("normalize", true))
         main.post { BrookMedia.applySound(s); call.resolve() }
+    }
+
+    // --- Shuffle / repeat ------------------------------------------------------------------------
+
+    private fun modesObject(): JSObject {
+        val o = JSObject()
+        o.put("shuffle", BrookMedia.shuffle)
+        o.put("repeatOne", BrookMedia.repeatOne)
+        return o
+    }
+
+    // The web UI says whether its play order is shuffled, so the notification button shows the truth.
+    @PluginMethod
+    fun setModes(call: PluginCall) {
+        val shuffle = call.data.optBoolean("shuffle", false)
+        main.post {
+            BrookMedia.shuffle = shuffle
+            BrookMedia.modesChanged?.invoke()
+            call.resolve(modesObject())
+        }
+    }
+
+    // --- Widget ------------------------------------------------------------------------------------
+
+    // Asks Android to put the Brook widget on the home screen; the user confirms in a system dialog.
+    @PluginMethod
+    fun pinWidget(call: PluginCall) {
+        main.post {
+            val manager = android.appwidget.AppWidgetManager.getInstance(context)
+            val ok = manager.isRequestPinAppWidgetSupported &&
+                manager.requestPinAppWidget(android.content.ComponentName(context, BrookWidget::class.java), null, null)
+            val o = JSObject()
+            o.put("requested", ok)
+            call.resolve(o)
+        }
     }
 
     // --- Crossfade ---------------------------------------------------------------------------------

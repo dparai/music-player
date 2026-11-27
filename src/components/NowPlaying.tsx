@@ -1190,6 +1190,7 @@ export function NowPlaying({
     setPlaying, setPreparing, setCurrentTime, setDuration,
     onProgress: (p, r) => onPlayingChangeRef.current?.(p, r),
     sound, crossfade: djMode, tracks: autoMixTracks, online,
+    shuffled, onShuffleRequest: (want) => { if (want !== shuffled) onShuffleToggle(); },
     onCrossfade: (phase, smart) => {
       setCrossfading(phase === "start");
       if (phase === "start") setMixLabel(smart ? "SMART MIX" : "CROSSFADE");

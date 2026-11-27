@@ -32,6 +32,9 @@ interface Options {
   crossfade?: boolean;
   tracks?: AutoMixTrack[];
   online?: boolean;
+  // The shuffle button on the notification was pressed: the shuffle state the player wants.
+  shuffled?: boolean;
+  onShuffleRequest?: (want: boolean) => void;
   onCrossfade?: (phase: "start" | "end" | "abort", smart: boolean) => void;
 }
 
@@ -87,6 +90,12 @@ export function useNativeEngine(o: Options) {
     void BrookPlayer.setSound({ gains: s.eq, preampDb: autoPreampDb(s.eq, 48000), normalize: s.normalize }).catch(() => {});
   }, [o.enabled, o.sound?.eq.join(","), o.sound?.normalize]);
 
+  // The shuffle button on the notification shows the web UI's shuffle state.
+  useEffect(() => {
+    if (!o.enabled || !ready) return;
+    void BrookPlayer.setModes({ shuffle: !!o.shuffled }).catch(() => {});
+  }, [o.enabled, ready, o.shuffled]);
+
   // Crossfade on/off for the native player.
   useEffect(() => {
     if (!o.enabled) return;
@@ -133,6 +142,7 @@ export function useNativeEngine(o: Options) {
       handles.push(await BrookPlayer.addListener("state", (s) => { if (alive && !isStale(s.epoch)) applyState(s); }));
       handles.push(await BrookPlayer.addListener("trackChanged", (t) => { if (alive && !isStale(t.epoch)) follow(t.id); }));
       handles.push(await BrookPlayer.addListener("error", (e) => diag("native error", e)));
+      handles.push(await BrookPlayer.addListener("modes", (m) => { if (alive && m.shuffle !== !!opts.current.shuffled) opts.current.onShuffleRequest?.(m.shuffle); }));
       handles.push(await BrookPlayer.addListener("crossfade", (e) => alive && opts.current.onCrossfade?.(e.phase, e.smart)));
       try {
         const s = await BrookPlayer.getState();
