@@ -24,6 +24,9 @@ import { LyricsView } from "./LyricsView";
 import { fetchLyrics, type Lyrics } from "@/lib/lyrics";
 import { diag } from "@/lib/diag";
 import { isDownloaded, offlineUrl } from "@/lib/downloads";
+import { AheadStore } from "@/lib/ahead";
+import { isNativeApp } from "@/lib/native";
+import { useNativeEngine } from "@/lib/useNativeEngine";
 import styles from "./NowPlaying.module.css";
 import type { TrackShape, TransitionChoice } from "@/lib/dj";
 
@@ -41,6 +44,13 @@ interface Props {
   onAdvance: (song: SubsonicSong) => void;
   nextAnalysis: SongAnalysis | null;
   nextSong: SubsonicSong | null;
+  // The songs after this one (up to a few): fetched into memory ahead of time.
+  upcoming?: SubsonicSong[];
+  // Android app: the songs before and after this one, handed to the native player, and a lookup by id.
+  queueBefore?: SubsonicSong[];
+  queueAfter?: SubsonicSong[];
+  findSong?: (id: string) => SubsonicSong | undefined;
+  online?: boolean;
   onPlayingChange?: (playing: boolean, progress: number) => void;
   // True while a picked song waits for the server to prepare its stream.
   onPreparingChange?: (preparing: boolean) => void;
@@ -49,6 +59,10 @@ interface Props {
   // Choosing Original in the quality menu saves every song on the device. False: the user said no, keep the old quality.
   onChooseOriginal?: () => boolean;
 }
+
+// Inside the Android app the native service plays the songs (see lib/useNativeEngine.ts);
+// the web audio engine below is then left idle.
+const NATIVE = isNativeApp();
 
 type Deck = "A" | "B";
 
@@ -131,6 +145,10 @@ function shapeOf(
   };
 }
 
+function aheadKey(id: string, t: { format: string; maxBitRate: number }): string {
+  return `${id}|${t.format}|${t.maxBitRate}`;
+}
+
 function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
 }
@@ -149,7 +167,7 @@ export function NowPlaying({
   onNext, onPrev, onAdvance,
   nextAnalysis, nextSong,
   onPlayingChange, onPreparingChange, togglePlayRef,
-  autoMixTracks, onChooseOriginal,
+  autoMixTracks, onChooseOriginal, upcoming, queueBefore, queueAfter, findSong, online,
 }: Props) {
   const audioARef = useRef<HTMLAudioElement>(null);
   const audioBRef = useRef<HTMLAudioElement>(null);
@@ -177,6 +195,16 @@ export function NowPlaying({
     preparingRef.current = value;
     setPreparingState(value);
     onPreparingChangeRef.current?.(value);
+  }
+  // Songs fetched ahead and held in memory (see lib/ahead.ts).
+  const aheadRef = useRef<AheadStore>(null as unknown as AheadStore);
+  if (!aheadRef.current) {
+    aheadRef.current = new AheadStore({
+      fetchFn: (url, init) => fetch(url, init),
+      makeUrl: (blob) => URL.createObjectURL(blob),
+      revokeUrl: (url) => URL.revokeObjectURL(url),
+      onEvent: (e, d) => diag(e, d),
+    });
   }
   const lastSongIdRef = useRef<string | null>(null);
   const skipNextLoadRef = useRef<string | null>(null);
@@ -496,8 +524,12 @@ export function NowPlaying({
     // Saved on the device: a plain URL the service worker answers, no network.
     if (isDownloaded(s.id)) return { key: null, url: () => offlineUrl(s.id) };
     const transcode = transcodeFor(s, qualityRef.current, streamFormat());
+    const key = transcode ? aheadKey(s.id, transcode) : null;
+    // Already fetched into memory: no network needed (a locked phone cannot start a new load).
+    const held = key ? aheadRef.current.urlFor(key) : null;
+    if (held) return { key: null, url: () => held };
     return {
-      key: transcode ? `${s.id}|${transcode.format}|${transcode.maxBitRate}` : null,
+      key,
       url: () => streamUrl(creds, s.id, transcode),
     };
   }
@@ -515,7 +547,7 @@ export function NowPlaying({
   }
 
   useEffect(() => {
-    if (!song) return;
+    if (NATIVE || !song) return;
 
     if (skipNextLoadRef.current === song.id) {
       // A crossfade already brought this song in on the new deck.
@@ -592,12 +624,40 @@ export function NowPlaying({
     load(false);
   }, [song, creds, getActiveAudio]);
 
+  // Fetch the next few songs into memory so a handoff on a locked phone needs no
+  // network. Only transcoded tiers: Original is saved on the device already, and a
+  // raw FLAC is too big to hold. The effect runs again when the queue, quality or
+  // login changes, and when the page comes back (a fetch begun while locked may have failed).
+  const upcomingKey = (upcoming ?? []).map((u) => u.id).join(",");
+  const syncAhead = useCallback(() => {
+    if (NATIVE) return;
+    const fmt = streamFormat();
+    const q = qualityRef.current;
+    const items = (upcoming ?? []).flatMap((u) => {
+      if (isDownloaded(u.id)) return [];
+      const t = transcodeFor(u, q, fmt);
+      return t ? [{ key: aheadKey(u.id, t), url: () => streamUrl(creds, u.id, t) }] : [];
+    });
+    const cur = songRef.current;
+    const ct = cur && !isDownloaded(cur.id) ? transcodeFor(cur, q, fmt) : null;
+    void aheadRef.current.sync(cur && ct ? [aheadKey(cur.id, ct)] : [], items);
+  }, [upcomingKey, creds]);
+  const syncAheadRef = useRef(syncAhead);
+  syncAheadRef.current = syncAhead;
+  useEffect(() => { syncAhead(); }, [syncAhead, quality, song?.id]);
+  useEffect(() => {
+    const again = () => { if (!document.hidden) syncAheadRef.current(); };
+    document.addEventListener("visibilitychange", again);
+    return () => document.removeEventListener("visibilitychange", again);
+  }, []);
+  useEffect(() => () => { setTimeout(() => { if (!mountedRef.current) aheadRef.current.clear(); }, 0); }, []);
+
   // Have the server transcode the next song ahead of time, so it starts at once
   // and can be cued for a mix. Costs one tiny request, not a download.
   const nextSongId = nextSong?.id;
   useEffect(() => {
     const next = nextSongRef.current;
-    if (!next) return;
+    if (NATIVE || !next) return;
     const stream = streamFor(next);
     if (stream.key) void whenSeekable(stream.key, stream.url, STREAM_WARM_WAIT_MS).then((ok) => diag("prewarm next", { id: next.id, ready: ok, hidden: document.hidden }));
   }, [nextSongId, quality, creds]);
@@ -702,7 +762,7 @@ export function NowPlaying({
   const silenceLevelsRef = useRef<number[]>([]);
 
   useEffect(() => {
-    if (!djMode) return;
+    if (NATIVE || !djMode) return;
 
     const check = () => {
       // A locked phone can't run a mix: the idle deck's play() would be refused.
@@ -855,7 +915,7 @@ export function NowPlaying({
   }
 
   useEffect(() => {
-    if (djMode) return; // the mix engine hands over by itself
+    if (NATIVE || djMode) return; // the mix engine hands over by itself
 
     const check = () => {
       if (document.hidden || !soundRef.current.gapless) return;
@@ -1057,6 +1117,7 @@ export function NowPlaying({
   }
 
   function playAll() {
+    if (NATIVE) { nativeEngine.play(); return; }
     const audio = getActiveAudio();
     if (!audio) return;
     ensureAudioGraph();
@@ -1077,6 +1138,7 @@ export function NowPlaying({
   }
 
   function pauseAll() {
+    if (NATIVE) { nativeEngine.pause(); return; }
     const active = getActiveAudio();
     if (active && !active.paused && !fadeRef.current && !pauseTimerRef.current && rampActiveFader(0, FADE_PAUSE_S)) {
       // Fade out on the audio thread, then pause the element once it is silent.
@@ -1102,6 +1164,7 @@ export function NowPlaying({
   pauseRef.current = pauseAll;
 
   const togglePlay = useCallback(() => {
+    if (NATIVE) { if (playingRef.current) pauseRef.current(); else playRef.current(); return; }
     const audio = getActiveAudio();
     if (!audio) return;
     if (preparingRef.current) return; // the song starts by itself once the server is ready
@@ -1116,6 +1179,23 @@ export function NowPlaying({
 
   const onPlayingChangeRef = useRef(onPlayingChange);
   onPlayingChangeRef.current = onPlayingChange;
+  const playingRef = useRef(false);
+  playingRef.current = playing;
+
+  const nativeEngine = useNativeEngine({
+    enabled: NATIVE, song, before: queueBefore ?? [], after: queueAfter ?? [], creds, quality,
+    findSong: findSong ?? (() => undefined),
+    onAdvance: (s) => onAdvanceRef.current(s),
+    setPlaying, setPreparing, setCurrentTime, setDuration,
+    onProgress: (p, r) => onPlayingChangeRef.current?.(p, r),
+    sound, crossfade: djMode, tracks: autoMixTracks, online,
+    shuffled, onShuffleRequest: (want) => { if (want !== shuffled) onShuffleToggle(); },
+    onCrossfade: (phase, smart) => {
+      setCrossfading(phase === "start");
+      if (phase === "start") setMixLabel(smart ? "SMART MIX" : "CROSSFADE");
+    },
+    lufsOf: (s) => (autoMixTracks ? findAutoMixTrack(autoMixTracks, s)?.lufs : null),
+  });
 
   function handleTimeUpdate() {
     const audio = getActiveAudio();
@@ -1148,6 +1228,7 @@ export function NowPlaying({
   }
 
   function seekToRatio(ratio: number) {
+    if (NATIVE) { if (duration > 0) { nativeEngine.seek(ratio * duration); setCurrentTime(ratio * duration); } return; }
     const audio = getActiveAudio();
     if (!audio || !(duration > 0)) return;
     if (!isFinite(audio.duration)) return; // a transcode still in progress: a seek would hang
@@ -1252,7 +1333,7 @@ export function NowPlaying({
 
   // Lock-screen controls and the OS audio session follow the real play state.
   useEffect(() => {
-    if (!("mediaSession" in navigator)) return;
+    if (NATIVE || !("mediaSession" in navigator)) return;
     if (!playing && handoffRef.current) return; // a song change, not a real pause
     navigator.mediaSession.playbackState = playing ? "playing" : "paused";
   }, [playing]);
@@ -1382,12 +1463,6 @@ export function NowPlaying({
         inside: currentTime >= mixZone.start && currentTime < mixZone.end,
       }
     : null;
-  // Kept to three short chips plus the quality picker so the row fits one line on a phone.
-  const chips = [
-    song.suffix?.toUpperCase(),
-    song.bitRate ? `${song.bitRate} kbps` : null,
-    effectiveBpm ? `${Math.round(effectiveBpm)} BPM` : null,
-  ].filter(Boolean) as string[];
 
   function onSeekKey(e: React.KeyboardEvent) {
     if (!(duration > 0)) return;
@@ -1442,7 +1517,7 @@ export function NowPlaying({
               status={lyricsState.status}
               lyrics={lyricsState.data}
               time={currentTime}
-              getTime={() => getActiveAudio()?.currentTime ?? currentTime}
+              getTime={() => (NATIVE ? nativeEngine.getTime() : getActiveAudio()?.currentTime ?? currentTime)}
               open={lyricsOpen}
               onRetry={() => setLyricsTry((n) => n + 1)}
               onSeek={(s) => seekToRatio(s / duration)}
@@ -1490,7 +1565,12 @@ export function NowPlaying({
           </div>
           <div className={styles.timeRow}>
             <span>{formatTime(shownTime)}</span>
-            {crossfading && <span className={styles.mixChip}><i />{mixLabel}</span>}
+            {crossfading ? (
+              <span className={styles.mixChip}><i />{mixLabel}</span>
+            ) : NATIVE && djMode && online === false ? (
+              // Offline there is no beat data to mix with: the player falls back to a plain fade.
+              <span className={styles.mixChip} role="status">Smart mix needs internet</span>
+            ) : null}
             <span>{formatTime(duration)}</span>
           </div>
         </div>
@@ -1527,9 +1607,8 @@ export function NowPlaying({
       </div>
 
       <ul className={styles.chips}>
-        {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
         <li className={styles.chipFixed}>
-          <SoundMenu value={sound} onChange={setSound} />
+          <SoundMenu value={sound} onChange={setSound} native={NATIVE} />
         </li>
         <li className={styles.chipFixed}>
           <QualityMenu value={quality} onChange={(q) => {

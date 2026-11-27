@@ -10,11 +10,14 @@
     "test": "node --test \"tests/**/*.test.ts\""
   },
   "dependencies": {
+    "@capacitor/android": "^8.6.3",
+    "@capacitor/core": "^8.6.3",
     "md5": "^2.3.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.6.3",
     "@types/md5": "^2.3.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

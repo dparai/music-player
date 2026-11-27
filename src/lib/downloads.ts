@@ -4,6 +4,11 @@
 // network and the player only needs a plain URL it can set synchronously.
 
 import { streamUrl, type SubsonicCredentials, type SubsonicSong } from "./subsonic";
+import { BrookPlayer, isNativeApp, type NativeDownloads } from "./native";
+
+// Inside the Android app the songs are saved by the native player as real files and played from there;
+// everything below then just mirrors the native state. In a browser they go to Cache Storage as before.
+const NATIVE = isNativeApp();
 
 const CACHE = "brook-downloads";
 const PREFIX = "/offline/";
@@ -42,13 +47,32 @@ export function downloadedCount(): number {
   return have.size;
 }
 
-export const downloadsSupported = typeof caches !== "undefined";
+export const downloadsSupported = NATIVE || typeof caches !== "undefined";
 
 // Reads which songs are already on the device. Call once at start.
 export function loadDownloads(): Promise<void> {
   if (!downloadsSupported) return Promise.resolve();
-  loadPromise ??= readDownloads();
+  loadPromise ??= NATIVE ? readNative() : readDownloads();
   return loadPromise;
+}
+
+function applyNative(d: NativeDownloads) {
+  have.clear();
+  d.done.forEach((id) => have.add(id));
+  active.clear();
+  for (const [id, st] of Object.entries(d.active)) {
+    if (st.status === "downloading") active.set(id, { status: "downloading", pct: st.pct ?? 0 });
+    else if (st.status === "failed") active.set(id, { status: "failed", reason: st.reason ?? "Download failed" });
+    else active.set(id, { status: "queued" });
+  }
+  changed();
+}
+
+async function readNative(): Promise<void> {
+  try {
+    await BrookPlayer.addListener("downloads", applyNative);
+    applyNative(await BrookPlayer.getDownloads());
+  } catch { /* the bridge is not ready: nothing is downloaded */ }
 }
 
 async function readDownloads(): Promise<void> {
@@ -63,6 +87,12 @@ async function readDownloads(): Promise<void> {
 }
 
 export async function removeDownload(id: string): Promise<void> {
+  if (NATIVE) {
+    have.delete(id);
+    changed();
+    try { await BrookPlayer.removeDownloads({ ids: [id] }); } catch { /* already gone */ }
+    return;
+  }
   try {
     const cache = await caches.open(CACHE);
     await cache.delete(offlineUrl(id));
@@ -83,6 +113,12 @@ export async function pruneDownloads(serverIds: Set<string>): Promise<number> {
 }
 
 export async function removeAllDownloads(): Promise<void> {
+  if (NATIVE) {
+    have.clear();
+    changed();
+    try { await BrookPlayer.removeAllDownloads(); } catch { /* ignore */ }
+    return;
+  }
   try { await caches.delete(CACHE); } catch { /* ignore */ }
   have.clear();
   changed();
@@ -140,6 +176,20 @@ async function pump() {
 
 export function downloadSongs(creds: SubsonicCredentials, songs: SubsonicSong[]): number {
   if (!downloadsSupported) return 0;
+  if (NATIVE) {
+    const todo = songs.filter((s) => !have.has(s.id) && (!active.has(s.id) || active.get(s.id)!.status === "failed"));
+    if (todo.length === 0) return 0;
+    for (const s of todo) active.set(s.id, { status: "queued" });
+    changed();
+    void BrookPlayer.download({
+      items: todo.map((s) => ({
+        id: s.id,
+        url: new URL(streamUrl(creds, s.id), window.location.href).href,
+        cacheKey: `orig:${s.id}`,
+      })),
+    });
+    return todo.length;
+  }
   let added = 0;
   for (const song of songs) {
     if (have.has(song.id)) continue;
@@ -154,6 +204,7 @@ export function downloadSongs(creds: SubsonicCredentials, songs: SubsonicSong[])
 }
 
 export function cancelQueued(): void {
+  if (NATIVE) { void BrookPlayer.cancelDownloads(); return; }
   for (const { song } of queue.splice(0)) active.delete(song.id);
   changed();
 }

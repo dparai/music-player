@@ -16,6 +16,10 @@ import { Library } from "@/components/Library";
 import { memo } from "react";
 import { flushSync } from "react-dom";
 import { NowPlaying } from "@/components/NowPlaying";
+import { AHEAD_COUNT } from "@/lib/ahead";
+import { upcomingSongs } from "@/lib/queue";
+import { NATIVE_QUEUE_AFTER } from "@/lib/nativeQueue";
+import { isNativeApp } from "@/lib/native";
 import { DiagGate } from "@/components/DiagPanel";
 import { loadDownloads, isDownloaded, subscribeDownloads, downloadsVersion, downloadSongs, downloadsSupported, pruneDownloads } from "@/lib/downloads";
 import { MiniPlayer } from "@/components/MiniPlayer";
@@ -63,7 +67,17 @@ export function App() {
   const togglePlayRef = useRef<(() => void) | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, SongAnalysis>>({});
   const [autoMixTracks, setAutoMixTracks] = useState<AutoMixTrack[]>([]);
-  const [djMode, setDjMode] = useState(false);
+  // The Crossfade switch. In the web player it also turns on DJ song picking; in the Android app the
+  // native player mixes between the songs in the normal order, so the picking stays off there.
+  // Remembered in the app (a phone user does not want to switch it on after every restart).
+  const [crossfadeOn, setCrossfadeOn] = useState(() => {
+    try { return isNativeApp() && localStorage.getItem("deepakmusic_crossfade") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    if (!isNativeApp()) return;
+    try { localStorage.setItem("deepakmusic_crossfade", crossfadeOn ? "1" : "0"); } catch { /* storage blocked */ }
+  }, [crossfadeOn]);
+  const djMode = crossfadeOn && !isNativeApp();
   const [shuffled, setShuffled] = useState(false);
   const [currentSongId, setCurrentSongId] = useState<string | null>(null);
   const [playNextQueue, setPlayNextQueue] = useState<SubsonicSong[]>([]);
@@ -131,6 +145,23 @@ export function App() {
 
   const nextSong = getNextSong();
   const nextAnalysis = nextSong ? lookupSong(analysisData, nextSong) : null;
+  // For the Android player, which has to know the queue itself: the song before this one and the
+  // songs after it (Play Next first). Always the plain order; the DJ pick is web-only.
+  const queueBefore = useMemo(() => {
+    if (currentIndex > 0) return [playOrder[currentIndex - 1]!];
+    return playOrder.length > 1 && currentIndex === 0 ? [playOrder[playOrder.length - 1]!] : [];
+  }, [playOrder, currentIndex]);
+  const queueAfter = useMemo(
+    () => upcomingSongs(playNextQueue, playOrder, currentSongId, NATIVE_QUEUE_AFTER),
+    [playNextQueue, playOrder, currentSongId],
+  );
+  const songsById = useMemo(() => new Map(songs.map((s) => [s.id, s])), [songs]);
+  const findSong = useCallback((id: string) => songsById.get(id), [songsById]);
+  // The songs after this one, for fetching ahead. A DJ pick is only known one song out.
+  const upcoming = useMemo(
+    () => (djMode ? (nextSong ? [nextSong] : []) : upcomingSongs(playNextQueue, playOrder, currentSongId, AHEAD_COUNT)),
+    [djMode, nextSong, playNextQueue, playOrder, currentSongId],
+  );
 
   useEffect(() => {
     djNextSong.current = null;
@@ -214,7 +245,7 @@ export function App() {
     setSongs([]);
     setCurrentSongId(null);
     setPlayNextQueue([]);
-    setDjMode(false);
+    setCrossfadeOn(false);
     setShuffled(false);
   }
 
@@ -338,8 +369,9 @@ export function App() {
                 song={currentSong}
                 creds={creds}
                 analysis={currentAnalysis}
-                djMode={djMode}
-                onDjModeToggle={() => setDjMode((d) => !d)}
+                djMode={crossfadeOn}
+                onDjModeToggle={() => setCrossfadeOn((d) => !d)}
+                online={online}
                 shuffled={shuffled}
                 onShuffleToggle={handleShuffle}
                 onNext={handleNext}
@@ -347,6 +379,10 @@ export function App() {
                 onAdvance={handleAdvance}
                 nextAnalysis={nextAnalysis}
                 nextSong={nextSong}
+                upcoming={upcoming}
+                queueBefore={queueBefore}
+                queueAfter={queueAfter}
+                findSong={findSong}
                 onPlayingChange={handlePlayingChange}
                 onPreparingChange={setPreparing}
                 togglePlayRef={togglePlayRef}

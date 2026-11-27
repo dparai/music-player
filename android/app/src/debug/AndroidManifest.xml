@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Test builds talk to a test server on this PC over `adb reverse`; the release build is HTTPS only. -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>
