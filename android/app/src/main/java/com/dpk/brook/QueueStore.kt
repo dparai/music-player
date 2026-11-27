@@ -35,7 +35,8 @@ class QueueStore(context: Context) {
                     .put("album", m.albumTitle?.toString())
                     .put("art", m.artworkUri?.toString())
                     .put("dur", m.durationMs ?: 0L)
-                    .put("prefetch", m.extras?.getBoolean("prefetch", false) ?: false),
+                    .put("prefetch", m.extras?.getBoolean("prefetch", false) ?: false)
+                    .put("gain", m.extras?.getDouble("gainDb", 0.0) ?: 0.0),
             )
         }
         prefs.edit()
@@ -52,7 +53,7 @@ class QueueStore(context: Context) {
             val items = ArrayList<MediaItem>()
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                val extras = Bundle().apply { putBoolean("prefetch", o.optBoolean("prefetch")) }
+                val extras = Bundle().apply { putBoolean("prefetch", o.optBoolean("prefetch")); putDouble("gainDb", o.optDouble("gain", 0.0)) }
                 val meta = MediaMetadata.Builder()
                     .setTitle(o.optString("title"))
                     .setArtist(o.optString("artist"))

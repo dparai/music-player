@@ -1188,6 +1188,8 @@ export function NowPlaying({
     onAdvance: (s) => onAdvanceRef.current(s),
     setPlaying, setPreparing, setCurrentTime, setDuration,
     onProgress: (p, r) => onPlayingChangeRef.current?.(p, r),
+    sound,
+    lufsOf: (s) => (autoMixTracks ? findAutoMixTrack(autoMixTracks, s)?.lufs : null),
   });
 
   function handleTimeUpdate() {
@@ -1606,11 +1608,9 @@ export function NowPlaying({
 
       <ul className={styles.chips}>
         {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
-        {!NATIVE && (
-          <li className={styles.chipFixed}>
-            <SoundMenu value={sound} onChange={setSound} />
-          </li>
-        )}
+        <li className={styles.chipFixed}>
+          <SoundMenu value={sound} onChange={setSound} native={NATIVE} />
+        </li>
         {NATIVE && (
           <li className={styles.chipFixed}>
             <SleepMenu />

@@ -15,6 +15,8 @@ export interface NativeItem {
   cacheKey: string;
   // Fetch it into the phone's cache ahead of time (false for big original files).
   prefetch: boolean;
+  // Loudness trim in dB for this song (from the server's LUFS or ReplayGain tags); 0 when unknown.
+  gainDb: number;
   artUrl: string | null;
   durationMs: number;
 }
@@ -73,6 +75,8 @@ export interface BrookPlayerPlugin {
   next(): Promise<void>;
   previous(): Promise<void>;
   getState(): Promise<NativeState>;
+  // The equaliser (10 band gains in dB), the preamp that keeps boosts from clipping, and volume normalizing.
+  setSound(o: { gains: number[]; preampDb: number; normalize: boolean }): Promise<void>;
   setSleepTimer(o: { minutes?: number; endOfSong?: boolean }): Promise<NativeSleep>;
   getSleepTimer(): Promise<NativeSleep>;
   getDownloads(): Promise<NativeDownloads>;

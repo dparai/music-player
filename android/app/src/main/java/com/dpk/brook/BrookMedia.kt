@@ -46,6 +46,17 @@ object BrookMedia {
     lateinit var downloadManager: DownloadManager
         private set
 
+    // Equaliser, preamp and song gain, in the player's audio path (shared by the player and the plugin).
+    val eq = EqProcessor()
+
+    @Volatile var sound = SoundSettings()
+
+    fun applySound(s: SoundSettings) {
+        sound = s
+        eq.update(s)
+        SoundSettings.save(appContext, s)
+    }
+
     // The playing ExoPlayer (set by PlaybackService), for things that act on it from outside the service.
     @Volatile var player: androidx.media3.exoplayer.ExoPlayer? = null
 
@@ -79,6 +90,8 @@ object BrookMedia {
             DefaultDataSource.Factory(app, httpFactory),
             Executors.newFixedThreadPool(2),
         ).apply { maxParallelDownloads = 2 }
+        sound = SoundSettings.load(app)
+        eq.update(sound)
         ready = true
     }
 

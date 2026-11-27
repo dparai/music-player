@@ -8,6 +8,8 @@ import styles from "./SoundMenu.module.css";
 interface Props {
   value: SoundSettings;
   onChange: (next: SoundSettings) => void;
+  // The Android app plays gapless by itself, so the Gapless switch is not shown there.
+  native?: boolean;
 }
 
 function bandLabel(hz: number): string {
@@ -87,7 +89,7 @@ function Switch({ label, hint, on, onChange }: { label: string; hint: string; on
 }
 
 // Sound chip: volume normalising, gapless playback and a 10-band equaliser.
-export function SoundMenu({ value, onChange }: Props) {
+export function SoundMenu({ value, onChange, native = false }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -135,12 +137,14 @@ export function SoundMenu({ value, onChange }: Props) {
             on={value.normalize}
             onChange={(normalize) => set({ normalize })}
           />
-          <Switch
-            label="Gapless playback"
-            hint="Next song starts as this one ends (Crossfade off)"
-            on={value.gapless}
-            onChange={(gapless) => set({ gapless })}
-          />
+          {!native && (
+            <Switch
+              label="Gapless playback"
+              hint="Next song starts as this one ends (Crossfade off)"
+              on={value.gapless}
+              onChange={(gapless) => set({ gapless })}
+            />
+          )}
 
           <div className={styles.eqHead}>
             <p className={styles.heading}>Equaliser</p>

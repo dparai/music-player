@@ -6,6 +6,7 @@ import { BrookPlayer, type NativeState } from "./native";
 import { toNativeItem } from "./nativeItem";
 import { nativeQueue, sameQueue } from "./nativeQueue";
 import { diag } from "./diag";
+import { autoPreampDb, type SoundSettings } from "./sound";
 import { downloadsVersion, isDownloaded, subscribeDownloads } from "./downloads";
 
 interface Options {
@@ -16,12 +17,15 @@ interface Options {
   creds: SubsonicCredentials;
   quality: Quality;
   findSong: (id: string) => SubsonicSong | undefined;
+  // The server's measured loudness for a song, when it has one.
+  lufsOf?: (song: SubsonicSong) => number | null | undefined;
   onAdvance: (song: SubsonicSong) => void;
   setPlaying: (v: boolean) => void;
   setPreparing: (v: boolean) => void;
   setCurrentTime: (s: number) => void;
   setDuration: (s: number) => void;
   onProgress: (playing: boolean, ratio: number) => void;
+  sound?: SoundSettings;
 }
 
 const POLL_MS = 500;
@@ -41,7 +45,7 @@ export function useNativeEngine(o: Options) {
 
   const itemsFor = useCallback((songs: SubsonicSong[]) => {
     const { creds, quality } = opts.current;
-    return songs.map((s) => toNativeItem(s, creds, quality, streamFormat(), isDownloaded(s.id)));
+    return songs.map((s) => toNativeItem(s, creds, quality, streamFormat(), isDownloaded(s.id), opts.current.lufsOf?.(s)));
   }, []);
 
   const applyState = useCallback((s: NativeState) => {
@@ -64,6 +68,13 @@ export function useNativeEngine(o: Options) {
       if (s) c.onAdvance(s);
     }
   }, []);
+
+  // The equaliser, preamp and normalizing live in the native audio path: send them on start and on every change.
+  useEffect(() => {
+    if (!o.enabled || !o.sound) return;
+    const s = o.sound;
+    void BrookPlayer.setSound({ gains: s.eq, preampDb: autoPreampDb(s.eq, 48000), normalize: s.normalize }).catch(() => {});
+  }, [o.enabled, o.sound?.eq.join(","), o.sound?.normalize]);
 
   // Start: adopt what the native service is already playing (the app was reopened
   // while it kept playing), otherwise load the restored song paused.

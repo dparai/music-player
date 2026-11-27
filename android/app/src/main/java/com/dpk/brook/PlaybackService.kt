@@ -13,7 +13,10 @@ import androidx.media3.datasource.HttpDataSource
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import com.google.common.util.concurrent.Futures
@@ -42,8 +45,22 @@ class PlaybackService : MediaSessionService() {
     override fun onCreate() {
         super.onCreate()
         BrookMedia.init(this)
+        BrookMedia.eq.meter = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         store = QueueStore(this)
-        val player = ExoPlayer.Builder(this)
+        // The equaliser sits in the audio sink, so every song goes through it, gapless transitions included.
+        val renderers = object : DefaultRenderersFactory(this) {
+            override fun buildAudioSink(
+                context: android.content.Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean,
+            ): AudioSink =
+                DefaultAudioSink.Builder(context)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .setAudioProcessors(arrayOf(BrookMedia.eq))
+                    .build()
+        }
+        val player = ExoPlayer.Builder(this, renderers)
             .setMediaSourceFactory(DefaultMediaSourceFactory(BrookMedia.playbackFactory))
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -78,6 +95,8 @@ class PlaybackService : MediaSessionService() {
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 Log.i(TAG, "transition id=${item?.mediaId} reason=$reason index=${player.currentMediaItemIndex}/${player.mediaItemCount}")
                 retries = 0
+                // The loudness trim of the song that is now playing (the web UI computes it from LUFS or ReplayGain).
+                BrookMedia.eq.setItemGainDb(item?.mediaMetadata?.extras?.getDouble("gainDb", 0.0) ?: 0.0)
                 schedulePrefetch(player)
                 store.save(player)
             }

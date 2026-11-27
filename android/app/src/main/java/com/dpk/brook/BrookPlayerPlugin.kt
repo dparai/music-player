@@ -80,6 +80,16 @@ class BrookPlayerPlugin : Plugin() {
         }
     }
 
+    // --- Sound -----------------------------------------------------------------------------------
+
+    @PluginMethod
+    fun setSound(call: PluginCall) {
+        val g = call.getArray("gains")
+        val gains = DoubleArray(SoundSettings.BANDS) { i -> (g?.optDouble(i, 0.0) ?: 0.0).coerceIn(-12.0, 12.0) }
+        val s = SoundSettings(gains, call.data.optDouble("preampDb", 0.0).coerceIn(-24.0, 12.0), call.data.optBoolean("normalize", true))
+        main.post { BrookMedia.applySound(s); call.resolve() }
+    }
+
     // --- Sleep timer -------------------------------------------------------------------------------
 
     private fun sleepObject(): JSObject {
@@ -266,6 +276,7 @@ class BrookPlayerPlugin : Plugin() {
         // Whether the player should fetch this song ahead of time (the web UI says no for big originals).
         val extras = android.os.Bundle()
         extras.putBoolean("prefetch", o.optBoolean("prefetch", false))
+        extras.putDouble("gainDb", o.optDouble("gainDb", 0.0))
         meta.setExtras(extras)
         val builder = MediaItem.Builder()
             .setMediaId(o.getString("id") ?: "")
