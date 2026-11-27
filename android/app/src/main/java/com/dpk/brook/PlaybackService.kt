@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.os.Handler
+import android.os.SystemClock
 import android.os.Looper
 import android.util.Log
 import androidx.media3.common.AudioAttributes
@@ -43,6 +44,8 @@ class PlaybackService : MediaSessionService() {
     private var session: MediaSession? = null
     private val main = Handler(Looper.getMainLooper())
     private var retries = 0
+    private var skips = 0   // songs in a row that failed without one playing
+    private var stalls = 0
     private val prefetcher = Prefetcher()
     private lateinit var store: QueueStore
     private lateinit var crossfader: Crossfader
@@ -133,7 +136,7 @@ class PlaybackService : MediaSessionService() {
         override fun onPlaybackStateChanged(state: Int) {
             // The player a song is coming in on is "secondary" until the mix finishes: log it too.
             Log.i(TAG, "state=$state playWhenReady=${player.playWhenReady} id=${player.currentMediaItem?.mediaId}${if (isPrimary(player)) "" else " (next)"}")
-            if (state == Player.STATE_READY && isPrimary(player)) retries = 0
+            if (state == Player.STATE_READY && isPrimary(player)) { retries = 0; skips = 0; stalls = 0 }
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -255,6 +258,7 @@ class PlaybackService : MediaSessionService() {
         crossfader.start()
 
         main.postDelayed(saveTick, 15_000)
+        main.postDelayed(stallWatch, 2_000)
     }
 
     // The songs after the current one, fetched into the phone's cache (see Prefetcher). Debounced: one queue
@@ -276,30 +280,68 @@ class PlaybackService : MediaSessionService() {
         prefetcher.fetch(next)
     }
 
-    // A network problem retries the same song for as long as the player is meant to be playing, with a
-    // growing delay (1.5 s up to 20 s), so a tunnel or a lift never ends the music. A song the server no
-    // longer has (HTTP 4xx) or one that cannot be decoded is skipped, so one bad file never stops the rest.
+    // What a failed song does:
+    //  - no network (a tunnel, a lift): retry the same song for as long as it is meant to play, with a growing
+    //    delay (1.5 s up to 20 s), so a dead spot never ends the music;
+    //  - the server answered but not with a song (a 5xx, a busy 429, a 416): a few quick retries, then skip, so
+    //    one broken transcode cannot keep the player stuck on silence for ever;
+    //  - the server no longer has the song (404 / 410), or it cannot be decoded: skip at once.
+    // If every song in a row fails, stop instead of racing round the queue.
     private fun recover(player: ExoPlayer, error: PlaybackException) {
         val http = error.cause as? HttpDataSource.InvalidResponseCodeException
-        val gone = http != null && http.responseCode in 400..499
+        val code = http?.responseCode
+        val gone = code == 404 || code == 410
+        val serverFailed = http != null && !gone
         val network = !gone && error.errorCode in listOf(
             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
             PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
             PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
         )
-        if (network) {
+        if (network && !(serverFailed && retries >= MAX_SERVER_RETRIES)) {
             retries++
             val delay = minOf(1500L shl minOf(retries - 1, 4), MAX_RETRY_DELAY_MS)
-            Log.i(TAG, "retry $retries in ${delay}ms")
+            Log.i(TAG, "retry $retries in ${delay}ms (http=$code)")
             main.postDelayed({
                 if (player.playerError != null) player.prepare()
             }, delay)
-        } else if (player.hasNextMediaItem()) {
-            Log.i(TAG, "skipping the song that cannot play (${error.errorCodeName})")
-            retries = 0
-            player.seekToNextMediaItem()
+        } else {
+            skipSong(player, "${error.errorCodeName} http=$code")
+        }
+    }
+
+    private fun skipSong(player: ExoPlayer, why: String) {
+        retries = 0
+        skips++
+        if (!player.hasNextMediaItem() || skips > player.mediaItemCount) {
+            Log.w(TAG, "nothing else to try after $skips failed songs ($why): pausing")
+            player.pause()
             player.prepare()
+            return
+        }
+        Log.i(TAG, "skipping the song that cannot play ($why)")
+        player.seekToNextMediaItem()
+        player.prepare()
+    }
+
+    // A connection that hangs without failing (a Wi-Fi to mobile switch, a half-dead socket) would leave the
+    // player buffering until the read timeout. If the primary player has been waiting for audio too long,
+    // reopen the stream from where it is; after a few tries give the song up.
+    private var bufferingSince = 0L
+    private val stallWatch = object : Runnable {
+        override fun run() {
+            val p = session?.player
+            if (p != null && p.playWhenReady && p.playbackState == Player.STATE_BUFFERING && p.playerError == null) {
+                val now = SystemClock.elapsedRealtime()
+                if (bufferingSince == 0L) bufferingSince = now
+                else if (now - bufferingSince > STALL_MS) {
+                    bufferingSince = 0L
+                    stalls++
+                    if (stalls > MAX_STALLS) { stalls = 0; skipSong(p as ExoPlayer, "stalled") }
+                    else { Log.i(TAG, "stalled while buffering, reopening the stream ($stalls)"); p.stop(); p.prepare() }
+                }
+            } else bufferingSince = 0L
+            main.postDelayed(this, 2_000)
         }
     }
 
@@ -331,6 +373,9 @@ class PlaybackService : MediaSessionService() {
     companion object {
         private const val TAG = "BrookPlayer"
         private const val MAX_RETRY_DELAY_MS = 20_000L
+        private const val MAX_SERVER_RETRIES = 3   // a server that answers with an error is retried this often, then skipped
+        private const val STALL_MS = 12_000L
+        private const val MAX_STALLS = 3
         private const val PREFETCH_COUNT = 4
         private const val ACTION_SHUFFLE = "brook.shuffle"
         private const val ACTION_REPEAT = "brook.repeat"

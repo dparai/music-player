@@ -81,8 +81,8 @@ object BrookMedia {
         streamCache = SimpleCache(File(app.cacheDir, "stream"), LeastRecentlyUsedCacheEvictor(STREAM_CACHE_BYTES), databaseProvider)
         httpFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15_000)
-            .setReadTimeoutMs(20_000)
+            .setConnectTimeoutMs(8_000)
+            .setReadTimeoutMs(12_000)
 
         // network -> stream cache (read + write) -> downloads (read only)
         val streamLayer = CacheDataSource.Factory()

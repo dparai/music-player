@@ -4,6 +4,7 @@ import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
 import java.util.concurrent.Executors
@@ -42,9 +43,11 @@ class Prefetcher {
                     w.cache()
                     Log.i(TAG, "prefetched $key in ${System.currentTimeMillis() - started} ms")
                 } catch (e: Exception) {
-                    // Cancelled (a newer queue), or the network failed: playback fetches it itself when needed.
-                    if (gen == generation.get()) Log.w(TAG, "prefetch of $key failed: ${e.message}")
-                    return@execute
+                    // Cancelled (a newer queue): stop. The server refusing this one song (a 416 on a song that is
+                    // already cached, a 5xx): go on to the next. No network: stop, playback retries when needed.
+                    if (gen != generation.get()) return@execute
+                    Log.w(TAG, "prefetch of $key failed: ${e.message}")
+                    if (e !is HttpDataSource.InvalidResponseCodeException) return@execute
                 } finally {
                     if (writer === w) writer = null
                 }
