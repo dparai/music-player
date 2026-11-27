@@ -56,6 +56,11 @@ export interface NativeDownloadItem {
   cacheKey: string; // "orig:<id>", the key playback reads
 }
 
+export interface NativeSleep {
+  endsAt: number;     // epoch ms the music stops, or 0
+  endOfSong: boolean; // stops when the current song ends
+}
+
 export interface BrookPlayerPlugin {
   // Replace the whole queue and start at `startIndex`.
   setQueue(o: { items: NativeItem[]; startIndex: number; positionMs?: number; play: boolean }): Promise<void>;
@@ -68,6 +73,8 @@ export interface BrookPlayerPlugin {
   next(): Promise<void>;
   previous(): Promise<void>;
   getState(): Promise<NativeState>;
+  setSleepTimer(o: { minutes?: number; endOfSong?: boolean }): Promise<NativeSleep>;
+  getSleepTimer(): Promise<NativeSleep>;
   getDownloads(): Promise<NativeDownloads>;
   download(o: { items: NativeDownloadItem[] }): Promise<void>;
   removeDownloads(o: { ids: string[] }): Promise<void>;
@@ -77,6 +84,7 @@ export interface BrookPlayerPlugin {
   addListener(event: "trackChanged", fn: (t: NativeTrackChange) => void): Promise<PluginListenerHandle>;
   addListener(event: "error", fn: (e: NativeError) => void): Promise<PluginListenerHandle>;
   addListener(event: "downloads", fn: (d: NativeDownloads) => void): Promise<PluginListenerHandle>;
+  addListener(event: "sleep", fn: (s: NativeSleep) => void): Promise<PluginListenerHandle>;
 }
 
 export function isNativeApp(): boolean {

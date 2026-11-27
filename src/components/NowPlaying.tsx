@@ -5,6 +5,7 @@ import { loadQuality, saveQuality, streamFormat, transcodeFor, type Quality } fr
 import { knownSeekable, whenSeekable } from "@/lib/streamReady";
 import { QualityMenu } from "./QualityMenu";
 import { SoundMenu } from "./SoundMenu";
+import { SleepMenu } from "./SleepMenu";
 import {
   EQ_BANDS, EQ_Q, autoPreampDb, bandKind, isFlat, loadSound, saveSound, type SoundSettings,
 } from "@/lib/sound";
@@ -1608,6 +1609,11 @@ export function NowPlaying({
         {!NATIVE && (
           <li className={styles.chipFixed}>
             <SoundMenu value={sound} onChange={setSound} />
+          </li>
+        )}
+        {NATIVE && (
+          <li className={styles.chipFixed}>
+            <SleepMenu />
           </li>
         )}
         <li className={styles.chipFixed}>

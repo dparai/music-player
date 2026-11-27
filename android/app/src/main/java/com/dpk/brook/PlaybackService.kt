@@ -58,6 +58,7 @@ class PlaybackService : MediaSessionService() {
         // The web page refills the queue while it is alive; with the app swiped away nobody does, so the
         // queue loops at its end (as the web player does) instead of falling silent.
         player.repeatMode = Player.REPEAT_MODE_ALL
+        BrookMedia.player = player
 
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
@@ -175,6 +176,8 @@ class PlaybackService : MediaSessionService() {
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
         prefetcher.cancel()
+        SleepTimer.cancel()
+        BrookMedia.player = null
         session?.run {
             player.release()
             release()

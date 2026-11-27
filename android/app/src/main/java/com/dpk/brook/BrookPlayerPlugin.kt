@@ -75,8 +75,34 @@ class BrookPlayerPlugin : Plugin() {
             connect()
             BrookMedia.init(context)
             BrookMedia.downloadManager.addListener(downloadListener)
+            SleepTimer.onChange = { notifyListeners("sleep", sleepObject()) }
             emitDownloads()
         }
+    }
+
+    // --- Sleep timer -------------------------------------------------------------------------------
+
+    private fun sleepObject(): JSObject {
+        val o = JSObject()
+        o.put("endsAt", SleepTimer.endsAtEpochMs)
+        o.put("endOfSong", SleepTimer.endOfSong)
+        return o
+    }
+
+    @PluginMethod
+    fun setSleepTimer(call: PluginCall) {
+        val minutes = call.data.optInt("minutes", 0)
+        val endOfSong = call.data.optBoolean("endOfSong", false)
+        main.post {
+            val p = BrookMedia.player
+            if (p == null || (minutes <= 0 && !endOfSong)) SleepTimer.cancel() else SleepTimer.start(p, minutes, endOfSong)
+            call.resolve(sleepObject())
+        }
+    }
+
+    @PluginMethod
+    fun getSleepTimer(call: PluginCall) {
+        main.post { call.resolve(sleepObject()) }
     }
 
     // --- Downloads ---------------------------------------------------------------------------------

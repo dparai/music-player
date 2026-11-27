@@ -46,6 +46,9 @@ object BrookMedia {
     lateinit var downloadManager: DownloadManager
         private set
 
+    // The playing ExoPlayer (set by PlaybackService), for things that act on it from outside the service.
+    @Volatile var player: androidx.media3.exoplayer.ExoPlayer? = null
+
     @Synchronized
     fun init(context: Context) {
         if (ready) return
