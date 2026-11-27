@@ -3,6 +3,7 @@ import {
   EQ_BANDS, EQ_RANGE_DB, PRESETS, autoPreampDb, clampGain, isFlat, presetFor, type SoundSettings,
 } from "@/lib/sound";
 import { ChevronIcon } from "./icons";
+import { BrookPlayer, type NativeSleep } from "@/lib/native";
 import styles from "./SoundMenu.module.css";
 
 interface Props {
@@ -85,6 +86,59 @@ function Switch({ label, hint, on, onChange }: { label: string; hint: string; on
       </span>
       <span className={`${styles.switch} ${on ? styles.switchOn : ""}`} aria-hidden="true"><i /></span>
     </button>
+  );
+}
+
+const SLEEP_CHOICES: { label: string; minutes?: number; endOfSong?: boolean }[] = [
+  { label: "Off" },
+  { label: "15 min", minutes: 15 },
+  { label: "30 min", minutes: 30 },
+  { label: "45 min", minutes: 45 },
+  { label: "1 hour", minutes: 60 },
+  { label: "End of song", endOfSong: true },
+];
+
+// Sleep timer (Android app): the native player stops the music, so it works with the screen off.
+function SleepSection() {
+  const [sleep, setSleep] = useState<NativeSleep>({ endsAt: 0, endOfSong: false });
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    let h: { remove: () => Promise<void> } | null = null;
+    let alive = true;
+    const update = (s: NativeSleep) => { setNow(Date.now()); setSleep(s); };
+    void BrookPlayer.getSleepTimer().then((s) => alive && update(s)).catch(() => {});
+    void BrookPlayer.addListener("sleep", update).then((x) => { if (alive) h = x; else void x.remove(); });
+    return () => { alive = false; void h?.remove(); };
+  }, []);
+  useEffect(() => {
+    if (!sleep.endsAt) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [sleep.endsAt]);
+  const left = Math.max(0, Math.round((sleep.endsAt - now) / 1000));
+  const status = sleep.endsAt ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} left` : sleep.endOfSong ? "At the end of this song" : "Off";
+  const active = (c: { minutes?: number; endOfSong?: boolean }) =>
+    c.endOfSong ? sleep.endOfSong : c.minutes ? sleep.endsAt > 0 : !sleep.endsAt && !sleep.endOfSong;
+  return (
+    <>
+      <div className={styles.eqHead}>
+        <p className={styles.heading}>Sleep timer</p>
+        <span className={styles.headroom} aria-live="polite">{status}</span>
+      </div>
+      <div className={styles.presets} role="radiogroup" aria-label="Sleep timer">
+        {SLEEP_CHOICES.map((c) => (
+          <button
+            key={c.label}
+            role="radio"
+            aria-checked={active(c)}
+            className={`${styles.preset} ${active(c) ? styles.presetOn : ""}`}
+            onClick={() => { void BrookPlayer.setSleepTimer({ minutes: c.minutes ?? 0, endOfSong: !!c.endOfSong }); }}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -180,6 +234,7 @@ export function SoundMenu({ value, onChange, native = false }: Props) {
           <p className={styles.note}>
             {preset || flat ? "Drag a band to make your own curve." : "Custom curve."} Double-tap a band to zero it.
           </p>
+          {native && <SleepSection />}
         </div>
       )}
     </div>

@@ -5,7 +5,6 @@ import { loadQuality, saveQuality, streamFormat, transcodeFor, type Quality } fr
 import { knownSeekable, whenSeekable } from "@/lib/streamReady";
 import { QualityMenu } from "./QualityMenu";
 import { SoundMenu } from "./SoundMenu";
-import { SleepMenu } from "./SleepMenu";
 import {
   EQ_BANDS, EQ_Q, autoPreampDb, bandKind, isFlat, loadSound, saveSound, type SoundSettings,
 } from "@/lib/sound";
@@ -1464,12 +1463,6 @@ export function NowPlaying({
         inside: currentTime >= mixZone.start && currentTime < mixZone.end,
       }
     : null;
-  // Kept to three short chips plus the quality picker so the row fits one line on a phone.
-  const chips = [
-    song.suffix?.toUpperCase(),
-    song.bitRate ? `${song.bitRate} kbps` : null,
-    effectiveBpm ? `${Math.round(effectiveBpm)} BPM` : null,
-  ].filter(Boolean) as string[];
 
   function onSeekKey(e: React.KeyboardEvent) {
     if (!(duration > 0)) return;
@@ -1614,15 +1607,9 @@ export function NowPlaying({
       </div>
 
       <ul className={styles.chips}>
-        {chips.map((c) => <li key={c} className={styles.chip}>{c}</li>)}
         <li className={styles.chipFixed}>
           <SoundMenu value={sound} onChange={setSound} native={NATIVE} />
         </li>
-        {NATIVE && (
-          <li className={styles.chipFixed}>
-            <SleepMenu />
-          </li>
-        )}
         <li className={styles.chipFixed}>
           <QualityMenu value={quality} onChange={(q) => {
             if (q === "original" && onChooseOriginal && !onChooseOriginal()) return;
